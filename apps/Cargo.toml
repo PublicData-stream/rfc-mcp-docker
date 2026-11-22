@@ -13,6 +13,8 @@ rmcp.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+rfc-storage = { path = "../crates/storage" }
+
 [dev-dependencies]
 rfc-core = { path = "../crates/core" }
 rfc-test-support = { path = "../crates/test-support" }

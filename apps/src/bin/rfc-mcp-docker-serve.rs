@@ -6,6 +6,10 @@ mod mcp;
 mod sandbox;
 
 use rfc_mcp_docker::ProbeResult;
+use rfc_storage::{
+    blob::BlobReader,
+    postgres::{Reader, mirror_root},
+};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ProbeResult {
@@ -13,6 +17,13 @@ async fn main() -> ProbeResult {
     match args.as_slice() {
         [option] if option == "--version" => {
             println!("rfc-mcp-docker-serve {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        [option] if option == "--phase1-check-storage" => {
+            let reader = Reader::connect().await?;
+            BlobReader::open(&mirror_root(), true)?;
+            let (_, sequence) = reader.active().await?;
+            println!("serve storage checks passed, publication sequence {sequence}");
             Ok(())
         }
         [option, port] if option == "--phase0-mcp" => {
@@ -27,6 +38,6 @@ async fn main() -> ProbeResult {
         }
         #[cfg(target_os = "linux")]
         [option] if option == "--phase0-sandbox" => Ok(sandbox::run()?),
-        _ => Err("rfc-mcp-docker-serve is a Phase 0 skeleton; use --version".into()),
+        _ => Err("rfc-mcp-docker-serve: expected --version or --phase1-check-storage".into()),
     }
 }

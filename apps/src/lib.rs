@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-pub type ProbeResult = Result<(), Box<dyn std::error::Error>>;
+pub type ProbeResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 /// Makes a bounded HTTPS request to a test fixture using the normal TLS verifier.
 pub async fn https_probe(url: &str, extra_ca: &Path, expected: &str) -> ProbeResult {

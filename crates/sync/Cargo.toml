@@ -1,0 +1,17 @@
+[package]
+name = "rfc-mcp-docker-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rfc-mcp-docker-sync"
+path = "src/main.rs"
+
+[dependencies]
+rfc-core = { path = "../core" }
+rfc-mcp-docker = { path = "../../apps" }
+rfc-storage = { path = "../storage" }
+tokio.workspace = true
+tokio-postgres.workspace = true
