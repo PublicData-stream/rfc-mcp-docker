@@ -38,6 +38,13 @@ RUN --network=none \
     cargo build --release --bin rfc-phase3-fixture --features phase3-fixtures --frozen \
     && cp /tmp/rust/target/release/rfc-phase3-fixture /out/
 
+FROM build AS phase4-build
+RUN --network=none \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/tmp/rust/target,sharing=locked \
+    cargo build --release --bin rfc-phase4-fixture --features phase4-fixtures --frozen \
+    && cp /tmp/rust/target/release/rfc-phase4-fixture /out/
+
 FROM docker.io/library/alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS ripgrep
 ARG TARGETARCH
 RUN set -eu; \
@@ -85,3 +92,6 @@ COPY --from=phase2-build /out/rfc-phase2-fixture /rfc-phase2-fixture
 
 FROM runtime AS phase3-fixture
 COPY --from=phase3-build /out/rfc-phase3-fixture /rfc-phase3-fixture
+
+FROM runtime AS phase4-fixture
+COPY --from=phase4-build /out/rfc-phase4-fixture /rfc-phase4-fixture

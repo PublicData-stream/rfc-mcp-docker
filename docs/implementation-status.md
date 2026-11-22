@@ -139,3 +139,55 @@ python3 scripts/phase3/integration.py --image-prefix rfc-phase3-final
 - The suite interrupted retirement before and after its database commit and interrupted deletion before unlink, after unlink, and after directory sync. Recovery drained the queue; a queued digest could not be registered before cleanup. Count and age protections and explicit ready-candidate discard passed. A fresh Compose project restored the quiescent PostgreSQL dump, registered blob inventory, and readable generation locks, then reproduced the active and retained guarded reads and the outbox count.
 
 The evidence covers synthetic fixtures, process interruption, and PostgreSQL connection loss on the local profile. Full live corpus publication, physical power loss, hosted CI, public deployment, and authenticated notification delivery remain separate verification work.
+
+## Phase 4
+
+The search gate passed locally on 2026-11-22 with rootless Docker Engine 29.10.0, Compose v5.8.0, Linux 7.0.0-44-generic amd64, Rust 1.99.1, and the Phase 0 PostgreSQL 19.0 Alpine image. Cargo used `/tmp/rust/target`. Test inputs, bind mounts, credentials, and cursor keys were under `/tmp`. The search library is available for Phase 5 MCP integration. [DSL reference](search.md)
+
+| Tested image | Local image ID |
+|---|---|
+| Serve | `sha256:db235950e7b8773aad8167ea7b05474186fefcbdb2d9e2e0b5cd3619fb46b9fe` |
+| Sync | `sha256:f0c9a1f43175654cdf0519802accb7f83195e12ebe2eaaa54b6b3ca4c057c1a7` |
+| Feed | `sha256:659f503ee155a7596d7db3247845575aebd074947cee2632e5e1b60be95fd695` |
+| PostgreSQL | `sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188` |
+| Phase 4 fixture | `sha256:f0ac5a90b5632c59669094b18e4fc6a473e581cf7ccd538f6a503c9155212ff4` |
+
+### Commands
+
+```sh
+export CARGO_TARGET_DIR=/tmp/rust/target TMPDIR=/tmp
+cargo fetch --locked
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+actionlint .github/workflows/ci.yml
+python3 scripts/phase0/integration.py --project rfc-phase4-final
+python3 -B scripts/phase1/integration.py --image-prefix rfc-phase4-final
+python3 -B scripts/phase2/integration.py --image-prefix rfc-phase4-final
+python3 -B scripts/phase3/integration.py --image-prefix rfc-phase4-final
+python3 -B scripts/phase4/integration.py --image-prefix rfc-phase4-final
+```
+
+### Observations
+
+- The locked workspace checks, all-feature Clippy and tests, and `actionlint` passed. Phase 0 verified the strict Streamable HTTP wire behavior, PostgreSQL TLS and ICU, and the effective Landlock and seccomp controls on the rebuilt images. Phases 1 and 2 verified least-privilege storage, restored manifests, original-byte ingestion and indexing, and the existing failure fences. Phase 3 verified publication, reader locking, recovery, and restore of the active and retained snapshots.
+- The Phase 4 fixture upgraded schema 3 to 4, reran the migrations, preserved a legacy manifest row, and ran queries as the SELECT-only serve role. The suite compared 124 known and generated ASTs with an independent three-valued evaluator. It checked every relationship direction, duplicate evidence, catalog gaps, document-wide token AND, exact literals crossing chunks, invalid UTF-8, and corrupt originals.
+- On the pinned PostgreSQL image, the position cap probe stored a terminal position of 16,383 and 255 positions for the repeated lexeme. The 2,048-byte test lexeme was ignored. Search uses document-wide lexeme membership for body token matching.
+- The fixture checked authenticated cursor binding, tampering, expiry, complete pagination across publication and rollback, and refusal after retirement. A deliberate relation lock returned `deadline_exceeded`, and the reader connection closed. Exact and token excerpts and their complete notice bundle matched original byte ranges for the synthetically approved document. Policy-blocked results stayed metadata-only.
+- Early runs exposed a JSON borrowing error for escaped literals and a blocking stdin loop that delayed fixture connection cleanup. Owned request strings and asynchronous fixture input resolved both. The first benchmark also exposed broad observation and coverage scans. The final SQL uses correlated lookups and the benchmark asserts the expected index use.
+
+### Query plans and timings
+
+The fixture published a seeded 10,000-document generation. Each timing is from a warm local request under the serve role, including connection checks and generation locking. The table shows six measured requests per case after one warmup. Most synthetic documents share a 192 KiB original blob.
+
+| Case | RFCs evaluated | Median (ms) | Maximum (ms) |
+|---|---:|---:|---:|
+| Title token query | 27 | 42.07 | 44.66 |
+| Inbound obsolescence | 512 | 50.16 | 62.40 |
+| Empty partial page at row budget | 512 | 49.82 | 54.23 |
+| Exact query at original-byte budget | 188 | 122.37 | 135.38 |
+| 64 exact literals at comparison budget | 60 | 76.20 | 87.95 |
+
+The compiled 32-candidate `EXPLAIN (ANALYZE, BUFFERS)` samples used `generation_documents_pkey` for the generation and RFC window and `source_observations_pkey` for the original URL. Inbound obsolescence used an index-only scan on `relations_inbound_obsolescence` with generation and target conditions and zero heap fetches. Reference lookups used `relations_inverse`. Both relationship samples used the coverage uniqueness index to check the applicable family. The fixture prints the full plans.
+
+The measurements describe a synthetic local corpus. Live corpus performance, concurrent production traffic, hosted CI, and public MCP search require their own verification.
