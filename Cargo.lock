@@ -1213,6 +1213,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfc-search"
+version = "0.0.0"
+dependencies = [
+ "rfc-core",
+]
+
+[[package]]
 name = "rfc-storage"
 version = "0.0.0"
 dependencies = [
