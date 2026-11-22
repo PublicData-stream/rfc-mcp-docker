@@ -19,6 +19,8 @@ mod xml;
 
 #[cfg(feature = "phase2-fixtures")]
 pub use ingest::reconcile_fixture;
+#[cfg(feature = "phase3-fixtures")]
+pub use ingest::reconcile_fixture_with_reviews;
 pub use ingest::{Scope, reconcile};
 pub use publication::promote;
 pub use recovery::{Maintenance, maintain};

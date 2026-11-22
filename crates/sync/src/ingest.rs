@@ -119,18 +119,33 @@ fn bounded_error(error: impl std::fmt::Display) -> String {
 
 /// Reconciles a candidate using the official upstream endpoints.
 pub async fn reconcile(scope: Scope) -> Result<()> {
-    execute(Upstream::official(), scope).await
+    execute(Upstream::official(), Registry::load(), scope).await
 }
 
 /// Fixture endpoints are compiled only into the dedicated test build.
 #[cfg(feature = "phase2-fixtures")]
 pub async fn reconcile_fixture(scope: Scope) -> Result<()> {
-    execute(Upstream::fixture(), scope).await
+    execute(Upstream::fixture(), Registry::load(), scope).await
 }
 
-async fn execute(upstream: Result<Upstream>, scope: Scope) -> Result<()> {
+/// Only the disposable fixture driver passes synthetic review receipts.
+#[cfg(feature = "phase3-fixtures")]
+pub async fn reconcile_fixture_with_reviews(scope: Scope, reviews: &str) -> Result<()> {
+    execute(
+        Upstream::fixture(),
+        serde_json::from_str(reviews).map_err(Into::into),
+        scope,
+    )
+    .await
+}
+
+async fn execute(
+    upstream: Result<Upstream>,
+    registry: Result<Registry>,
+    scope: Scope,
+) -> Result<()> {
     let mut report = Report::new(scope);
-    let result = run(upstream, scope, &mut report).await;
+    let result = run(upstream, registry, scope, &mut report).await;
     match &result {
         Ok((id, digest)) => {
             report.state = "ready";
@@ -145,6 +160,7 @@ async fn execute(upstream: Result<Upstream>, scope: Scope) -> Result<()> {
 
 async fn run(
     upstream: Result<Upstream>,
+    registry: Result<Registry>,
     scope: Scope,
     report: &mut Report,
 ) -> Result<(GenerationId, BlobDigest)> {
@@ -155,7 +171,7 @@ async fn run(
     let store = BlobWriter::open(&root)?;
     recover_before_ingestion(&mut writer, &store).await?;
     let reader = BlobReader::open(&root, false)?;
-    let registry = Registry::load()?;
+    let registry = registry?;
     let id = writer.start_ingestion(PARSER, INDEX).await?;
     report.generation_id = Some(id.get().to_string());
     let mut run = Run {

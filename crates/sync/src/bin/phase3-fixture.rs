@@ -1,7 +1,9 @@
 //! Drives the production repositories in a disposable Compose project.
 
 use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
-use rfc_mcp_docker_sync::{Maintenance, Scope, maintain, promote, reconcile_fixture};
+use rfc_mcp_docker_sync::{
+    Maintenance, Scope, maintain, promote, reconcile_fixture, reconcile_fixture_with_reviews,
+};
 use rfc_storage::{
     blob::BlobWriter,
     fixture_boundary,
@@ -15,6 +17,18 @@ async fn main() -> Result<()> {
     match args.as_slice() {
         [scope] if scope == "full" => reconcile_fixture(Scope::Full).await?,
         [scope] if scope == "sample" => reconcile_fixture(Scope::Sample).await?,
+        [scope, review] if scope == "full" && review == "--review-fixture" => {
+            let reviews = std::fs::read_to_string("/phase5/fixture-policy.json")?;
+            reconcile_fixture_with_reviews(Scope::Full, &reviews).await?;
+        }
+        [action] if action == "digest" => {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            assert!(bytes.len() <= 4 * 1024 * 1024);
+            println!("{}", BlobDigest::hash(&bytes));
+        }
         [action, id, sequence] if matches!(action.as_str(), "publish" | "rollback") => {
             println!(
                 "{}",

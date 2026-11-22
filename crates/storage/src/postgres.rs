@@ -186,6 +186,13 @@ async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::J
     .with_safe_default_protocol_versions()?
     .with_root_certificates(roots)
     .with_no_client_auth();
+    let mut options = String::from(
+        "-csearch_path=pg_catalog,rfc -cstatement_timeout=5000 -clock_timeout=3000 -cidle_in_transaction_session_timeout=10000",
+    );
+    if role == RuntimeRole::Serve {
+        // PostgreSQL must check the socket even while a read is blocked on a lock.
+        options.push_str(" -cclient_connection_check_interval=100ms");
+    }
     let (client, connection) = tokio_postgres::Config::new()
         .host(&host)
         .port(port)
@@ -194,7 +201,7 @@ async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::J
         .dbname("rfc")
         .ssl_mode(SslMode::Require)
         .connect_timeout(Duration::from_secs(5))
-        .options("-csearch_path=pg_catalog,rfc -cstatement_timeout=5000 -clock_timeout=3000 -cidle_in_transaction_session_timeout=10000")
+        .options(&options)
         .connect(MakeRustlsConnect::new(tls))
         .await?;
     let driver = tokio::spawn(async move {
@@ -309,7 +316,7 @@ pub struct Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        // Closing the dedicated socket also cancels any SQL still in flight.
+        // PostgreSQL's connection checks observe closure even during a blocked read.
         self.driver.abort();
     }
 }

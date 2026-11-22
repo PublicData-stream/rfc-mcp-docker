@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::Request,
-    http::{Method, StatusCode},
+    http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -122,8 +122,7 @@ pub(crate) fn transport<S: ServerHandler + Clone>(
         .route_layer(middleware::from_fn(reject_legacy_requests))
 }
 
-// rmcp's stateless path still handles initialize and acknowledges the legacy
-// initialized notification. Retain its validation and handling for modern RPCs.
+// Keep malformed messages and legacy lifecycle requests out of the SDK dispatch.
 async fn reject_legacy_requests(request: Request, next: Next) -> Response {
     if request.method() != Method::POST {
         return next.run(request).await;
@@ -154,8 +153,46 @@ async fn reject_legacy_requests(request: Request, next: Next) -> Response {
         Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
-    if let Ok(envelope) = serde_json::from_slice::<Value>(&bytes) {
+    let json_body = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    if json_body {
+        let envelope: Value = match serde_json::from_slice(&bytes) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                return rpc_error(
+                    StatusCode::BAD_REQUEST,
+                    &Value::Null,
+                    ErrorData::parse_error("Invalid JSON", None),
+                );
+            }
+        };
         let method = envelope["method"].as_str();
+        if envelope["jsonrpc"] != "2.0"
+            || method.is_none()
+            || envelope
+                .get("id")
+                .is_some_and(|id| !id.is_i64() && !id.is_string())
+        {
+            return rpc_error(
+                StatusCode::BAD_REQUEST,
+                &Value::Null,
+                ErrorData::invalid_request("Expected one JSON-RPC 2.0 request", None),
+            );
+        }
+        if ["mcp-protocol-version", "mcp-method", "mcp-name"]
+            .iter()
+            .any(|name| parts.headers.get_all(*name).iter().count() > 1)
+        {
+            return rpc_error(
+                StatusCode::BAD_REQUEST,
+                &envelope["id"],
+                ErrorData::header_mismatch("Duplicate MCP request header", None),
+            );
+        }
         if method == Some("notifications/initialized") {
             return StatusCode::BAD_REQUEST.into_response();
         }
@@ -193,13 +230,17 @@ async fn reject_legacy_requests(request: Request, next: Next) -> Response {
                     ),
                 ),
             };
-            return (
-                status,
-                Json(json!({"jsonrpc": "2.0", "id": envelope["id"], "error": error})),
-            )
-                .into_response();
+            return rpc_error(status, &envelope["id"], error);
         }
     }
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
+}
+
+fn rpc_error(status: StatusCode, id: &Value, error: ErrorData) -> Response {
+    (
+        status,
+        Json(json!({"jsonrpc": "2.0", "id": id, "error": error})),
+    )
+        .into_response()
 }

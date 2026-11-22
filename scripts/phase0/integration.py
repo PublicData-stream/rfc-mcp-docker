@@ -29,6 +29,7 @@ def capture(command, *, timeout=30):
 def make_ca(directory, name):
     run([*CERT_COMMAND, "-x509", "-days", "2", "-subj", f"/CN={name}",
          "-addext", "basicConstraints=critical,CA:TRUE",
+         "-addext", "keyUsage=critical,keyCertSign,cRLSign",
          "-keyout", str(directory / f"{name}.key"), "-out", str(directory / f"{name}.crt")],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

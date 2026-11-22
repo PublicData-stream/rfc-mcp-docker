@@ -191,3 +191,42 @@ The fixture published a seeded 10,000-document generation. Each timing is from a
 The compiled 32-candidate `EXPLAIN (ANALYZE, BUFFERS)` samples used `generation_documents_pkey` for the generation and RFC window and `source_observations_pkey` for the original URL. Inbound obsolescence used an index-only scan on `relations_inbound_obsolescence` with generation and target conditions and zero heap fetches. Reference lookups used `relations_inverse`. Both relationship samples used the coverage uniqueness index to check the applicable family. The fixture prints the full plans.
 
 The measurements describe a synthetic local corpus. Live corpus performance, concurrent production traffic, hosted CI, and public MCP search require their own verification.
+
+## Phase 5
+
+**Verified locally on 2026-11-22.** The Phase 5 serving endpoint uses `rmcp` 3.11.0, schema 5, and PostgreSQL 19.0. Verification ran on rootless Docker Engine 29.10.0, Compose 5.8.0, Linux 7.0.0-44-generic amd64, and Rust 1.99.1. Cargo artifacts were under `/tmp/rust/target`. Compose used private networks and disposable bind mounts, database passwords, cursor keys, and certificates under `/tmp`. [MCP API and serving configuration](mcp.md)
+
+| Image | Local image ID |
+|---|---|
+| Serve | `sha256:afbe7deaab3ac29c69b28bf3a487635dbac2a1d30db2fb06f26f6b15f4358961` |
+| Sync | `sha256:1a0ed8dc9cb969211b90bfbe31a6c9d48fec5af10c887ba856cf79deca6b435e` |
+| Feed | `sha256:e9b00b21d47ee5ee9a964d8410cd98ac0aece2ad3786f1e0112b6b322cb6d8db` |
+| PostgreSQL | `sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188` |
+| TLS proxy and upstream fixture | `sha256:0ab3ec8a69751f517b4408e04194e2b5304fc57f933607663c44c30efd916734` |
+| Publication and review fixture | `sha256:25f3e57e9cac33f49353728fdcc93200e133d15715e320481d0c6c1bf2e1dca8` |
+
+### Commands
+
+```sh
+export CARGO_TARGET_DIR=/tmp/rust/target TMPDIR=/tmp
+cargo fetch --locked
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+actionlint .github/workflows/ci.yml
+python3 -B scripts/phase0/integration.py --project rfc-phase5-complete
+python3 -B scripts/phase5/integration.py --image-prefix rfc-phase5-complete
+for phase in 1 2 3 4; do
+    python3 -B "scripts/phase$phase/integration.py" --image-prefix rfc-phase5-complete
+done
+```
+
+### Observations
+
+- The locked Rust checks, all-feature Clippy and tests, and workflow lint passed. The Phase 0–4 Compose regressions passed on the final service images, including effective Landlock and seccomp checks, PostgreSQL TLS and role checks, original-source ingestion, guarded publication and restore, and the generation-pinned DSL suite.
+- The private gate upgraded schema 4 to 5, reran the migration, and preserved the existing whole-only document version. A client using the pinned protocol exercised discovery, direct calls, all five schemas, and typed errors through a localhost-published TLS proxy. Readiness reported an empty corpus before publication. Raw requests checked version and header mismatches, malformed messages, Host and Origin rejection, and legacy transport behavior.
+- The original-byte checks served RFC 2119 and RFC 8174 under their existing single-response approvals. The UTF-8 fixture reassembled to 93,023 bytes and its largest serialized JSON-RPC response was 221,679 bytes. The non-UTF-8 fixture reassembled to 44 bytes and preserved its original notice in base64. Both reassemblies matched their full BLAKE3 identities. Tests covered escaped control bytes, CRLF, UTF-8 boundaries, section coverage and duplicate headings, absent or oversized notice bundles, and exact search snippets and heading ranges.
+- The gate exercised rate limits for trusted and untrusted peers and the 16-request admission limit. PostgreSQL denied writes under the serving role, serve could not write to the mirror, and sync and feed lacked the cursor key. Fresh reads saw the committed pointer without a notification, while continuations stayed pinned across promotion and rollback and failed after retirement.
+- Early fixture runs exposed a disposable CA missing its key-usage extension, a NUL in the binary fixture, and an incorrect assumption about the original headings fixture's coverage. The private suite now uses a strict TLS chain, an ingestible non-UTF-8 fixture, and an explicit orphan-section fixture. The disconnect probe also found a blocked PostgreSQL backend still present at the end of the observation window. With connection-loss checks enabled for serve, the private gate observed the blocked session cleared within 78 ms of disconnect. A separate lock deadline returned `deadline_exceeded` and left zero reader sessions. [PostgreSQL TCP settings](https://www.postgresql.org/docs/19/runtime-config-connection.html#GUC-CLIENT-CONNECTION-CHECK-INTERVAL)
+
+Official RFCs require digest-scoped review receipts before enabling whole-document pagination. `rg` returns `sandbox_unavailable` pending the Phase 7 worker gate. Hosted CI, a live corpus, and public deployment have separate acceptance gates.

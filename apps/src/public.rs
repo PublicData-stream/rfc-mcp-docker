@@ -29,9 +29,9 @@ use rfc_storage::postgres::{GenerationSelection, Reader};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, RequestId, ServerCapabilities, ServerConfig, Tool,
-        ToolAnnotations,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CustomRequest, CustomResult,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, RequestId, ServerCapabilities,
+        ServerConfig, Tool, ToolAnnotations,
     },
     service::RequestContext,
 };
@@ -130,6 +130,27 @@ impl ServerHandler for Mcp {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|tool| tool.name == name).cloned()
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        if matches!(
+            request.method.as_ref(),
+            "server/discover" | "tools/list" | "tools/call"
+        ) {
+            return Err(ErrorData::invalid_params(
+                "Invalid MCP method parameters",
+                None,
+            ));
+        }
+        Err(ErrorData::new(
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+            "Unknown MCP method",
+            None,
+        ))
     }
 
     async fn list_tools(
