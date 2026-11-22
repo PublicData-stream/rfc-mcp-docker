@@ -1,0 +1,92 @@
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 64
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+
+services:
+  serve:
+    <<: *hardened
+    image: ${PHASE0_IMAGE_PREFIX}-serve
+    build: {context: ../.., target: serve}
+    command: [--phase0-mcp, "8780"]
+    networks: [ingress, db_read, sync_notify]
+    volumes:
+      - ${PHASE0_DIR}/mirror:/mirror:ro
+      - ${PHASE0_DIR}/secret.txt:/phase0/secret.txt:ro
+      - ${PHASE0_DIR}/reader-password:/phase0/db-password:ro
+  sync:
+    <<: *hardened
+    image: ${PHASE0_IMAGE_PREFIX}-sync
+    build: {context: ../.., target: sync}
+    networks: [db_write, sync_notify, feed_control, sync_egress]
+    volumes:
+      - ${PHASE0_DIR}/mirror:/mirror:rw
+      - ${PHASE0_DIR}/writer-password:/phase0/db-password:ro
+      - ${PHASE0_DIR}/certs/ca.crt:/phase0/ca.crt:ro
+      - ${PHASE0_DIR}/certs/wrong-ca.crt:/phase0/wrong-ca.crt:ro
+  feed:
+    <<: *hardened
+    image: ${PHASE0_IMAGE_PREFIX}-feed
+    build: {context: ../.., target: feed}
+    networks: [feed_control, feed_egress]
+    volumes:
+      - ${PHASE0_DIR}/certs/ca.crt:/phase0/ca.crt:ro
+      - ${PHASE0_DIR}/certs/wrong-ca.crt:/phase0/wrong-ca.crt:ro
+  postgres:
+    <<: *hardened
+    image: docker.io/library/postgres:19.0-alpine3.24@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188
+    user: "70:70"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: rfc_phase0
+      POSTGRES_PASSWORD_FILE: /phase0/postgres-password
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C --locale-provider=icu --icu-locale=und --auth-host=scram-sha-256 --auth-local=peer
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        cp /phase0/postgres.key /run/postgresql/phase0.key
+        cp /phase0/pgpass /run/postgresql/pgpass
+        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/phase0/postgres.crt -c ssl_key_file=/run/postgresql/phase0.key
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /run/postgresql:size=2m,uid=70,gid=70,mode=0770
+    volumes:
+      - ${PHASE0_DIR}/pgdata:/var/lib/postgresql
+      - ${PHASE0_DIR}/postgres:/phase0:ro
+      - ${PHASE0_DIR}/postgres/init.sql:/docker-entrypoint-initdb.d/01-phase0.sql:ro
+    networks: [db_read, db_write]
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -d, rfc_phase0, -U, postgres]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+  fixtures:
+    <<: *hardened
+    image: ${PHASE0_IMAGE_PREFIX}-fixtures
+    build: {context: ../.., target: phase0-fixtures}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        rsync --daemon --no-detach --port=8873 --config=/phase0/rsyncd.conf &
+        exec openssl s_server -quiet -www -accept 8443 -cert /phase0/fixtures.crt -key /phase0/fixtures.key
+    networks:
+      sync_egress: {aliases: [wrong.fixture]}
+      feed_egress: {aliases: [wrong.fixture]}
+    volumes:
+      - ${PHASE0_DIR}/upstream:/phase0:ro
+
+networks:
+  ingress: {internal: true}
+  db_read: {internal: true}
+  db_write: {internal: true}
+  sync_notify: {internal: true}
+  feed_control: {internal: true}
+  sync_egress: {internal: true}
+  feed_egress: {internal: true}
