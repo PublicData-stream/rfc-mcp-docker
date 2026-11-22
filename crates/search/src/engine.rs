@@ -34,6 +34,15 @@ const DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 pub enum SearchError {
+    InvalidArguments,
+    RfcNotFound,
+    SectionNotFound,
+    AmbiguousSection(Vec<String>),
+    InvalidByteRange,
+    InvalidUtf8Boundary,
+    UnsupportedSourceEncoding,
+    SourcePolicyRestricted,
+    SourceUnavailable,
     Query(QueryError),
     InvalidLimit,
     CursorInvalid,
@@ -48,6 +57,15 @@ pub enum SearchError {
 impl SearchError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::InvalidArguments => "invalid_arguments",
+            Self::RfcNotFound => "rfc_not_found",
+            Self::SectionNotFound => "section_not_found",
+            Self::AmbiguousSection(_) => "ambiguous_section",
+            Self::InvalidByteRange => "invalid_byte_range",
+            Self::InvalidUtf8Boundary => "invalid_utf8_boundary",
+            Self::UnsupportedSourceEncoding => "unsupported_source_encoding",
+            Self::SourcePolicyRestricted => "source_policy_restricted",
+            Self::SourceUnavailable => "source_unavailable",
             Self::Query(error) => error.code,
             Self::InvalidLimit => "resource_limit_exceeded",
             Self::CursorInvalid => "cursor_invalid",
@@ -67,6 +85,21 @@ impl fmt::Display for SearchError {
             return error.fmt(f);
         }
         let message = match self {
+            Self::InvalidArguments => "Check the tool schema and send a single valid selection",
+            Self::RfcNotFound => "Choose an RFC with original TXT in this generation",
+            Self::SectionNotFound => {
+                "Use table to find an indexed section or try an explicit range"
+            }
+            Self::AmbiguousSection(_) => {
+                "Choose a candidate section ID instead of the heading text"
+            }
+            Self::InvalidByteRange => "Use zero-based half-open byte offsets within the original",
+            Self::InvalidUtf8Boundary => "Choose UTF-8 character boundaries or request base64",
+            Self::UnsupportedSourceEncoding => "Request base64 for this original",
+            Self::SourcePolicyRestricted => "Use the official source URL for this selection",
+            Self::SourceUnavailable => {
+                "The original could not be verified; use the official source URL"
+            }
             Self::Query(_) => unreachable!(),
             Self::InvalidLimit => "Choose a page limit from 1 to 100",
             Self::CursorInvalid => "Restart with the original search arguments and no cursor",
@@ -103,7 +136,10 @@ impl From<tokio_postgres::Error> for SearchError {
     }
 }
 
-fn repository_error(error: Box<dyn std::error::Error + Send + Sync>, pinned: bool) -> SearchError {
+pub(crate) fn repository_error(
+    error: Box<dyn std::error::Error + Send + Sync>,
+    pinned: bool,
+) -> SearchError {
     if error.is::<GenerationUnavailable>() {
         return if pinned {
             SearchError::GenerationUnavailable
@@ -171,7 +207,15 @@ pub struct Hit {
 pub struct OriginalRange {
     pub start_byte: u64,
     pub end_byte: u64,
-    pub content: String,
+    #[serde(flatten)]
+    pub(crate) representation: Representation,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum Representation {
+    Text { content: String },
+    Base64 { content_base64: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -193,10 +237,12 @@ pub struct NoticeGroup {
     pub attribution: &'static str,
     pub digest: String,
     pub notices: Vec<OriginalRange>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) included_in_whole: bool,
 }
 
 pub struct Search {
-    key: CursorKey,
+    pub(crate) key: CursorKey,
     blocking_reads: Arc<Semaphore>,
 }
 
@@ -210,8 +256,18 @@ impl Search {
     }
 
     pub async fn run(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
+        self.run_with_budget(request, |page| within_page_budget(page).unwrap_or(false))
+            .await
+    }
+
+    /// The predicate reserves transport framing and continuation space as needed.
+    pub async fn run_with_budget(
+        &self,
+        request: SearchRequest,
+        fits: impl Fn(&SearchPage) -> bool + Send + Sync,
+    ) -> Result<SearchPage, SearchError> {
         let deadline = Instant::now() + DEADLINE;
-        timeout_at(deadline, self.run_bounded(request))
+        timeout_at(deadline, self.run_bounded(request, &fits))
             .await
             .map_err(|_| SearchError::Deadline)?
     }
@@ -252,7 +308,11 @@ impl Search {
             .map_err(|error| repository_error(error, false))
     }
 
-    async fn run_bounded(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
+    async fn run_bounded(
+        &self,
+        request: SearchRequest,
+        fits: &(impl Fn(&SearchPage) -> bool + Sync),
+    ) -> Result<SearchPage, SearchError> {
         let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
         if !(1..=MAX_LIMIT).contains(&limit) {
             return Err(SearchError::InvalidLimit);
@@ -282,6 +342,7 @@ impl Search {
             },
             plan,
             budget: Budget::default(),
+            fits,
         };
         reader
             .with_generation(selection, async |guard| {
@@ -316,7 +377,7 @@ impl Search {
             .map_err(|error| repository_error(error, pinned))
     }
 
-    async fn read_original<T: Send + 'static>(
+    pub(crate) async fn read_original<T: Send + 'static>(
         &self,
         guard: &GenerationReadGuard<'_>,
         id: RfcNumber,
@@ -343,7 +404,7 @@ impl Search {
     }
 }
 
-fn unix_time() -> Result<u64, SearchError> {
+pub(crate) fn unix_time() -> Result<u64, SearchError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -376,13 +437,14 @@ struct PageOptions {
     include_snippets: bool,
 }
 
-struct Scan {
+struct Scan<'a> {
     options: PageOptions,
     plan: Plan,
     budget: Budget,
+    fits: &'a (dyn Fn(&SearchPage) -> bool + Sync),
 }
 
-impl Scan {
+impl Scan<'_> {
     async fn run(
         &mut self,
         search: &Search,
@@ -488,7 +550,7 @@ impl Scan {
                 let facts: Vec<Option<bool>> = row.get(10);
                 if truth == Some(true) {
                     let source = Source::from_row(row)?;
-                    if !push_hit(&mut page, &source)? {
+                    if !push_hit(&mut page, &source, self.fits) {
                         if page.hits.is_empty() {
                             return Err(SearchError::ResourceLimit);
                         }
@@ -574,7 +636,7 @@ impl Scan {
         {
             page.hits.last_mut().expect("hit was appended").excerpts = excerpts;
             page.notice_groups.push(notices);
-            if within_page_budget(page)? {
+            if (self.fits)(page) {
                 return Ok(());
             }
             page.hits
@@ -589,9 +651,9 @@ impl Scan {
     }
 }
 
-fn push_hit(page: &mut SearchPage, source: &Source) -> Result<bool, SearchError> {
+fn push_hit(page: &mut SearchPage, source: &Source, fits: &dyn Fn(&SearchPage) -> bool) -> bool {
     let Some(title) = &source.title else {
-        return Ok(false);
+        return false;
     };
     page.hits.push(Hit {
         id: source.rfc.get(),
@@ -601,11 +663,11 @@ fn push_hit(page: &mut SearchPage, source: &Source) -> Result<bool, SearchError>
         digest: source.digest.to_string(),
         excerpts: Vec::new(),
     });
-    if within_page_budget(page)? {
-        return Ok(true);
+    if fits(page) {
+        return true;
     }
     page.hits.pop();
-    Ok(false)
+    false
 }
 
 fn serialized_size(page: &SearchPage) -> Result<usize, SearchError> {

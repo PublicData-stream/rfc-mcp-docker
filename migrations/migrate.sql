@@ -34,4 +34,10 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 4) AS apply
 \ir 0004-search.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (4);
 \endif
+SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 5) AS apply_v5
+\gset
+\if :apply_v5
+\ir 0005-reviewed-pagination.sql
+INSERT INTO rfc.schema_migrations (version) VALUES (5);
+\endif
 COMMIT;

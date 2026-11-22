@@ -1,10 +1,12 @@
 use std::ops::Range;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rfc_core::{BlobDigest, RfcNumber};
 use tokio_postgres::{Row, Transaction};
 
 use crate::{
     Excerpt, NoticeGroup, OriginalRange, SearchError,
+    engine::Representation,
     query::{Field, Match, Predicate},
     sql::Plan,
 };
@@ -27,10 +29,10 @@ pub(crate) struct Source {
     pub digest: BlobDigest,
     pub length: usize,
     pub url: String,
-    version: Vec<u8>,
-    encoding: String,
-    policy: String,
-    notice_state: String,
+    pub version: Vec<u8>,
+    pub encoding: String,
+    pub policy: String,
+    pub notice_state: String,
 }
 
 impl Source {
@@ -54,10 +56,29 @@ impl Source {
     }
 
     pub fn permits_excerpt(&self) -> bool {
-        self.encoding == "utf8"
-            && self.policy == "excerpt_allowed"
-            && self.notice_state == "complete"
-            && self.stream.is_some()
+        self.policy == "excerpt_allowed" && self.notice_state == "complete" && self.stream.is_some()
+    }
+
+    pub fn notice_group(
+        &self,
+        notices: Vec<OriginalRange>,
+        included_in_whole: bool,
+    ) -> NoticeGroup {
+        NoticeGroup {
+            id: format!("rfc-{}-notices", self.rfc.get()),
+            rfc_id: self.rfc.get(),
+            source_url: self.url.clone(),
+            source_name: "RFC Editor",
+            stream: self.stream.clone(),
+            attribution: if self.stream.as_deref() == Some("IETF") {
+                "RFC Editor, IETF stream"
+            } else {
+                "RFC Editor"
+            },
+            digest: self.digest.to_string(),
+            notices,
+            included_in_whole,
+        }
     }
 }
 
@@ -73,15 +94,12 @@ pub(crate) fn fulltext_witnesses<'a>(plan: &'a Plan, witnesses: &[usize]) -> Vec
     literals
 }
 
-pub(crate) async fn collect(
+pub(crate) async fn notices(
     tx: &Transaction<'_>,
     source: &Source,
     bytes: &[u8],
-    witnesses: &[(Match, &str)],
-) -> Result<Option<(Vec<Excerpt>, NoticeGroup)>, SearchError> {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Ok(None);
-    };
+    require_review: bool,
+) -> Result<Option<Vec<OriginalRange>>, SearchError> {
     let notices = tx
         .query(
             "SELECT start_byte::bigint,end_byte::bigint,extraction_state::text,review_state
@@ -97,19 +115,38 @@ pub(crate) async fn collect(
     for row in notices {
         let start = usize::try_from(row.get::<_, i64>(0)).map_err(|_| SearchError::Unavailable)?;
         let end = usize::try_from(row.get::<_, i64>(1)).map_err(|_| SearchError::Unavailable)?;
-        if row.get::<_, &str>(2) != "complete" || row.get::<_, &str>(3) == "restricted" {
+        let review = row.get::<_, &str>(3);
+        if row.get::<_, &str>(2) != "complete"
+            || review == "restricted"
+            || (require_review && review != "reviewed")
+        {
             return Ok(None);
         }
-        let Some(notice) = text.get(start..end) else {
+        let Some(notice) = bytes.get(start..end) else {
             return Ok(None);
         };
         notice_bytes += notice.len();
         if notice_bytes > MAX_NOTICE_BYTES {
             return Ok(None);
         }
-        notice_ranges.push(original(start..end, notice));
+        notice_ranges.push(original(start..end, notice, false));
     }
-    let id = format!("rfc-{}-notices", source.rfc.get());
+    Ok(Some(notice_ranges))
+}
+
+pub(crate) async fn collect(
+    tx: &Transaction<'_>,
+    source: &Source,
+    bytes: &[u8],
+    witnesses: &[(Match, &str)],
+) -> Result<Option<(Vec<Excerpt>, NoticeGroup)>, SearchError> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(None);
+    };
+    let Some(notices) = notices(tx, source, bytes, false).await? else {
+        return Ok(None);
+    };
+    let group = source.notice_group(notices, false);
     let allow_markers =
         bytes.len() <= MAX_TOKEN_SOURCE_BYTES && !bytes.contains(&START) && !bytes.contains(&STOP);
     let mut ranges = Vec::new();
@@ -138,39 +175,29 @@ pub(crate) async fn collect(
             let content = text.get(range.clone())?;
             let match_range = [range.start as u64, range.end as u64];
             Some(Excerpt {
-                original: original(range, content),
+                original: original(range, content.as_bytes(), false),
                 encoding: "utf8",
-                notice_group_id: id.clone(),
+                notice_group_id: group.id.clone(),
                 match_range,
             })
         })
         .collect();
-    Ok((!excerpts.is_empty()).then(|| {
-        (
-            excerpts,
-            NoticeGroup {
-                id,
-                rfc_id: source.rfc.get(),
-                source_url: source.url.clone(),
-                source_name: "RFC Editor",
-                stream: source.stream.clone(),
-                attribution: if source.stream.as_deref() == Some("IETF") {
-                    "RFC Editor, IETF stream"
-                } else {
-                    "RFC Editor"
-                },
-                digest: source.digest.to_string(),
-                notices: notice_ranges,
-            },
-        )
-    }))
+    Ok((!excerpts.is_empty()).then_some((excerpts, group)))
 }
 
-fn original(range: Range<usize>, content: &str) -> OriginalRange {
+pub(crate) fn original(range: Range<usize>, bytes: &[u8], base64: bool) -> OriginalRange {
+    let representation = match std::str::from_utf8(bytes) {
+        Ok(content) if !base64 => Representation::Text {
+            content: content.to_owned(),
+        },
+        _ => Representation::Base64 {
+            content_base64: STANDARD.encode(bytes),
+        },
+    };
     OriginalRange {
         start_byte: range.start as u64,
         end_byte: range.end as u64,
-        content: content.to_owned(),
+        representation,
     }
 }
 

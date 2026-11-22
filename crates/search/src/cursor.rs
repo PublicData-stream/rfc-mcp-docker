@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::hmac;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::engine::SearchError;
 
@@ -46,6 +46,10 @@ impl CursorKey {
     }
 
     pub fn encode(&self, cursor: &Cursor) -> Result<String, SearchError> {
+        self.seal(cursor)
+    }
+
+    pub(crate) fn seal(&self, cursor: &impl Serialize) -> Result<String, SearchError> {
         let mut bytes = serde_json::to_vec(cursor).map_err(|_| SearchError::Unavailable)?;
         let tag = hmac::sign(&self.0, &bytes);
         bytes.extend_from_slice(tag.as_ref());
@@ -57,6 +61,20 @@ impl CursorKey {
     }
 
     pub fn decode(&self, encoded: &str, query: &str, now: u64) -> Result<Cursor, SearchError> {
+        let cursor: Cursor = self.open(encoded)?;
+        if cursor.version != VERSION
+            || cursor.tool != TOOL
+            || cursor.sort != "id_asc"
+            || cursor.query != query
+            || cursor.after < 1
+        {
+            return Err(SearchError::CursorInvalid);
+        }
+        validate_context(cursor.generation, cursor.sequence, cursor.expiry, now)?;
+        Ok(cursor)
+    }
+
+    pub(crate) fn open<T: DeserializeOwned>(&self, encoded: &str) -> Result<T, SearchError> {
         if encoded.len() > MAX_CURSOR_BYTES {
             return Err(SearchError::CursorInvalid);
         }
@@ -67,24 +85,23 @@ impl CursorKey {
             .split_at_checked(bytes.len().saturating_sub(TAG_BYTES))
             .ok_or(SearchError::CursorInvalid)?;
         hmac::verify(&self.0, payload, tag).map_err(|_| SearchError::CursorInvalid)?;
-        let cursor: Cursor =
-            serde_json::from_slice(payload).map_err(|_| SearchError::CursorInvalid)?;
-        if cursor.version != VERSION
-            || cursor.tool != TOOL
-            || cursor.sort != "id_asc"
-            || cursor.query != query
-            || cursor.generation < 0
-            || cursor.sequence < 1
-            || cursor.after < 1
-            || cursor.expiry > now.saturating_add(MAX_AGE_SECONDS)
-        {
-            return Err(SearchError::CursorInvalid);
-        }
-        if cursor.expiry <= now {
-            return Err(SearchError::CursorExpired);
-        }
-        Ok(cursor)
+        serde_json::from_slice(payload).map_err(|_| SearchError::CursorInvalid)
     }
+}
+
+pub(crate) fn validate_context(
+    generation: i64,
+    sequence: i64,
+    expiry: u64,
+    now: u64,
+) -> Result<(), SearchError> {
+    if generation < 0 || sequence < 1 || expiry > now.saturating_add(MAX_AGE_SECONDS) {
+        return Err(SearchError::CursorInvalid);
+    }
+    if expiry <= now {
+        return Err(SearchError::CursorExpired);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

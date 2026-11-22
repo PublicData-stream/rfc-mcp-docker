@@ -511,13 +511,19 @@ impl Run<'_> {
         }
         self.writer.register_blob(durable).await?;
         let optional = self.rfcxml(id).await?;
-        let policy = self.registry.decide(
-            id,
-            digest,
-            entry,
-            indexed.notice_family,
-            indexed.notice_state,
-        );
+        let policy = if let Some(notices) = self.registry.pagination_notices(id, digest, bytes)? {
+            indexed.notice_state = Coverage::Complete;
+            indexed.notices = notices;
+            "whole_paginated"
+        } else {
+            self.registry.decide(
+                id,
+                digest,
+                entry,
+                indexed.notice_family,
+                indexed.notice_state,
+            )
+        };
         let candidate = self.writer.batch(self.id).await?;
         let txt = match (prior, fresh_txt.as_ref()) {
             (Some(prior), None) => prior.observation,
