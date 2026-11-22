@@ -31,12 +31,29 @@ impl GenerationId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BlobDigest([u8; 32]);
 
 impl BlobDigest {
     pub fn hash(bytes: &[u8]) -> Self {
         Self(*blake3::hash(bytes).as_bytes())
+    }
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_hex(value: &str) -> Option<Self> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        blake3::Hash::from_hex(value)
+            .ok()
+            .map(|hash| Self(*hash.as_bytes()))
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -72,6 +89,10 @@ impl ByteRange {
         self.end
     }
 
+    pub fn fits(self, byte_length: u64) -> bool {
+        self.end <= byte_length
+    }
+
     pub fn select(self, bytes: &[u8]) -> Option<&[u8]> {
         let start = usize::try_from(self.start).ok()?;
         let end = usize::try_from(self.end).ok()?;
@@ -102,6 +123,18 @@ pub enum RelationKind {
     Obsoletes,
 }
 
+impl RelationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NormativeReference => "normative_reference",
+            Self::InformativeReference => "informative_reference",
+            Self::UnclassifiedReference => "unclassified_reference",
+            Self::Updates => "updates",
+            Self::Obsoletes => "obsoletes",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Relation {
     pub source: RfcNumber,
@@ -114,6 +147,16 @@ pub enum Coverage {
     Complete,
     Partial,
     Unavailable,
+}
+
+impl Coverage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[cfg(test)]

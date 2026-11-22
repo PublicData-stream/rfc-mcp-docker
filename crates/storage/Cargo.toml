@@ -1,0 +1,17 @@
+[package]
+name = "rfc-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rfc-core = { path = "../core" }
+blake3.workspace = true
+getrandom = "0.4"
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
