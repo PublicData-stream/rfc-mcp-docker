@@ -1,6 +1,6 @@
 use rfc_core::GenerationId;
 use rfc_mcp_docker::{ProbeResult, https_probe};
-use rfc_mcp_docker_sync::{Scope, Writer, promote, reconcile};
+use rfc_mcp_docker_sync::{Maintenance, Scope, Writer, maintain, promote, reconcile};
 use rfc_storage::{blob::BlobWriter, postgres::mirror_root};
 use std::path::Path;
 
@@ -40,9 +40,17 @@ async fn main() -> ProbeResult {
             );
             Ok(())
         }
+        [option] if option == "--phase3-recover" => maintain(Maintenance::Recover).await,
+        [option] if option == "--phase3-gc" => maintain(Maintenance::Collect).await,
+        [option, generation] if option == "--phase3-discard" => {
+            let generation =
+                GenerationId::new(generation.parse()?).ok_or("invalid generation ID")?;
+            maintain(Maintenance::Discard(generation)).await
+        }
         _ => Err(
             "expected --version, --phase1-check-storage, --phase2-reconcile (--full|--sample), \
-             --phase3-(publish|rollback) GENERATION --expect-sequence SEQUENCE"
+             --phase3-(publish|rollback) GENERATION --expect-sequence SEQUENCE, \
+             --phase3-(recover|gc), or --phase3-discard GENERATION"
                 .into(),
         ),
     }

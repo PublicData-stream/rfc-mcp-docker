@@ -12,6 +12,7 @@ use tokio_postgres::{Client, Transaction};
 mod ingest;
 mod policy;
 mod publication;
+mod recovery;
 mod text;
 mod upstream;
 mod xml;
@@ -20,6 +21,7 @@ mod xml;
 pub use ingest::reconcile_fixture;
 pub use ingest::{Scope, reconcile};
 pub use publication::promote;
+pub use recovery::{Maintenance, maintain};
 pub use xml::validate_feed;
 
 pub struct Writer {

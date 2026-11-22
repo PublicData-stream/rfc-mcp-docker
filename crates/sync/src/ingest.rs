@@ -1,6 +1,7 @@
 use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
     policy::Registry,
+    recovery::recover_before_ingestion,
     text::{self, TextIndex},
     upstream::{self, Capture, Download, Source, Upstream},
     xml,
@@ -148,10 +149,11 @@ async fn run(
     report: &mut Report,
 ) -> Result<(GenerationId, BlobDigest)> {
     let upstream = upstream?;
-    let writer = Writer::connect().await?;
+    let mut writer = Writer::connect().await?;
     let _coordinator = writer.acquire_coordinator().await?;
     let root = mirror_root();
     let store = BlobWriter::open(&root)?;
+    recover_before_ingestion(&mut writer, &store).await?;
     let reader = BlobReader::open(&root, false)?;
     let registry = Registry::load()?;
     let id = writer.start_ingestion(PARSER, INDEX).await?;

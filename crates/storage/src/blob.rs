@@ -2,7 +2,7 @@
 
 use rfc_core::{BlobDigest, ByteRange, GenerationId};
 use rustix::fs::{
-    self, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags,
+    self, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags,
     StatVfsMountFlags,
 };
 use rustix::io::Errno;
@@ -278,6 +278,18 @@ impl BlobWriter {
         Ok(())
     }
 
+    pub fn try_retirement_fence(&self, generation: GenerationId) -> io::Result<Option<File>> {
+        match generation_fence(
+            &self.root,
+            generation,
+            FlockOperation::NonBlockingLockExclusive,
+        ) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn verify_generation_fence(&self, generation: GenerationId) -> io::Result<()> {
         regular(
             &self.root,
@@ -295,6 +307,104 @@ impl BlobWriter {
         let hex = digest.to_string();
         fs::fsync(directory(&self.blobs, &hex[..2])?)?;
         Ok(())
+    }
+
+    /// Inventory a canonical shard without following an entry supplied by the filesystem.
+    pub fn inventory_shard(&self, index: u8) -> io::Result<Vec<BlobDigest>> {
+        let name = format!("{index:02x}");
+        let shard = match directory(&self.blobs, &name) {
+            Ok(shard) => shard,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut digests = Vec::new();
+        for entry in Dir::read_from(&shard)? {
+            let entry = entry?;
+            let filename = entry.file_name().to_str().unwrap_or("");
+            if matches!(filename, "." | "..") {
+                continue;
+            }
+            if let Some(digest) =
+                BlobDigest::from_hex(filename).filter(|_| filename.starts_with(&name))
+            {
+                digests.push(digest);
+            } else {
+                eprintln!("preserving an unexpected entry in blob shard {name}");
+            }
+        }
+        Ok(digests)
+    }
+
+    /// Remove a queued canonical blob only if its bytes and inode are as expected.
+    pub fn remove_queued_blob(&self, digest: BlobDigest, length: Option<i64>) -> io::Result<()> {
+        let name = digest.to_string();
+        let shard = match directory(&self.blobs, &name[..2]) {
+            Ok(shard) => shard,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::fsync(&self.blobs)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        match regular(&shard, &name) {
+            Ok(file) => {
+                let size = i64::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
+                self.verify_existing(DurableBlob {
+                    digest,
+                    byte_length: length.unwrap_or(size),
+                })?;
+                crate::fixture_boundary("before_blob_unlink");
+                fs::unlinkat(&shard, name.as_str(), AtFlags::empty())?;
+                crate::fixture_boundary("after_blob_unlink");
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::fsync(&shard)?;
+        crate::fixture_boundary("after_unlink_sync");
+        Ok(())
+    }
+
+    /// Reconcile only known install-stage layouts while holding the coordinator.
+    pub fn recover_staging(&self) -> io::Result<usize> {
+        let mut removed = 0;
+        for entry in Dir::read_from(&self.staging)? {
+            let entry = entry?;
+            let name = entry.file_name().to_str().unwrap_or("");
+            if matches!(name, "." | "..") {
+                continue;
+            }
+            if name.len() != 32
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                eprintln!("preserving an unexpected staging entry");
+                continue;
+            }
+            let stage = directory(&self.staging, name)?;
+            let mut body = false;
+            let mut evidence = false;
+            for file in Dir::read_from(&stage)? {
+                let file = file?;
+                match file.file_name().to_str().unwrap_or("") {
+                    "." | ".." => {}
+                    "body" if regular(&stage, "body").is_ok() => body = true,
+                    _ => evidence = true,
+                }
+            }
+            if evidence {
+                self.move_to_quarantine(name, &stage)?;
+                continue;
+            }
+            if body {
+                fs::unlinkat(&stage, "body", AtFlags::empty())?;
+            }
+            fs::unlinkat(&self.staging, name, AtFlags::REMOVEDIR)?;
+            fs::fsync(&self.staging)?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     /// Opens a regular file beneath an explicitly selected trusted source root.
