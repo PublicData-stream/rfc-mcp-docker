@@ -16,4 +16,10 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 1) AS apply
 \ir 0001-storage.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (1);
 \endif
+SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 2) AS apply_v2
+\gset
+\if :apply_v2
+\ir 0002-ingestion.sql
+INSERT INTO rfc.schema_migrations (version) VALUES (2);
+\endif
 COMMIT;

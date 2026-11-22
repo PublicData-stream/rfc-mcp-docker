@@ -4,6 +4,7 @@ use rfc_core::BlobDigest;
 use serde::Serialize;
 
 pub const FORMAT_VERSION: i32 = 1;
+pub const INGESTION_FORMAT_VERSION: i32 = 2;
 
 /// RFC number, TXT digest, document-version identity, catalog metadata identity.
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -17,6 +18,16 @@ pub struct Edge(pub i32, pub String, pub i32, pub Vec<String>);
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Coverage(pub String, pub Option<i32>, pub String, pub String);
 
+/// Scope, catalog observation identities, policy version and catalog-only metadata.
+#[derive(Serialize)]
+pub struct Ingestion(
+    pub String,
+    pub String,
+    pub String,
+    pub String,
+    pub serde_json::Value,
+);
+
 /// Inputs loaded from the locked generation in one database transaction.
 pub struct Manifest {
     pub parser_version: String,
@@ -24,9 +35,18 @@ pub struct Manifest {
     pub members: Vec<Member>,
     pub edges: Vec<Edge>,
     pub coverage: Vec<Coverage>,
+    pub ingestion: Option<Ingestion>,
 }
 
 impl Manifest {
+    pub fn version(&self) -> i32 {
+        if self.ingestion.is_some() {
+            INGESTION_FORMAT_VERSION
+        } else {
+            FORMAT_VERSION
+        }
+    }
+
     /// Returns the exact persisted representation and its BLAKE3 digest.
     pub fn encode(mut self) -> (Vec<u8>, BlobDigest) {
         for edge in &mut self.edges {
@@ -35,14 +55,32 @@ impl Manifest {
         self.members.sort_unstable();
         self.edges.sort_unstable();
         self.coverage.sort_unstable();
-        let bytes = serde_json::to_vec(&(
-            FORMAT_VERSION,
+        let inputs = (
             self.parser_version,
             self.index_version,
             self.members,
             self.edges,
             self.coverage,
-        ))
+        );
+        let bytes = match self.ingestion {
+            Some(ingestion) => serde_json::to_vec(&(
+                INGESTION_FORMAT_VERSION,
+                inputs.0,
+                inputs.1,
+                inputs.2,
+                inputs.3,
+                inputs.4,
+                ingestion,
+            )),
+            None => serde_json::to_vec(&(
+                FORMAT_VERSION,
+                inputs.0,
+                inputs.1,
+                inputs.2,
+                inputs.3,
+                inputs.4,
+            )),
+        }
         .expect("manifest contains only JSON primitives and arrays");
         let digest = BlobDigest::hash(&bytes);
         (bytes, digest)
@@ -81,6 +119,7 @@ mod tests {
                 "updates".into(),
                 "partial".into(),
             )],
+            ingestion: None,
         }
     }
 
@@ -96,5 +135,25 @@ mod tests {
         let mut changed = sample(false);
         changed.coverage[0].3 = "complete".into();
         assert_ne!(changed.encode().1, digest);
+    }
+
+    #[test]
+    fn ingestion_manifest_binds_scope_and_provenance() {
+        let snapshot = |scope: &str, reverse: bool| {
+            let mut manifest = sample(reverse);
+            manifest.ingestion = Some(Ingestion(
+                scope.into(),
+                "before".into(),
+                "after".into(),
+                "policy-1".into(),
+                serde_json::json!([[8, {"title": "PDF-only"}]]),
+            ));
+            assert_eq!(manifest.version(), INGESTION_FORMAT_VERSION);
+            manifest.encode()
+        };
+        let (bytes, digest) = snapshot("sample", false);
+        assert!(bytes.starts_with(b"[2,"));
+        assert_eq!(snapshot("sample", true), (bytes, digest));
+        assert_ne!(snapshot("full", false).1, digest);
     }
 }

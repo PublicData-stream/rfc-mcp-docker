@@ -247,6 +247,38 @@ impl BlobWriter {
         self.install_with(input, max_bytes, |_| {})
     }
 
+    /// Keeps mismatching source captures out of the canonical blob namespace.
+    pub fn quarantine_mismatch(
+        &self,
+        rsync: &[u8],
+        https: &[u8],
+        max_bytes: usize,
+    ) -> io::Result<()> {
+        if rsync.len() > max_bytes || https.len() > max_bytes || rsync == https {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid mismatch evidence",
+            ));
+        }
+        let (name, stage) = new_stage(&self.staging)?;
+        for (filename, bytes) in [("body", rsync), ("https-body", https)] {
+            let mut file = create(&stage, filename)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        let mut incident = create(&stage, "incident.txt")?;
+        writeln!(
+            incident,
+            "rsync={} rsync_length={} https={} https_length={}",
+            BlobDigest::hash(rsync),
+            rsync.len(),
+            BlobDigest::hash(https),
+            https.len()
+        )?;
+        incident.sync_all()?;
+        self.move_to_quarantine(&name, &stage)
+    }
+
     fn install_with(
         &self,
         input: impl Read,
@@ -363,6 +395,10 @@ impl BlobWriter {
             error.kind()
         )?;
         incident.sync_all()?;
+        self.move_to_quarantine(name, stage)
+    }
+
+    fn move_to_quarantine(&self, name: &str, stage: &OwnedFd) -> io::Result<()> {
         fs::fsync(stage)?;
         fs::renameat_with(
             &self.staging,

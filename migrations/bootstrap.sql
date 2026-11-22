@@ -14,4 +14,5 @@ FROM pg_proc WHERE pronamespace = 'pg_catalog'::regnamespace AND
 \gexec
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock_shared(bigint) TO rfc_serve;
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_xact_lock(bigint) TO rfc_sync;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_try_advisory_lock(bigint) TO rfc_sync;
 COMMIT;

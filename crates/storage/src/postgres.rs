@@ -1,6 +1,6 @@
 //! PostgreSQL connection checks and the read-only corpus interface.
 
-use crate::manifest::{Coverage, Edge, Manifest, Member};
+use crate::manifest::{Coverage, Edge, Ingestion, Manifest, Member};
 use rfc_core::{BlobDigest, GenerationId};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::env;
@@ -13,7 +13,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSIONS: [i32; 2] = [1, 2];
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",
     "blobs",
@@ -30,6 +30,8 @@ const PUBLIC_READS: &[&str] = &[
     "rfc_relations",
     "edge_evidence",
     "relation_coverage",
+    "document_lexemes",
+    "generation_ingestion",
 ];
 
 /// Expected role for the executable opening a storage repository.
@@ -69,6 +71,8 @@ impl RuntimeRole {
                     "edge_evidence",
                     "relation_coverage",
                     "control_events",
+                    "document_lexemes",
+                    "generation_ingestion",
                 ] {
                     grants.push(format!("{name}:INSERT"));
                 }
@@ -77,7 +81,7 @@ impl RuntimeRole {
                     (
                         "document_versions",
                         "INSERT",
-                        "identity rfc_id txt_digest byte_length parser_version index_version encoding indexing_state notice_state notice_policy index_identity",
+                        "identity rfc_id txt_digest byte_length parser_version index_version encoding indexing_state notice_state notice_policy index_identity section_state line_starts",
                     ),
                     ("document_versions", "UPDATE", "sealed"),
                     (
@@ -114,6 +118,7 @@ impl RuntimeRole {
                         "generations_id_seq:USAGE",
                         "sync_jobs_id_seq:USAGE",
                         "pg_try_advisory_xact_lock(bigint):EXECUTE",
+                        "pg_try_advisory_lock(bigint):EXECUTE",
                     ]
                     .map(str::to_owned),
                 );
@@ -217,7 +222,7 @@ async fn verify(client: &Client, role: RuntimeRole) -> Result<()> {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    if versions != [SCHEMA_VERSION] {
+    if versions != SCHEMA_VERSIONS {
         return Err("unsupported storage schema version".into());
     }
     let differences = client.query(PRIVILEGE_CHECK, &[&role.privileges()]).await?;
@@ -314,8 +319,10 @@ impl Reader {
             "SELECT manifest_format, manifest_bytes, manifest_digest::bytea FROM rfc.generations
              WHERE id = $1 AND state IN ('ready', 'published', 'retained')", &[&id],
         ).await?;
-        let (actual, digest) = load_manifest(&tx, generation).await?.encode();
-        if row.try_get::<_, i32>(0)? != crate::manifest::FORMAT_VERSION
+        let manifest = load_manifest(&tx, generation).await?;
+        let format = manifest.version();
+        let (actual, digest) = manifest.encode();
+        if row.try_get::<_, i32>(0)? != format
             || row.try_get::<_, Vec<u8>>(1)? != actual
             || row.try_get::<_, &[u8]>(2)? != digest.as_bytes()
         {
@@ -372,12 +379,20 @@ pub async fn load_manifest(db: &impl GenericClient, generation: GenerationId) ->
     ).await? {
         coverage.push(Coverage(row.try_get(0)?, row.try_get(1)?, row.try_get(2)?, row.try_get(3)?));
     }
+    let ingestion = db.query_opt(
+        "SELECT scope, encode(catalog_before, 'hex'), encode(catalog_after, 'hex'), policy_registry, catalog_only::text
+         FROM rfc.generation_ingestion WHERE generation_id = $1", &[&id],
+    ).await?.map(|row| -> Result<Ingestion> {
+        Ok(Ingestion(row.try_get(0)?, row.try_get(1)?, row.try_get(2)?, row.try_get(3)?,
+            serde_json::from_str(row.try_get::<_, &str>(4)?)?))
+    }).transpose()?;
     Ok(Manifest {
         parser_version: versions.try_get(0)?,
         index_version: versions.try_get(1)?,
         members,
         edges,
         coverage,
+        ingestion,
     })
 }
 
