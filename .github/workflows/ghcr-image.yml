@@ -199,7 +199,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Publish without replacing an existing date tag
+      - name: Publish a new date tag and update latest
         shell: bash
         run: |
           digest=$(python3 scripts/ghcr_image.py image-digest "$IMAGE" "$TAG" "$GITHUB_SHA" "$SOURCE_COMMIT")
@@ -215,7 +215,15 @@ jobs:
           digest=$(python3 scripts/ghcr_image.py image-digest \
             "$IMAGE" "$TAG" "$GITHUB_SHA" "$SOURCE_COMMIT" --expected "$amd64" "$arm64")
           test -n "$digest"
-          printf 'Published %s:%s (%s).\n' "$IMAGE" "$TAG" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$digest"
+          latest_digest=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:latest" \
+            | jq -er .digest)
+          if [[ "$latest_digest" != "$digest" ]]; then
+            echo "::error::$IMAGE:latest resolved to $latest_digest instead of $digest."
+            exit 1
+          fi
+          printf 'Published %s:%s and %s:latest (%s).\n' \
+            "$IMAGE" "$TAG" "$IMAGE" "$digest" >> "$GITHUB_STEP_SUMMARY"
 
   update-upstream:
     name: Open a PR for a newer upstream release
