@@ -25,6 +25,7 @@ roxmltree = "0.21"
 [features]
 phase1-fixtures = []
 phase2-fixtures = []
+phase3-fixtures = ["phase2-fixtures", "rfc-storage/phase3-fixtures"]
 
 [[bin]]
 name = "rfc-phase1-fixture"
@@ -35,3 +36,8 @@ required-features = ["phase1-fixtures"]
 name = "rfc-phase2-fixture"
 path = "src/bin/phase2-fixture.rs"
 required-features = ["phase2-fixtures"]
+
+[[bin]]
+name = "rfc-phase3-fixture"
+path = "src/bin/phase3-fixture.rs"
+required-features = ["phase3-fixtures"]

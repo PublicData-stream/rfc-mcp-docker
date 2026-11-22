@@ -103,3 +103,39 @@ The Phase 1 gate covers the local rootless amd64 fixture profile and process int
 - python3 scripts/phase2/integration.py --live verified RFCs 2119, 8174, and 9110 from official rsync and HTTPS in a fresh Compose project. The catalog digest matched across both captures and the scoped candidate reached ready with manifest c6feca1a6071e62c97b19f4f7447195ba5dceed516c065e211f12ac522d4695d. The report recorded two unavailable RFCXML bodies, one RFC with incomplete reference coverage, and one RFC with incomplete section coverage. The active pointer stayed unset.
 
 The live sample is the extent of upstream verification. Full live reconciliation, publication, and production-scale capacity remain later verification work.
+
+## Phase 3
+
+**Verified locally on rootless Linux amd64 on 2026-11-22.** The runtime changes are in `bde10fc` and `8204309`. Tests used kernel `7.0.0-44-generic`, Docker Engine `29.10.0`, Compose `v5.8.0`, Rust `1.99.1`, and the PostgreSQL 19.0 Alpine image pinned in Phase 0. Cargo output used `/tmp/rust/target`. The Compose projects kept test data, credentials, and volume backing directories under `/tmp`. [Operator commands, lock ordering, and backup procedure](publication.md)
+
+| Tested image | Local image ID |
+|---|---|
+| Serve | `sha256:6c20eeb96ea212479f8b44a9ac54bcac8667129efe9a4ffcf64441e8a1053988` |
+| Sync | `sha256:29034f624ddd9771b1b2eac90a0031c6c48bb944dc767248ae3831e761c2862d` |
+| Feed | `sha256:528f7cff4a3a66184d0862feb1a391c33dba8fb9747229882a6ab7c320ba1c77` |
+| PostgreSQL | `sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188` |
+| Phase 3 fixture | `sha256:39de3e7a73acac9b939730468f262c7972abefc19f4ed79aa247aef3f9a38e72` |
+
+### Commands
+
+```sh
+export CARGO_TARGET_DIR=/tmp/rust/target
+cargo fetch --locked
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+actionlint .github/workflows/ci.yml
+python3 scripts/phase0/integration.py --project rfc-phase3-final
+python3 scripts/phase1/integration.py --image-prefix rfc-phase3-final
+python3 scripts/phase2/integration.py --image-prefix rfc-phase3-final
+python3 scripts/phase3/integration.py --image-prefix rfc-phase3-final
+```
+
+### Observations
+
+- The locked Rust checks, full-feature Clippy and tests, and `actionlint .github/workflows/ci.yml` passed locally. The Phase 0 Compose probe passed strict MCP wire behavior, PostgreSQL 19 locks and privileges, TLS, exact fixture rsync, and the effective Landlock and seccomp controls. The Phase 1 and Phase 2 regressions passed storage and restore compatibility, original-byte ingestion and indexing, and the service permission boundaries. Phase 2's first run during parallel fixture image exports timed out in Compose setup. The rerun after image export passed, and the two leftover test volumes were removed.
+- The Phase 3 Compose suite upgraded a schema 2 database to schema 3 and preserved the existing ready row byte for byte. On an initially empty pointer, an interrupted promotion and an injected outbox insert failure left the pointer at sequence zero. Process exit after commit made the new generation readable with a pending event. The suite rejected a scoped sample, a stale expected sequence, and a corrupted canonical file. Seven publication events included two successful rollbacks. Concurrent readers observed consistent metadata, manifests, and original bytes through a pointer change.
+- The suite terminated sync around candidate insertion, file and directory sync, and readiness. Recovery cleared incomplete candidates and staging while the active generation remained readable. It terminated a PostgreSQL backend during an accepted read and proved the shared mirror fence still blocked removal. A reader waiting behind exclusive retirement observed the tombstone before accessing bytes. A held mirror coordinator blocked concurrent reconciliation even after the collector lost its PostgreSQL backend. Cancelling a fixture worker reaped it. The active and retained generations continued sharing unchanged blobs on the same inode.
+- The suite interrupted retirement before and after its database commit and interrupted deletion before unlink, after unlink, and after directory sync. Recovery drained the queue; a queued digest could not be registered before cleanup. Count and age protections and explicit ready-candidate discard passed. A fresh Compose project restored the quiescent PostgreSQL dump, registered blob inventory, and readable generation locks, then reproduced the active and retained guarded reads and the outbox count.
+
+The evidence covers synthetic fixtures, process interruption, and PostgreSQL connection loss on the local profile. Full live corpus publication, physical power loss, hosted CI, public deployment, and authenticated notification delivery remain separate verification work.

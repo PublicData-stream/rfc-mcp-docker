@@ -1,5 +1,5 @@
 # 0004 — Publication and reader locking
 
-Install and synchronize immutable files before committing the active-generation pointer and outbox event in PostgreSQL. Use a publisher/GC coordination lock and transaction-scoped per-generation locks. Readers acquire shared locks in READ COMMITTED READ ONLY and recheck generation status in a new statement before accessing blobs. A retire operation takes the corresponding exclusive lock and rechecks eligibility.
+Install and synchronize immutable files before committing the active-generation pointer and outbox event in PostgreSQL. Sync acquires a stable mirror lock before taking the session advisory lock. Readers acquire shared generation locks in PostgreSQL and on the mirror, then recheck generation status in a fresh statement inside `READ COMMITTED READ ONLY`. Retirement takes the corresponding exclusive locks and rechecks eligibility. The mirror lock protects ongoing filesystem access if a PostgreSQL session disconnects.
 
-Lock lifetime covers the reader's final blob access, including a ripgrep worker. Readers retain SELECT-only application access. The Phase 0 probe verifies that the shared lock works under that role and conflicts with an exclusive lock.
+Lock lifetime covers the reader's final blob access, including a supervised worker. Readers retain SELECT-only application access. See the [operator commands and recovery contract](../publication.md).
