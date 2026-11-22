@@ -149,7 +149,7 @@ async fn run(
 ) -> Result<(GenerationId, BlobDigest)> {
     let upstream = upstream?;
     let writer = Writer::connect().await?;
-    writer.acquire_ingestion_lock().await?;
+    let _coordinator = writer.acquire_coordinator().await?;
     let root = mirror_root();
     let store = BlobWriter::open(&root)?;
     let reader = BlobReader::open(&root, false)?;

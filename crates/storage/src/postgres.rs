@@ -1,19 +1,23 @@
 //! PostgreSQL connection checks and the read-only corpus interface.
 
-use crate::manifest::{Coverage, Edge, Ingestion, Manifest, Member};
-use rfc_core::{BlobDigest, GenerationId};
+use crate::{
+    blob::BlobReader,
+    manifest::{Coverage, Edge, Ingestion, Manifest, Member},
+};
+use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::timeout;
-use tokio_postgres::{Client, GenericClient, config::SslMode};
+use tokio_postgres::{Client, GenericClient, IsolationLevel, Transaction, config::SslMode};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSIONS: [i32; 2] = [1, 2];
+const SCHEMA_VERSIONS: [i32; 3] = [1, 2, 3];
+const READ_DEADLINE: Duration = Duration::from_secs(15);
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",
     "blobs",
@@ -57,7 +61,12 @@ impl RuntimeRole {
         match self {
             Self::Serve => grants.push("pg_advisory_xact_lock_shared(bigint):EXECUTE".to_owned()),
             Self::Sync => {
-                for name in ["sync_jobs", "control_events", "notification_outbox"] {
+                for name in [
+                    "sync_jobs",
+                    "control_events",
+                    "notification_outbox",
+                    "blob_deletion_queue",
+                ] {
                     grants.push(format!("{name}:SELECT"));
                 }
                 for name in [
@@ -119,6 +128,12 @@ impl RuntimeRole {
                         "sync_jobs_id_seq:USAGE",
                         "pg_try_advisory_xact_lock(bigint):EXECUTE",
                         "pg_try_advisory_lock(bigint):EXECUTE",
+                        "generation_blobs(bigint):EXECUTE",
+                        "promote_generation(bigint,bigint,boolean):EXECUTE",
+                        "retire_generation(bigint,integer,integer,boolean):EXECUTE",
+                        "mark_unreachable_blobs():EXECUTE",
+                        "queue_orphan_blobs(bytea[]):EXECUTE",
+                        "finish_blob_deletion(bytea):EXECUTE",
                     ]
                     .map(str::to_owned),
                 );
@@ -130,10 +145,14 @@ impl RuntimeRole {
 
 /// Opens and verifies a dedicated PostgreSQL session. Writer construction lives in sync.
 pub async fn connect(role: RuntimeRole) -> Result<Client> {
+    Ok(open_session(role).await?.0)
+}
+
+async fn open_session(role: RuntimeRole) -> Result<(Client, tokio::task::JoinHandle<()>)> {
     timeout(Duration::from_secs(10), connect_and_verify(role)).await?
 }
 
-async fn connect_and_verify(role: RuntimeRole) -> Result<Client> {
+async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::JoinHandle<()>)> {
     let host = env::var("RFC_DB_HOST")?;
     let port = env::var("RFC_DB_PORT")
         .ok()
@@ -177,11 +196,11 @@ async fn connect_and_verify(role: RuntimeRole) -> Result<Client> {
         .options("-csearch_path=pg_catalog,rfc -cstatement_timeout=5000 -clock_timeout=3000 -cidle_in_transaction_session_timeout=10000")
         .connect(MakeRustlsConnect::new(tls))
         .await?;
-    tokio::spawn(async move {
+    let driver = tokio::spawn(async move {
         let _ = connection.await;
     });
     verify(&client, role).await?;
-    Ok(client)
+    Ok((client, driver))
 }
 
 async fn verify(client: &Client, role: RuntimeRole) -> Result<()> {
@@ -284,13 +303,132 @@ ORDER BY 1";
 /// A reader connection that has verified its SELECT-only privilege boundary.
 pub struct Reader {
     client: Client,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        // Closing the dedicated socket also cancels any SQL still in flight.
+        self.driver.abort();
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum GenerationSelection {
+    Active,
+    Pinned(GenerationId),
+}
+
+#[derive(Debug)]
+pub struct GenerationUnavailable;
+
+impl std::fmt::Display for GenerationUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("generation_unavailable")
+    }
+}
+
+impl std::error::Error for GenerationUnavailable {}
+
+/// Keeps both the database snapshot selection and the mirror fence alive.
+pub struct GenerationReadGuard<'a> {
+    tx: Transaction<'a>,
+    mirror: &'a BlobReader,
+    _fence: File,
+    generation: GenerationId,
+    sequence: i64,
+}
+
+impl GenerationReadGuard<'_> {
+    pub fn generation(&self) -> GenerationId {
+        self.generation
+    }
+
+    pub fn publication_sequence(&self) -> i64 {
+        self.sequence
+    }
+
+    /// Bind generation-scoped metadata queries to `generation()`.
+    pub fn transaction(&self) -> &Transaction<'_> {
+        &self.tx
+    }
+
+    async fn document_digest(&self, rfc: RfcNumber) -> Result<BlobDigest> {
+        let generation = i64::try_from(self.generation.get())?;
+        let number = i32::try_from(rfc.get())?;
+        let row = self
+            .tx
+            .query_opt(
+                "SELECT d.txt_digest::bytea FROM rfc.generation_documents m
+             JOIN rfc.document_versions d ON d.identity = m.document_version
+             WHERE m.generation_id = $1 AND m.rfc_id = $2::integer",
+                &[&generation, &number],
+            )
+            .await?
+            .ok_or("RFC is absent from the guarded generation")?;
+        Ok(BlobDigest::from_bytes(
+            row.try_get::<_, &[u8]>(0)?.try_into()?,
+        ))
+    }
+
+    pub async fn read_document(
+        &self,
+        rfc: RfcNumber,
+        range: ByteRange,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let digest = self.document_digest(rfc).await?;
+        Ok(self.mirror.read_range(digest, range, limit)?)
+    }
+
+    /// Plan a worker's allowlist through membership and pre-open the original inodes.
+    /// The caller keeps the guard through completion and reaping of the worker.
+    pub async fn open_worker_files(&self, rfcs: &[RfcNumber], limit: usize) -> Result<Vec<File>> {
+        if rfcs.len() > limit {
+            return Err("worker file count exceeds limit".into());
+        }
+        let mut files = Vec::with_capacity(rfcs.len());
+        for &rfc in rfcs {
+            let digest = self.document_digest(rfc).await?;
+            files.push(self.mirror.open_blob(digest)?);
+        }
+        Ok(files)
+    }
+
+    /// Start a trusted launcher. The supervisor retains the filesystem fence
+    /// through kill and reap even when the caller is cancelled or times out.
+    pub async fn run_worker(
+        &self,
+        command: &mut tokio::process::Command,
+    ) -> Result<std::process::ExitStatus> {
+        let fence = self._fence.try_clone()?;
+        let mut child = command.process_group(0).kill_on_drop(true).spawn()?;
+        let group = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or("worker has no process group ID")?;
+        let (caller, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let worker = tokio::spawn(async move {
+            let _fence = fence;
+            tokio::select! {
+                status = child.wait() => status,
+                _ = cancelled => {
+                    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                    child.wait().await
+                }
+            }
+        });
+        let status = worker.await??;
+        drop(caller);
+        Ok(status)
+    }
 }
 
 impl Reader {
     pub async fn connect() -> Result<Self> {
-        Ok(Self {
-            client: connect(RuntimeRole::Serve).await?,
-        })
+        let (client, driver) = open_session(RuntimeRole::Serve).await?;
+        Ok(Self { client, driver })
     }
 
     /// Returns the current pointer and its independent monotonic sequence.
@@ -301,6 +439,94 @@ impl Reader {
             .map(|id| GenerationId::new(id).ok_or("invalid generation ID"))
             .transpose()?;
         Ok((generation, row.try_get(1)?))
+    }
+
+    /// Run one bounded operation on a dedicated, disposable read session.
+    pub async fn with_generation<T>(
+        mut self,
+        selection: GenerationSelection,
+        operation: impl for<'a, 'b> AsyncFnOnce(&'a GenerationReadGuard<'b>) -> Result<T>,
+    ) -> Result<T> {
+        let operation = async {
+            for attempt in 0..2 {
+                let tx = self
+                    .client
+                    .build_transaction()
+                    .isolation_level(IsolationLevel::ReadCommitted)
+                    .read_only(true)
+                    .start()
+                    .await?;
+                let (id, resolved_sequence) = match selection {
+                    GenerationSelection::Active => {
+                        let row = tx.query_one("SELECT generation_id, publication_sequence FROM rfc.active_generation WHERE singleton", &[]).await?;
+                        (
+                            row.try_get::<_, Option<i64>>(0)?
+                                .ok_or(GenerationUnavailable)?,
+                            Some(row.try_get(1)?),
+                        )
+                    }
+                    GenerationSelection::Pinned(generation) => {
+                        (i64::try_from(generation.get())?, None)
+                    }
+                };
+                let generation = GenerationId::new(id).ok_or("invalid generation ID")?;
+                crate::fixture_boundary("reader_resolved");
+                tx.query_one("SELECT pg_advisory_xact_lock_shared($1)", &[&id])
+                    .await?;
+                let mirror = loop {
+                    let result = BlobReader::open(&mirror_root(), true).and_then(|mirror| {
+                        let fence = mirror.generation_fence(generation)?;
+                        Ok((mirror, fence))
+                    });
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    } else {
+                        break result;
+                    }
+                };
+                let mirror = match mirror {
+                    Ok(mirror) => Some(mirror),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                // This statement starts after taking the locks, including when the
+                // generation was retired while the advisory lock was pending.
+                let row = tx
+                    .query_opt(
+                        "SELECT last_publication_sequence FROM rfc.generations
+                     WHERE id = $1 AND state IN ('published', 'retained')",
+                        &[&id],
+                    )
+                    .await?;
+                if let Some(row) = row {
+                    let (mirror, fence) =
+                        mirror.ok_or("readable generation is missing its mirror fence")?;
+                    let sequence = resolved_sequence.unwrap_or(row.try_get(0)?);
+                    let guard = GenerationReadGuard {
+                        tx,
+                        mirror: &mirror,
+                        _fence: fence,
+                        generation,
+                        sequence,
+                    };
+                    let result = operation(&guard).await?;
+                    guard.tx.commit().await?;
+                    return Ok(result);
+                }
+                tx.rollback().await?;
+                if attempt == 1 || matches!(selection, GenerationSelection::Pinned(_)) {
+                    return Err(GenerationUnavailable.into());
+                }
+            }
+            unreachable!("generation attempts are bounded")
+        };
+        tokio::select! {
+            result = timeout(READ_DEADLINE, operation) => result?,
+            _ = &mut self.driver => Err("generation read session closed".into()),
+        }
     }
 
     /// Checks stored manifest bytes and the manifest reconstructed from rows.
@@ -315,22 +541,35 @@ impl Reader {
             .await?;
         tx.query_one("SELECT pg_advisory_xact_lock_shared($1)", &[&id])
             .await?;
-        let row = tx.query_one(
-            "SELECT manifest_format, manifest_bytes, manifest_digest::bytea FROM rfc.generations
-             WHERE id = $1 AND state IN ('ready', 'published', 'retained')", &[&id],
-        ).await?;
-        let manifest = load_manifest(&tx, generation).await?;
-        let format = manifest.version();
-        let (actual, digest) = manifest.encode();
-        if row.try_get::<_, i32>(0)? != format
-            || row.try_get::<_, Vec<u8>>(1)? != actual
-            || row.try_get::<_, &[u8]>(2)? != digest.as_bytes()
-        {
-            return Err("stored generation manifest differs from its inputs".into());
-        }
+        tx.query_one(
+            "SELECT id FROM rfc.generations WHERE id = $1 AND state = 'ready'",
+            &[&id],
+        )
+        .await?;
+        let digest = verify_stored_manifest(&tx, generation).await?;
         tx.commit().await?;
         Ok(digest)
     }
+}
+
+pub async fn verify_stored_manifest(
+    db: &impl GenericClient,
+    generation: GenerationId,
+) -> Result<BlobDigest> {
+    let id = i64::try_from(generation.get())?;
+    let row = db.query_one(
+        "SELECT manifest_format, manifest_bytes, manifest_digest::bytea FROM rfc.generations WHERE id = $1", &[&id],
+    ).await?;
+    let manifest = load_manifest(db, generation).await?;
+    let format = manifest.version();
+    let (actual, digest) = manifest.encode();
+    if row.try_get::<_, i32>(0)? != format
+        || row.try_get::<_, Vec<u8>>(1)? != actual
+        || row.try_get::<_, &[u8]>(2)? != digest.as_bytes()
+    {
+        return Err("stored generation manifest differs from its inputs".into());
+    }
+    Ok(digest)
 }
 
 /// Loads a manifest for a generation whose state is protected by the caller.

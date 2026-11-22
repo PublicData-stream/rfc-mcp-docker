@@ -8,7 +8,7 @@ mod sandbox;
 use rfc_mcp_docker::ProbeResult;
 use rfc_storage::{
     blob::BlobReader,
-    postgres::{Reader, mirror_root},
+    postgres::{GenerationSelection, Reader, mirror_root},
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -22,7 +22,14 @@ async fn main() -> ProbeResult {
         [option] if option == "--phase1-check-storage" => {
             let reader = Reader::connect().await?;
             BlobReader::open(&mirror_root(), true)?;
-            let (_, sequence) = reader.active().await?;
+            let (active, mut sequence) = reader.active().await?;
+            if active.is_some() {
+                sequence = reader
+                    .with_generation(GenerationSelection::Active, async |guard| {
+                        Ok(guard.publication_sequence())
+                    })
+                    .await?;
+            }
             println!("serve storage checks passed, publication sequence {sequence}");
             Ok(())
         }

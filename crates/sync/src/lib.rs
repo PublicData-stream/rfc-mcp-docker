@@ -1,13 +1,17 @@
 //! Candidate-writing repository for the synchronization executable.
 
 use rfc_core::{BlobDigest, ByteRange, Coverage, GenerationId, Relation, RfcNumber, SectionId};
-use rfc_storage::blob::DurableBlob;
-use rfc_storage::manifest::identity;
-use rfc_storage::postgres::{Result, RuntimeRole, connect, load_manifest};
+use rfc_storage::{
+    blob::{BlobWriter, DurableBlob},
+    manifest::identity,
+    postgres::{Result, RuntimeRole, connect, load_manifest, mirror_root},
+};
+use std::os::fd::OwnedFd;
 use tokio_postgres::{Client, Transaction};
 
 mod ingest;
 mod policy;
+mod publication;
 mod text;
 mod upstream;
 mod xml;
@@ -15,6 +19,7 @@ mod xml;
 #[cfg(feature = "phase2-fixtures")]
 pub use ingest::reconcile_fixture;
 pub use ingest::{Scope, reconcile};
+pub use publication::promote;
 pub use xml::validate_feed;
 
 pub struct Writer {
@@ -57,7 +62,14 @@ impl Writer {
         Ok(Candidate { id, tx })
     }
 
-    async fn acquire_ingestion_lock(&self) -> Result<()> {
+    async fn acquire_coordinator(&self) -> Result<OwnedFd> {
+        let fence = BlobWriter::coordinate(&mirror_root()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                std::io::Error::other("another synchronization holds the corpus lock")
+            } else {
+                error
+            }
+        })?;
         let held: bool = self
             .client
             .query_one("SELECT pg_catalog.pg_try_advisory_lock(-1::bigint)", &[])
@@ -66,14 +78,16 @@ impl Writer {
         if !held {
             return Err("another synchronization holds the corpus lock".into());
         }
-        Ok(())
+        Ok(fence)
     }
 
     async fn start_ingestion(&self, parser: &str, index: &str) -> Result<GenerationId> {
+        rfc_storage::fixture_boundary("before_candidate_insert");
         let row = self.client.query_one(
             "INSERT INTO rfc.generations (parser_version, index_version) VALUES ($1, $2) RETURNING id",
             &[&parser, &index],
         ).await?;
+        rfc_storage::fixture_boundary("after_candidate_insert");
         GenerationId::new(row.try_get(0)?).ok_or_else(|| "invalid candidate ID".into())
     }
 
@@ -462,6 +476,7 @@ impl Candidate<'_> {
 
     /// Freezes the candidate with the deterministic serialization of its inputs.
     pub async fn ready(self) -> Result<(GenerationId, BlobDigest)> {
+        rfc_storage::fixture_boundary("before_readiness");
         let generation = self.generation();
         self.tx.query_one("SELECT id FROM rfc.generations WHERE id = $1 AND state = 'building' FOR NO KEY UPDATE",
             &[&generation]).await?;
@@ -473,6 +488,7 @@ impl Candidate<'_> {
             &[&generation, &format, &bytes, &digest.as_bytes().as_slice()],
         ).await?;
         self.tx.commit().await?;
+        rfc_storage::fixture_boundary("after_readiness");
         Ok((self.id, digest))
     }
 

@@ -1,8 +1,9 @@
 //! Linux filesystem operations for the Compose mirror volume.
 
-use rfc_core::{BlobDigest, ByteRange};
+use rfc_core::{BlobDigest, ByteRange, GenerationId};
 use rustix::fs::{
-    self, AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, ResolveFlags, StatVfsMountFlags,
+    self, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags,
+    StatVfsMountFlags,
 };
 use rustix::io::Errno;
 use std::fs::File;
@@ -117,6 +118,14 @@ impl BlobReader {
         regular(&self.root, &relative_path(digest))
     }
 
+    pub(crate) fn generation_fence(&self, generation: GenerationId) -> io::Result<File> {
+        generation_fence(
+            &self.root,
+            generation,
+            FlockOperation::NonBlockingLockShared,
+        )
+    }
+
     /// Reads a range with an explicit allocation ceiling.
     pub fn read_range(
         &self,
@@ -140,6 +149,16 @@ impl BlobReader {
         file.read_exact(&mut bytes)?;
         Ok(bytes)
     }
+}
+
+fn generation_fence(
+    root: &OwnedFd,
+    generation: GenerationId,
+    operation: FlockOperation,
+) -> io::Result<File> {
+    let file = regular(root, &format!("generation-locks/{}", generation.get()))?;
+    fs::flock(&file, operation)?;
+    Ok(file)
 }
 
 /// A blob verified and synchronized before database registration.
@@ -191,6 +210,19 @@ enum Boundary {
 }
 
 impl BlobWriter {
+    /// The mirror inode remains locked across database failures and is never replaced.
+    pub fn coordinate(path: &Path) -> io::Result<OwnedFd> {
+        let root = mirror(path)?;
+        if read_only(&root)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "sync requires a writable mirror mount",
+            ));
+        }
+        fs::flock(&root, FlockOperation::NonBlockingLockExclusive)?;
+        Ok(root)
+    }
+
     /// Opens a writable mirror and durably prepares its private directories.
     pub fn open(path: &Path) -> io::Result<Self> {
         let root = mirror(path)?;
@@ -228,6 +260,43 @@ impl BlobWriter {
         })
     }
 
+    pub fn prepare_generation_fence(&self, generation: GenerationId) -> io::Result<()> {
+        let locks = ensure_directory(&self.root, "generation-locks", PUBLIC_DIRECTORY)?;
+        let name = generation.get().to_string();
+        match fs::openat2(
+            &locks,
+            name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o444),
+            RESOLVE,
+        ) {
+            Ok(file) => fs::fsync(file)?,
+            Err(Errno::EXIST) => regular(&locks, &name)?.sync_all()?,
+            Err(error) => return Err(error.into()),
+        }
+        fs::fsync(&locks)?;
+        Ok(())
+    }
+
+    pub fn verify_generation_fence(&self, generation: GenerationId) -> io::Result<()> {
+        regular(
+            &self.root,
+            &format!("generation-locks/{}", generation.get()),
+        )?
+        .sync_all()
+    }
+
+    /// Verify canonical bytes and flush their existing name before publication.
+    pub fn verify_durable(&self, digest: BlobDigest, byte_length: i64) -> io::Result<()> {
+        self.verify_existing(DurableBlob {
+            digest,
+            byte_length,
+        })?;
+        let hex = digest.to_string();
+        fs::fsync(directory(&self.blobs, &hex[..2])?)?;
+        Ok(())
+    }
+
     /// Opens a regular file beneath an explicitly selected trusted source root.
     pub fn open_candidate(&self, source_root: &Path, relative: &str) -> io::Result<File> {
         if relative
@@ -244,7 +313,14 @@ impl BlobWriter {
 
     /// Streams bytes with an explicit maximum representable PostgreSQL length.
     pub fn install(&self, input: impl Read, max_bytes: u64) -> io::Result<Install> {
-        self.install_with(input, max_bytes, |_| {})
+        self.install_with(input, max_bytes, |boundary| {
+            crate::fixture_boundary(match boundary {
+                Boundary::BeforeFileSync => "before_file_sync",
+                Boundary::AfterFileSync => "after_file_sync",
+                Boundary::AfterRename => "after_blob_install",
+                Boundary::AfterDirectorySync => "after_directory_sync",
+            });
+        })
     }
 
     /// Keeps mismatching source captures out of the canonical blob namespace.
