@@ -28,4 +28,10 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 3) AS apply
 \ir 0003-publication.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (3);
 \endif
+SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 4) AS apply_v4
+\gset
+\if :apply_v4
+\ir 0004-search.sql
+INSERT INTO rfc.schema_migrations (version) VALUES (4);
+\endif
 COMMIT;

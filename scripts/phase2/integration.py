@@ -137,7 +137,7 @@ COMMIT;
     assert project.sql("SELECT version FROM rfc.schema_migrations") == "1"
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4"
 
 
 def verify_ranges(project, report, sources):

@@ -7,3 +7,19 @@ license.workspace = true
 
 [dependencies]
 rfc-core = { path = "../core" }
+rfc-storage = { path = "../storage" }
+base64 = "0.22"
+memchr = "2"
+ring = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-postgres.workspace = true
+
+[features]
+phase4-fixtures = []
+
+[[bin]]
+name = "rfc-phase4-fixture"
+path = "src/bin/phase4-fixture.rs"
+required-features = ["phase4-fixtures"]

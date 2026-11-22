@@ -8,6 +8,7 @@ use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::env;
 use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -16,7 +17,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSIONS: [i32; 3] = [1, 2, 3];
+const SCHEMA_VERSIONS: [i32; 4] = [1, 2, 3, 4];
 const READ_DEADLINE: Duration = Duration::from_secs(15);
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",
@@ -339,6 +340,39 @@ pub struct GenerationReadGuard<'a> {
     sequence: i64,
 }
 
+/// An original file selected through generation membership. The mirror fence
+/// remains held if a bounded blocking read outlives its requesting task.
+pub struct GuardedOriginal {
+    file: File,
+    digest: BlobDigest,
+    _fence: File,
+}
+
+impl GuardedOriginal {
+    pub fn read_verified(self, expected_length: usize) -> io::Result<Vec<u8>> {
+        let length = u64::try_from(expected_length).map_err(io::Error::other)?;
+        if self.file.metadata()?.len() != length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Original length differs",
+            ));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(expected_length)
+            .map_err(io::Error::other)?;
+        let read_limit = length.checked_add(1).ok_or(io::ErrorKind::InvalidInput)?;
+        self.file.take(read_limit).read_to_end(&mut bytes)?;
+        if bytes.len() != expected_length || BlobDigest::hash(&bytes) != self.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Original content differs",
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
 impl GenerationReadGuard<'_> {
     pub fn generation(&self) -> GenerationId {
         self.generation
@@ -379,6 +413,15 @@ impl GenerationReadGuard<'_> {
     ) -> Result<Vec<u8>> {
         let digest = self.document_digest(rfc).await?;
         Ok(self.mirror.read_range(digest, range, limit)?)
+    }
+
+    pub async fn open_original(&self, rfc: RfcNumber) -> Result<GuardedOriginal> {
+        let digest = self.document_digest(rfc).await?;
+        Ok(GuardedOriginal {
+            file: self.mirror.open_blob(digest)?,
+            digest,
+            _fence: self._fence.try_clone()?,
+        })
     }
 
     /// Plan a worker's allowlist through membership and pre-open the original inodes.

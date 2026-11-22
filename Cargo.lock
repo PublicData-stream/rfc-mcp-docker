@@ -1216,7 +1216,15 @@ dependencies = [
 name = "rfc-search"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
+ "memchr",
  "rfc-core",
+ "rfc-storage",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
