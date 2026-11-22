@@ -1,5 +1,5 @@
 use rfc_mcp_docker::{ProbeResult, https_probe};
-use rfc_mcp_docker_sync::Writer;
+use rfc_mcp_docker_sync::{Scope, Writer, reconcile};
 use rfc_storage::{blob::BlobWriter, postgres::mirror_root};
 use std::path::Path;
 
@@ -20,6 +20,14 @@ async fn main() -> ProbeResult {
         [option, url, ca, expected] if option == "--phase0-https" => {
             https_probe(url, Path::new(ca), expected).await
         }
-        _ => Err("rfc-mcp-docker-sync: expected --version or --phase1-check-storage".into()),
+        [option, scope] if option == "--phase2-reconcile" => match scope.as_str() {
+            "--full" => reconcile(Scope::Full).await,
+            "--sample" => reconcile(Scope::Sample).await,
+            _ => Err("reconciliation requires --full or --sample".into()),
+        },
+        _ => Err(
+            "expected --version, --phase1-check-storage, or --phase2-reconcile (--full|--sample)"
+                .into(),
+        ),
     }
 }

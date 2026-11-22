@@ -2,9 +2,20 @@
 
 use rfc_core::{BlobDigest, ByteRange, Coverage, GenerationId, Relation, RfcNumber, SectionId};
 use rfc_storage::blob::DurableBlob;
-use rfc_storage::manifest::{FORMAT_VERSION, identity};
+use rfc_storage::manifest::identity;
 use rfc_storage::postgres::{Result, RuntimeRole, connect, load_manifest};
 use tokio_postgres::{Client, Transaction};
+
+mod ingest;
+mod policy;
+mod text;
+mod upstream;
+mod xml;
+
+#[cfg(feature = "phase2-fixtures")]
+pub use ingest::reconcile_fixture;
+pub use ingest::{Scope, reconcile};
+pub use xml::validate_feed;
 
 pub struct Writer {
     client: Client,
@@ -44,6 +55,43 @@ impl Writer {
         ).await?;
         let id = GenerationId::new(row.try_get(0)?).ok_or("invalid candidate ID")?;
         Ok(Candidate { id, tx })
+    }
+
+    async fn acquire_ingestion_lock(&self) -> Result<()> {
+        let held: bool = self
+            .client
+            .query_one("SELECT pg_catalog.pg_try_advisory_lock(-1::bigint)", &[])
+            .await?
+            .try_get(0)?;
+        if !held {
+            return Err("another synchronization holds the corpus lock".into());
+        }
+        Ok(())
+    }
+
+    async fn start_ingestion(&self, parser: &str, index: &str) -> Result<GenerationId> {
+        let row = self.client.query_one(
+            "INSERT INTO rfc.generations (parser_version, index_version) VALUES ($1, $2) RETURNING id",
+            &[&parser, &index],
+        ).await?;
+        GenerationId::new(row.try_get(0)?).ok_or_else(|| "invalid candidate ID".into())
+    }
+
+    async fn batch(&mut self, id: GenerationId) -> Result<Candidate<'_>> {
+        Ok(Candidate {
+            id,
+            tx: self.client.transaction().await?,
+        })
+    }
+
+    async fn fail(&self, id: GenerationId) -> Result<()> {
+        self.client
+            .execute(
+                "UPDATE rfc.generations SET state = 'failed' WHERE id = $1 AND state = 'building'",
+                &[&i64::try_from(id.get())?],
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -121,6 +169,12 @@ pub struct Candidate<'a> {
     tx: Transaction<'a>,
 }
 
+struct IndexedText<'a> {
+    section_state: Coverage,
+    line_starts: &'a [i64],
+    text: Option<&'a str>,
+}
+
 impl Candidate<'_> {
     fn generation(&self) -> i64 {
         self.id.get() as i64
@@ -163,7 +217,15 @@ impl Candidate<'_> {
         Ok(id)
     }
 
-    pub async fn document(&self, mut document: Document<'_>) -> Result<BlobDigest> {
+    pub async fn document(&self, document: Document<'_>) -> Result<BlobDigest> {
+        self.document_with_index(document, None).await
+    }
+
+    async fn document_with_index(
+        &self,
+        mut document: Document<'_>,
+        indexed: Option<IndexedText<'_>>,
+    ) -> Result<BlobDigest> {
         let rfc = document.rfc.get() as i32;
         let length = document.txt.byte_length();
         let digest = document.txt.digest();
@@ -176,7 +238,17 @@ impl Candidate<'_> {
         document
             .notices
             .sort_unstable_by_key(|notice| notice.ordinal);
-        let index_identity = index_identity(&document)?;
+        let mut index_identity = index_identity(&document)?;
+        if let Some(indexed) = &indexed {
+            index_identity = identity(
+                "rfc-document-index-v2",
+                &(
+                    index_identity.to_string(),
+                    indexed.section_state.as_str(),
+                    indexed.line_starts,
+                ),
+            )?;
+        }
         let id = identity(
             "rfc-document-version-v1",
             &(
@@ -195,12 +267,14 @@ impl Candidate<'_> {
         self.rfc_identity(rfc).await?;
         let inserted = self.tx.execute(
             "INSERT INTO rfc.document_versions (identity, rfc_id, txt_digest, byte_length, parser_version, index_version,
-                encoding, indexing_state, notice_state, notice_policy, index_identity)
-             VALUES ($1::bytea, $2::integer, $3::bytea, $4::bigint, $5, $6, $7, $8::text, $9::text, $10, $11::bytea)
+                encoding, indexing_state, notice_state, notice_policy, index_identity, section_state, line_starts)
+             VALUES ($1::bytea, $2::integer, $3::bytea, $4::bigint, $5, $6, $7, $8::text, $9::text, $10, $11::bytea, $12::text, $13::bigint[])
              ON CONFLICT DO NOTHING",
             &[&key, &rfc, &digest.as_bytes().as_slice(), &length, &document.parser_version, &document.index_version,
               &document.encoding, &document.index_state.as_str(), &document.notice_state.as_str(),
-              &document.notice_policy, &index_identity.as_bytes().as_slice()],
+              &document.notice_policy, &index_identity.as_bytes().as_slice(),
+              &indexed.as_ref().map(|index| index.section_state.as_str()),
+              &indexed.as_ref().map(|index| index.line_starts)],
         ).await?;
         if inserted == 0 {
             let sealed: bool = self
@@ -243,6 +317,19 @@ impl Candidate<'_> {
                 &[&key, &length, &notice.ordinal, &notice.category, &start, &end, &notice.extraction.as_str(), &notice.review],
             ).await?;
         }
+        if let Some(text) = indexed.and_then(|index| index.text) {
+            self.tx
+                .batch_execute("SET LOCAL statement_timeout = '30s'")
+                .await?;
+            self.tx.execute(
+                "INSERT INTO rfc.document_lexemes (document_version, lexeme)
+                 SELECT DISTINCT $1::bytea, term.lexeme COLLATE pg_catalog.\"C\"
+                 FROM pg_catalog.ts_debug('pg_catalog.simple'::regconfig, $2::text) AS token
+                 CROSS JOIN LATERAL pg_catalog.unnest(token.lexemes) AS term(lexeme)
+                 WHERE octet_length(token.token) < 2048 AND octet_length(term.lexeme) BETWEEN 1 AND 2047",
+                &[&key, &text],
+            ).await?;
+        }
         self.tx
             .execute(
                 "UPDATE rfc.document_versions SET sealed = true WHERE identity = $1::bytea",
@@ -253,7 +340,17 @@ impl Candidate<'_> {
     }
 
     pub async fn member(&self, member: &Membership<'_>) -> Result<()> {
-        let metadata = identity(
+        self.member_with_sources(member, None, None, false).await
+    }
+
+    async fn member_with_sources(
+        &self,
+        member: &Membership<'_>,
+        month: Option<&str>,
+        rfcxml: Option<BlobDigest>,
+        ingestion: bool,
+    ) -> Result<()> {
+        let mut metadata = identity(
             "rfc-catalog-metadata-v1",
             &(
                 member.catalog.to_string(),
@@ -264,13 +361,25 @@ impl Candidate<'_> {
                 member.status,
             ),
         )?;
+        if ingestion {
+            metadata = identity(
+                "rfc-catalog-metadata-v2",
+                &(
+                    metadata.to_string(),
+                    month,
+                    rfcxml.map(|digest| digest.to_string()),
+                ),
+            )?;
+        }
+        let rfcxml = rfcxml.as_ref().map(|digest| digest.as_bytes().as_slice());
         self.tx.execute(
             "INSERT INTO rfc.generation_documents (generation_id, rfc_id, document_version, metadata_identity,
-                catalog_observation, txt_observation, title, stream, publication_date, current_status)
-             VALUES ($1, $2::integer, $3::bytea, $4::bytea, $5::bytea, $6::bytea, $7, $8, ($9::text)::date, $10)",
+                catalog_observation, txt_observation, title, stream, publication_date, current_status, publication_month, rfcxml_observation)
+             VALUES ($1, $2::integer, $3::bytea, $4::bytea, $5::bytea, $6::bytea, $7, $8, ($9::text)::date, $10,
+                ($11::text)::date, $12::bytea)",
             &[&self.generation(), &(member.rfc.get() as i32), &member.version.as_bytes().as_slice(), &metadata.as_bytes().as_slice(),
               &member.catalog.as_bytes().as_slice(), &member.txt.as_bytes().as_slice(), &member.title, &member.stream,
-              &member.publication_date, &member.status],
+              &member.publication_date, &member.status, &month, &rfcxml],
         ).await?;
         Ok(())
     }
@@ -356,13 +465,19 @@ impl Candidate<'_> {
         let generation = self.generation();
         self.tx.query_one("SELECT id FROM rfc.generations WHERE id = $1 AND state = 'building' FOR NO KEY UPDATE",
             &[&generation]).await?;
-        let (bytes, digest) = load_manifest(&self.tx, self.id).await?.encode();
+        let manifest = load_manifest(&self.tx, self.id).await?;
+        let format = manifest.version();
+        let (bytes, digest) = manifest.encode();
         self.tx.execute(
             "UPDATE rfc.generations SET state = 'ready', manifest_format = $2, manifest_bytes = $3, manifest_digest = $4::bytea WHERE id = $1",
-            &[&generation, &FORMAT_VERSION, &bytes, &digest.as_bytes().as_slice()],
+            &[&generation, &format, &bytes, &digest.as_bytes().as_slice()],
         ).await?;
         self.tx.commit().await?;
         Ok((self.id, digest))
+    }
+
+    async fn commit(self) -> Result<()> {
+        Ok(self.tx.commit().await?)
     }
 }
 
