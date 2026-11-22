@@ -1,0 +1,4 @@
+# Fixture blobs are original bytes, including historical page breaks and CRLF.
+fixtures/rfc/*.txt binary
+fixtures/synthetic/*.txt binary
+fixtures/synthetic/*.bin binary

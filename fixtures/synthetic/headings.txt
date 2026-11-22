@@ -1,0 +1,13 @@
+Contents
+  1. Redundant title..................1
+  Appendix A. Wrapped title..........2
+
+1. Redundant title
+	2. This is a code example
+1.1. café and café
+2. Redundant title
+Appendix A. Wrapped
+   title
+Contributors
+Copyright notice
+Copyright (c) 2026 Synthetic Authors. All rights reserved.

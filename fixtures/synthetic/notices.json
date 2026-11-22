@@ -1,0 +1,11 @@
+{
+  "reviewed": {
+    "artifact": "headings.txt",
+    "notice_start": "Copyright notice",
+    "expected_state": "complete"
+  },
+  "unavailable": {
+    "artifact": "invalid-utf8.bin",
+    "expected_state": "unavailable"
+  }
+}

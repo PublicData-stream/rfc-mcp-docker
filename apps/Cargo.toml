@@ -1,0 +1,18 @@
+[package]
+name = "rfc-mcp-docker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+rmcp.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rfc-core = { path = "../crates/core" }
+rfc-test-support = { path = "../crates/test-support" }

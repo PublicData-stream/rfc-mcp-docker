@@ -1,0 +1,16 @@
+{
+  "rfc_numbers": [100, 101, 102, 103, 104],
+  "edges": [
+    [100, "normative_reference", 101],
+    [100, "informative_reference", 102],
+    [101, "unclassified_reference", 104],
+    [102, "updates", 100],
+    [103, "obsoletes", 100]
+  ],
+  "outgoing_reference_coverage": {
+    "100": "complete",
+    "101": "partial",
+    "102": "unavailable"
+  },
+  "catalog_inbound_obsolescence_coverage": "partial"
+}
