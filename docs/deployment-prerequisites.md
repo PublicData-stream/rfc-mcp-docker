@@ -7,6 +7,8 @@
 - Use distinct ingress, DB read/write, feed control, sync notification, and upstream egress boundaries. Review actual routing, firewall, secret ownership and the TLS proxy before public service. The Phase 0 harness uses private synthetic endpoints for egress and exercises the DB reachability boundaries.
 - Before release, complete the later phase gates for storage durability, publication and recovery, search, HMAC, worker lifecycle, restore, and full production image validation.
 
+See [storage and database provisioning](storage.md) for the Phase 1 checks, role setup, and private Compose restore drill.
+
 ## Repeat Phase 0
 
 ```sh

@@ -16,6 +16,14 @@ RUN --network=none \
           /tmp/rust/target/release/rfc-mcp-docker-sync \
           /tmp/rust/target/release/rfc-mcp-docker-feed /out/
 
+# The fixture driver is excluded from service images.
+FROM build AS phase1-build
+RUN --network=none \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/tmp/rust/target,sharing=locked \
+    cargo build --release --bin rfc-phase1-fixture --features phase1-fixtures --frozen \
+    && cp /tmp/rust/target/release/rfc-phase1-fixture /out/
+
 FROM docker.io/library/alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS ripgrep
 ARG TARGETARCH
 RUN set -eu; \
@@ -54,3 +62,6 @@ FROM runtime AS feed
 COPY --from=build /out/rfc-mcp-docker-feed /usr/local/bin/
 USER 10003:10003
 ENTRYPOINT ["/usr/local/bin/rfc-mcp-docker-feed"]
+
+FROM runtime AS phase1-fixture
+COPY --from=phase1-build /out/rfc-phase1-fixture /rfc-phase1-fixture

@@ -15,3 +15,11 @@ rfc-mcp-docker = { path = "../../apps" }
 rfc-storage = { path = "../storage" }
 tokio.workspace = true
 tokio-postgres.workspace = true
+
+[features]
+phase1-fixtures = []
+
+[[bin]]
+name = "rfc-phase1-fixture"
+path = "src/bin/phase1-fixture.rs"
+required-features = ["phase1-fixtures"]

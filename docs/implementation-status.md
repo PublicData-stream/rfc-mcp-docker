@@ -59,3 +59,27 @@ The catalog server ignored the Range header, so the probe enforced its byte cap 
 - `file` and `readelf` on binaries copied from the tested images reported static PIE for the three Rust applications and ripgrep, with no dynamic `NEEDED` entries. `apk --no-network list --installed` and `ldd` confirmed the rsync musl loader and libraries, Alpine musl `1.2.6-r3`, the trust bundle `20261020-r0`, and PostgreSQL ICU libs/data `78.1-r0` and OpenSSL `3.5.9-r1`. Rustls accepted the trusted fixture certificate and rejected the wrong CA and hostname in sync and feed. PostgreSQL loaded `pg_trgm` in the server process and executed the indexed query.
 
 Arm64 evidence covers registry manifests. Hosted CI, public deployment, and subsequent phase gates are outside this local verification.
+
+## Phase 1
+
+**Verified locally on rootless Linux amd64 on 2026-11-22.** Linux kernel `7.0.0-44-generic`, Docker Engine `29.10.0`, Compose `v5.8.0`, Rust `1.99.1`, and ext4-backed named volumes under `/tmp`. PostgreSQL used the same pinned 19.0 Alpine image as Phase 0. The locked client uses `tokio-postgres 0.7.18`, `tokio-postgres-rustls 0.14.0`, and Rustls `0.23.46`. [Storage format and provisioning](storage.md)
+
+| Tested target | Image ID |
+|---|---|
+| serve | `sha256:ce23a015d4ce73d2170fc84d2e9d22b6b2ae1fb6e4163b369c1b46c3842f293d` |
+| sync | `sha256:679ea43f0ef593fcca25ebde4da234c8ded176af29d98313ccf89d3e5a2b2523` |
+| feed | `sha256:574aee203ed9cd799d82cbcc15627a4c180d895708341443ef746a6a1dd19535` |
+| PostgreSQL 19.0 | `sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188` |
+| Phase 0 fixture client | `sha256:4bdd4cd9311846e22c7028c759552fc948fb226d7bffea3658afb450b9a3f83c` |
+| Phase 1 fixture driver | `sha256:c04f57ba82ca91d87215e8fb14db804ac6b7666103a82e6be75912104d50d4d0` |
+
+### Commands and observations
+
+- `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, `cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings`, `cargo test --workspace --all-features --frozen`, and `actionlint .github/workflows/ci.yml` passed. Cargo output was under `/tmp/rust/target`. Storage unit tests covered exact bytes and bounds, digest changes, unsafe paths, quarantined collisions, deterministic manifest bytes, and process termination before and after file sync, after rename, and after directory sync before registration.
+- `cargo tree --workspace --frozen -e features` confirmed the app dependency graph uses Rustls and omits `native-tls` and `openssl-sys`. `file` and `readelf -d` on all three rebuilt Alpine application binaries showed static PIE with zero dynamic `NEEDED` entries.
+- `python3 scripts/phase0/integration.py --project rfc-phase1-regression` passed on the recorded images. Results covered the strict MCP wire suite, rootless isolation, exact rsync transfer, TLS failures, PostgreSQL restart and ICU/GIN behavior, and the ripgrep worker's Landlock and seccomp boundaries.
+- `python3 scripts/phase1/integration.py --image-prefix rfc-phase1-regression` passed. In the source project, four concurrent installs converged on one file. Path traversal, symlink, and FIFO candidates were rejected. Reinstalling against a same-size corrupt entry preserved it and quarantined the incoming bytes. The serve mount denied writes and private staging access. Feed had neither database reachability nor storage or credential mounts. The first integration attempt stopped at a mount override that kept the original Compose service mount. The final harness uses a separate Compose override file and verified rejection of both inverted mount modes.
+- PostgreSQL applied and reran schema version 1. Under explicit read-write transactions the serve role was denied corpus DML, DDL, `TRUNCATE`, temporary tables, role changes, sequence use, unsafe functions, and `COPY TO PROGRAM`. Sync built two ready generations, reused their document versions, and was denied frozen mutations and active-pointer updates. Both generations had manifest digest `b99769e6663431cd18814166422fcd2b4fb27e51a6d235a83d502e217918aeca`. Tests verified TLS and SCRAM, migration-owner default function grants, actual FTS matching, original-byte range constraints, and lock release on commit and rollback. Startup checks rejected wrong role credentials, bad TLS identities, and excess grants.
+- After container recreation the reader reverified both generations on the source volumes. The harness restored the quiescent database dump and three reachable blobs to a fresh Compose project, then rechecked each digest, stored range, manifest, and runtime role boundary. The TXT inputs were the two checked-in RFC originals. Catalog data, index ranges, and provenance observations were fixture data. The active generation remained unset at sequence zero.
+
+The Phase 1 gate covers the local rootless amd64 fixture profile and process interruption. Qualification on other hosts, physical power-loss behavior, live ingestion, publication recovery, and release restore of a serving corpus remain separate from this evidence.
