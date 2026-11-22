@@ -109,19 +109,26 @@ impl GetRequest {
 #[serde(deny_unknown_fields)]
 struct PageCursor {
     v: u8,
+    #[serde(rename = "t")]
     tool: String,
+    #[serde(rename = "a")]
     args: String,
+    #[serde(rename = "g")]
     generation: i64,
+    #[serde(rename = "s")]
     sequence: i64,
     expiry: u64,
+    #[serde(rename = "p")]
     after: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "d", skip_serializing_if = "Option::is_none")]
     document: Option<DocumentCursor>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocumentCursor {
+    id: i32,
+    #[serde(rename = "v")]
     version: String,
     start: usize,
     end: usize,
@@ -377,6 +384,14 @@ impl Search {
         }
         let context = PageContext::new(&self.key, "get", request.cursor.as_deref())?;
         let args = fingerprint(&(request.id, &selector))?;
+        if context.cursor.as_ref().is_some_and(|cursor| {
+            cursor
+                .document
+                .as_ref()
+                .is_none_or(|document| document.id != request.id)
+        }) {
+            return Err(SearchError::CursorInvalid);
+        }
         if !whole {
             context.check_args(&args)?;
         }
@@ -394,7 +409,6 @@ impl Search {
                     if let Some(cursor) = &context.cursor {
                         let saved = cursor.document.as_ref().ok_or(SearchError::CursorInvalid)?;
                         let position = usize::try_from(cursor.after)?;
-                        // The RFC ID also binds an omitted selector through the document version.
                         if saved.version != version
                             || saved.end > source.length
                             || position <= saved.start
@@ -419,6 +433,7 @@ impl Search {
                         let range = select(guard, &source, selector).await?;
                         (
                             DocumentCursor {
+                                id: request.id,
                                 version,
                                 start: range.start,
                                 end: range.end,
@@ -467,7 +482,22 @@ impl Search {
                 } else {
                     None
                 };
+                let minimum_end = if position == scope.end {
+                    position
+                } else if let Some(text) = text {
+                    position
+                        + text[position..scope.end]
+                            .chars()
+                            .next()
+                            .expect("nonempty validated text")
+                            .len_utf8()
+                } else {
+                    position + 1
+                };
                 let mut end = scope.end.min(position + scope.max);
+                if end < minimum_end {
+                    return Err(SearchError::ResourceLimit.into());
+                }
                 loop {
                     while text.is_some_and(|text| !text.is_char_boundary(end)) {
                         end -= 1;
@@ -500,10 +530,10 @@ impl Search {
                     if fits(&result) {
                         return Ok(result);
                     }
-                    if whole_only || end == position {
+                    if whole_only || end == minimum_end {
                         return Err(SearchError::ResourceLimit.into());
                     }
-                    end = position + (end - position) / 2;
+                    end = (position + (end - position) / 2).max(minimum_end);
                 }
             })
             .await

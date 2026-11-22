@@ -1,4 +1,4 @@
-//! Stateless Streamable HTTP probe using the pinned official SDK.
+//! Stateless Streamable HTTP using the pinned official SDK.
 
 use std::{borrow::Cow, sync::Arc};
 
@@ -94,15 +94,28 @@ impl ServerHandler for Probe {
 }
 
 pub fn router() -> Router {
+    transport(Probe, None, Vec::new())
+}
+
+pub(crate) fn transport<S: ServerHandler + Clone>(
+    handler: S,
+    allowed_hosts: Option<Vec<String>>,
+    allowed_origins: Vec<String>,
+) -> Router {
+    let mut config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_stateless_protocol_metadata_required(true)
+        .with_json_response(true)
+        .with_max_request_body_bytes(BODY_LIMIT)
+        .with_allowed_origins(allowed_origins)
+        .enforce_origin_validation();
+    if let Some(hosts) = allowed_hosts {
+        config = config.with_allowed_hosts(hosts);
+    }
     let service = StreamableHttpService::new(
-        || Ok(Probe),
+        move || Ok(handler.clone()),
         Arc::new(NeverSessionManager::default()),
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
-            .with_stateless_protocol_metadata_required(true)
-            .with_json_response(true)
-            .with_max_request_body_bytes(BODY_LIMIT)
-            .enforce_origin_validation(),
+        config,
     );
     Router::new()
         .route_service("/mcp", service)
@@ -114,6 +127,21 @@ pub fn router() -> Router {
 async fn reject_legacy_requests(request: Request, next: Next) -> Response {
     if request.method() != Method::POST {
         return next.run(request).await;
+    }
+    if request
+        .headers()
+        .contains_key(axum::http::header::CONTENT_ENCODING)
+        && (request
+            .headers()
+            .get_all(axum::http::header::CONTENT_ENCODING)
+            .iter()
+            .count()
+            != 1
+            || !request.headers()[axum::http::header::CONTENT_ENCODING]
+                .as_bytes()
+                .eq_ignore_ascii_case(b"identity"))
+    {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
     let (parts, body) = request.into_parts();
     let bytes = match tokio::time::timeout(

@@ -7,13 +7,17 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 libc.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
 rfc-storage = { path = "../crates/storage" }
+rfc-search = { path = "../crates/search" }
 
 [dev-dependencies]
 rfc-core = { path = "../crates/core" }

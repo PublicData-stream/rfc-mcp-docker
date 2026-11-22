@@ -1,6 +1,9 @@
 #[path = "../mcp.rs"]
 mod mcp;
 
+#[path = "../public.rs"]
+mod public;
+
 #[cfg(target_os = "linux")]
 #[path = "../sandbox.rs"]
 mod sandbox;
@@ -15,6 +18,7 @@ use rfc_storage::{
 async fn main() -> ProbeResult {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
+        [] => public::run().await,
         [option] if option == "--version" => {
             println!("rfc-mcp-docker-serve {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -45,6 +49,6 @@ async fn main() -> ProbeResult {
         }
         #[cfg(target_os = "linux")]
         [option] if option == "--phase0-sandbox" => Ok(sandbox::run()?),
-        _ => Err("rfc-mcp-docker-serve: expected --version or --phase1-check-storage".into()),
+        _ => Err("rfc-mcp-docker-serve: unexpected argument".into()),
     }
 }
