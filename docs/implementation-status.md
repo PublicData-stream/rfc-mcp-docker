@@ -83,3 +83,23 @@ Arm64 evidence covers registry manifests. Hosted CI, public deployment, and subs
 - After container recreation the reader reverified both generations on the source volumes. The harness restored the quiescent database dump and three reachable blobs to a fresh Compose project, then rechecked each digest, stored range, manifest, and runtime role boundary. The TXT inputs were the two checked-in RFC originals. Catalog data, index ranges, and provenance observations were fixture data. The active generation remained unset at sequence zero.
 
 The Phase 1 gate covers the local rootless amd64 fixture profile and process interruption. Qualification on other hosts, physical power-loss behavior, live ingestion, publication recovery, and release restore of a serving corpus remain separate from this evidence.
+
+## Phase 2
+
+**Verified locally on rootless Linux amd64 on 2026-11-22.** Runtime code at 60a9c38 passed the fixture gate and the bounded live-upstream smoke on Linux 7.0.0-44-generic, Docker Engine 29.10.0, Docker Compose v5.8.0, Rust 1.99.1, and the Phase 0 PostgreSQL 19.0 image pin. The lockfile selects roxmltree 0.21.2 and Rustls 0.23.46. Cargo artifacts used /tmp/rust/target. The disposable projects kept fixture inputs, test credentials, and volume backing directories under /tmp. [Ingestion commands and storage contracts](ingestion.md)
+
+| Tested image | Local image ID |
+|---|---|
+| Serve | sha256:8b061fef07cd16d6ab0a45a450178a23dad49b32ff7bf34f3abc00192aefdeb1 |
+| Sync | sha256:b06d93e9dcef71de27751efb22cf4623c6a8bad26ea36b2689f79b5ec54b99cc |
+| Feed | sha256:cd4e0a852980c97c1fd2e8464496496b836be90170539987d9cb45cea8f58e84 |
+| Phase 2 fixture driver | sha256:7aa1a2ab20f726ff4818a65a6ecc2013fc88fd99a22f72b845df4131400feec2 |
+
+- cargo fetch --locked, scripts/phase0/check-rust.sh, workspace Clippy and tests with --all-features --frozen, and actionlint passed. The frozen feature graph confirmed Rustls and roxmltree and omitted native-tls and openssl-sys. Format-1 and format-2 manifest tests verified deterministic encoding for identical inputs.
+- python3 scripts/phase0/integration.py --project rfc-phase2-regression passed against rebuilt images. It covered the strict MCP wire behavior, exact rsync transfer, TLS rejection cases, the pinned PostgreSQL checks, and effective Landlock and seccomp restrictions.
+- python3 scripts/phase1/integration.py --image-prefix rfc-phase2-regression passed. Both format-1 fixture generations retained their original manifest digest after schema version 2, container recreation, and restore into a fresh Compose project.
+- python3 scripts/phase2/integration.py passed. A full fixture candidate verified five TXT bodies, including invalid UTF-8 preserved in bytes mode, and recorded one catalog-only RFC. The reader reconstructed the candidate manifests and checked stored line, heading, section, notice, evidence, and chunk byte ranges. An exact literal spanned a chunk boundary, and PostgreSQL retained that token and terms on either side. A metadata-only refresh reused all five verified TXT observations and document versions. The gate also exercised the migration from schema version 1, a scoped sample, typed catalog and reference edges, and incomplete RFCXML fallback.
+- The fixture gate rejected a vanished catalog entry, catalog drift, malformed catalog, redirects, encoded and oversized HTTPS bodies, an interrupted rsync stream, a missing or symlinked TXT, and a byte mismatch. The mismatch went to private quarantine. A competing run was rejected while sync held the advisory lock. The active generation remained unset at sequence zero with an empty outbox, and the fixture verified the serve and feed permission boundaries.
+- python3 scripts/phase2/integration.py --live verified RFCs 2119, 8174, and 9110 from official rsync and HTTPS in a fresh Compose project. The catalog digest matched across both captures and the scoped candidate reached ready with manifest c6feca1a6071e62c97b19f4f7447195ba5dceed516c065e211f12ac522d4695d. The report recorded two unavailable RFCXML bodies, one RFC with incomplete reference coverage, and one RFC with incomplete section coverage. The active pointer stayed unset.
+
+The live sample is the extent of upstream verification. Full live reconciliation, publication, and production-scale capacity remain later verification work.
