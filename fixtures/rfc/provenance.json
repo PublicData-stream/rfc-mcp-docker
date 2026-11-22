@@ -1,0 +1,26 @@
+{
+  "rfc2119.txt": {
+    "rfc": 2119,
+    "source": "https://www.rfc-editor.org/rfc/rfc2119.txt",
+    "source_name": "RFC Editor",
+    "captured_at": "2026-11-22T15:43:10+00:00",
+    "stream": "IETF",
+    "bytes": 4723,
+    "blake3": "5f1bbd38bc7f5d4540b85db3aeca5f706d6d18c8a1e27d8c99603bb0f13965aa",
+    "sha256": "3c2ceb7bfc84cd34720f4a5271338ab9d8280d34bdd1eb250c64306202f2ed8b",
+    "policy_review": "RFC 2119 Status of This Memo, unlimited distribution",
+    "fixture_use": "complete unchanged original with all in-file notices"
+  },
+  "rfc8174.txt": {
+    "rfc": 8174,
+    "source": "https://www.rfc-editor.org/rfc/rfc8174.txt",
+    "source_name": "RFC Editor",
+    "captured_at": "2026-11-22T15:43:11+00:00",
+    "stream": "IETF",
+    "bytes": 6071,
+    "blake3": "2ffac1117c206df7d11b6b4917572c298948ce546fd5319b09217b8751a5f2eb",
+    "sha256": "5ca0e2f90be0bc5928ee465f76518fee316dfa775aed885658a29a419cc293b7",
+    "policy_review": "Corrected IETF Trust Legal Provisions 5.0 section 3.c(i), whole unmodified document",
+    "fixture_use": "complete unchanged original with all in-file notices"
+  }
+}
