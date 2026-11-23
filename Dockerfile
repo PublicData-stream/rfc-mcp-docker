@@ -54,20 +54,22 @@ ARG TARGETARCH
 ARG TARGETVARIANT
 RUN apk add --no-cache make=4.4.1-r4
 RUN set -eu; \
-    commit=e89fff89ac9af12e8d4ce9d5fd07beb408ca730f; \
+    commit=669cb4c755db20b26c3af3d923c042ae224c7496; \
     wget -q -O /tmp/rg.tar.gz "https://codeload.github.com/BurntSushi/ripgrep/tar.gz/$commit"; \
-    echo 'af40d0f4cb7a55994906c009a7ba865047f0d487c95bceb8db59ffc4f2173d20  /tmp/rg.tar.gz' | sha256sum -c -; \
+    echo '21002cba547651acf2ffb2f1e90010ee9533df3ce8819b171378d55a4f5953fd  /tmp/rg.tar.gz' | sha256sum -c -; \
     tar -xzf /tmp/rg.tar.gz --strip-components=1; \
     rm /tmp/rg.tar.gz
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked cargo fetch --locked
+# An explicit target keeps static-link flags out of host procedural macros.
 RUN --network=none \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/tmp/rust/target,sharing=locked \
-    export RUSTFLAGS="-C target-feature=+crt-static" \
+    target="$(rustc -vV | sed -n 's/^host: //p')" \
+    && export RUSTFLAGS="-C target-feature=+crt-static" \
     && if [ "$TARGETARCH/$TARGETVARIANT" = amd64/v3 ]; then export RUSTFLAGS="$RUSTFLAGS -C target-cpu=x86-64-v3"; fi \
-    && CARGO_PROFILE_RELEASE_STRIP=debuginfo cargo build --target-dir /tmp/rust/target/rg \
+    && CARGO_PROFILE_RELEASE_STRIP=debuginfo cargo build --target "$target" --target-dir /tmp/rust/target/rg \
       --release --bin rg --no-default-features --frozen \
-    && cp /tmp/rust/target/rg/release/rg /tmp/rg
+    && cp "/tmp/rust/target/rg/$target/release/rg" /tmp/rg
 
 # Export the resolved Rust dependency inventories from the same build stages.
 FROM build AS app-audit
