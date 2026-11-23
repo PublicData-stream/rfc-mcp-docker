@@ -17,7 +17,7 @@ tokio-postgres.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "rt-multi-thread"] }
 tempfile = "3"
 libc.workspace = true
 roxmltree = "0.21"
@@ -26,6 +26,7 @@ roxmltree = "0.21"
 phase1-fixtures = []
 phase2-fixtures = []
 phase3-fixtures = ["phase2-fixtures", "rfc-storage/phase3-fixtures"]
+phase6-fixtures = ["phase3-fixtures"]
 
 [[bin]]
 name = "rfc-phase1-fixture"

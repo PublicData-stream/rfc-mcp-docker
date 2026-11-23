@@ -1,4 +1,4 @@
-use crate::Writer;
+use crate::{Writer, daemon::finish_job};
 use rfc_core::{BlobDigest, GenerationId};
 use rfc_storage::{
     blob::BlobWriter,
@@ -12,6 +12,16 @@ pub async fn promote(generation: GenerationId, expected: i64, rollback: bool) ->
     }
     let mut writer = Writer::connect().await?;
     let _coordinator = writer.acquire_coordinator().await?;
+    promote_locked(&mut writer, generation, expected, rollback, None).await
+}
+
+pub(crate) async fn promote_locked(
+    writer: &mut Writer,
+    generation: GenerationId,
+    expected: i64,
+    rollback: bool,
+    job: Option<i64>,
+) -> Result<i64> {
     let mirror = BlobWriter::open(&mirror_root())?;
     let id = i64::try_from(generation.get())?;
     let target_state = if rollback { "retained" } else { "ready" };
@@ -82,6 +92,9 @@ pub async fn promote(generation: GenerationId, expected: i64, rollback: bool) ->
         )
         .await?
         .try_get(0)?;
+    if let Some(job) = job {
+        finish_job(&tx, job, true).await?;
+    }
     rfc_storage::fixture_boundary("before_publication_commit");
     tx.commit().await?;
     rfc_storage::fixture_boundary("after_publication_commit");

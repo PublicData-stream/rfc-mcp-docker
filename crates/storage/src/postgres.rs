@@ -17,7 +17,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSIONS: [i32; 5] = [1, 2, 3, 4, 5];
+const SCHEMA_VERSIONS: [i32; 6] = [1, 2, 3, 4, 5, 6];
 const READ_DEADLINE: Duration = Duration::from_secs(15);
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",
@@ -113,9 +113,14 @@ impl RuntimeRole {
                     (
                         "sync_jobs",
                         "UPDATE",
-                        "generation_id state trigger_id outcome diagnostic started_at finished_at",
+                        "generation_id state trigger_id outcome diagnostic started_at finished_at expected_publication_sequence retries next_attempt_at",
                     ),
                     ("control_events", "UPDATE", "status job_id"),
+                    (
+                        "notification_outbox",
+                        "UPDATE",
+                        "delivery_state attempts next_attempt_at delivered_at last_error",
+                    ),
                 ] {
                     grants.extend(
                         columns

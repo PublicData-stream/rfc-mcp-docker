@@ -9,6 +9,7 @@ use rfc_storage::{
 use std::os::fd::OwnedFd;
 use tokio_postgres::{Client, Transaction};
 
+mod daemon;
 mod ingest;
 mod policy;
 mod publication;
@@ -17,6 +18,7 @@ mod text;
 mod upstream;
 mod xml;
 
+pub use daemon::run_daemon;
 #[cfg(feature = "phase2-fixtures")]
 pub use ingest::reconcile_fixture;
 #[cfg(feature = "phase3-fixtures")]
@@ -85,14 +87,33 @@ impl Writer {
         Ok(fence)
     }
 
-    async fn start_ingestion(&self, parser: &str, index: &str) -> Result<GenerationId> {
+    async fn start_ingestion(
+        &mut self,
+        parser: &str,
+        index: &str,
+        job: Option<i64>,
+    ) -> Result<GenerationId> {
         rfc_storage::fixture_boundary("before_candidate_insert");
-        let row = self.client.query_one(
+        let tx = self.client.transaction().await?;
+        let row = tx.query_one(
             "INSERT INTO rfc.generations (parser_version, index_version) VALUES ($1, $2) RETURNING id",
             &[&parser, &index],
         ).await?;
+        let id: i64 = row.try_get(0)?;
+        if let Some(job) = job {
+            let attached = tx.execute(
+                "UPDATE rfc.sync_jobs SET generation_id = $2,
+                    expected_publication_sequence = (SELECT publication_sequence FROM rfc.active_generation WHERE singleton)
+                 WHERE id = $1 AND state = 'running'",
+                &[&job, &id],
+            ).await?;
+            if attached != 1 {
+                return Err("synchronization job is no longer running".into());
+            }
+        }
+        tx.commit().await?;
         rfc_storage::fixture_boundary("after_candidate_insert");
-        GenerationId::new(row.try_get(0)?).ok_or_else(|| "invalid candidate ID".into())
+        GenerationId::new(id).ok_or_else(|| "invalid candidate ID".into())
     }
 
     async fn batch(&mut self, id: GenerationId) -> Result<Candidate<'_>> {

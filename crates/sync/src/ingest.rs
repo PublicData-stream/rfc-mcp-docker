@@ -145,8 +145,35 @@ async fn execute(
     scope: Scope,
 ) -> Result<()> {
     let mut report = Report::new(scope);
-    let result = run(upstream, registry, scope, &mut report).await;
-    match &result {
+    let result = async {
+        let upstream = upstream?;
+        let mut writer = Writer::connect().await?;
+        let _coordinator = writer.acquire_coordinator().await?;
+        run(&mut writer, upstream, registry, scope, None, &mut report).await
+    }
+    .await;
+    print_report(report, &result)?;
+    result.map(|_| ())
+}
+
+pub(crate) async fn ingest_locked(
+    writer: &mut Writer,
+    upstream: Result<Upstream>,
+    registry: Result<Registry>,
+    scope: Scope,
+    job: Option<i64>,
+) -> Result<(GenerationId, BlobDigest)> {
+    let mut report = Report::new(scope);
+    let result = match upstream {
+        Ok(upstream) => run(writer, upstream, registry, scope, job, &mut report).await,
+        Err(error) => Err(error),
+    };
+    print_report(report, &result)?;
+    result
+}
+
+fn print_report(mut report: Report, result: &Result<(GenerationId, BlobDigest)>) -> Result<()> {
+    match result {
         Ok((id, digest)) => {
             report.state = "ready";
             report.generation_id = Some(id.get().to_string());
@@ -155,24 +182,23 @@ async fn execute(
         Err(error) => report.error = Some(bounded_error(error)),
     }
     println!("{}", serde_json::to_string(&report)?);
-    result.map(|_| ())
+    Ok(())
 }
 
 async fn run(
-    upstream: Result<Upstream>,
+    writer: &mut Writer,
+    upstream: Upstream,
     registry: Result<Registry>,
     scope: Scope,
+    job: Option<i64>,
     report: &mut Report,
 ) -> Result<(GenerationId, BlobDigest)> {
-    let upstream = upstream?;
-    let mut writer = Writer::connect().await?;
-    let _coordinator = writer.acquire_coordinator().await?;
     let root = mirror_root();
     let store = BlobWriter::open(&root)?;
-    recover_before_ingestion(&mut writer, &store).await?;
+    recover_before_ingestion(writer, &store).await?;
     let reader = BlobReader::open(&root, false)?;
     let registry = registry?;
-    let id = writer.start_ingestion(PARSER, INDEX).await?;
+    let id = writer.start_ingestion(PARSER, INDEX, job).await?;
     report.generation_id = Some(id.get().to_string());
     let mut run = Run {
         writer,
@@ -199,7 +225,7 @@ async fn run(
 }
 
 struct Run<'a> {
-    writer: Writer,
+    writer: &'a mut Writer,
     id: GenerationId,
     scope: Scope,
     store: BlobWriter,

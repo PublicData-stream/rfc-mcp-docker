@@ -31,3 +31,6 @@ rfc-search = { path = "../crates/search" }
 [dev-dependencies]
 rfc-core = { path = "../crates/core" }
 rfc-test-support = { path = "../crates/test-support" }
+
+[features]
+phase6-fixtures = []
