@@ -17,6 +17,8 @@ docker compose --env-file /path/to/rfc.env up -d --wait postgres
 
 The volume operation adjusts only the backing directories themselves. PostgreSQL owns `/var/lib/postgresql` and expects its data in `/var/lib/postgresql/19/docker`. Verify with `SHOW data_directory`. The role-and-subnet HBA rules require TLS and SCRAM for runtime clients. Use the administrator’s local peer-authenticated socket for setup.
 
+Set `RFC_NOTIFY_DYNAMIC_RANGE` and `RFC_CONTROL_DYNAMIC_RANGE` to ranges within their corresponding private subnets and outside the fixed listener addresses. This reserves the listener addresses during concurrent startup and recreation. An omitted range uses the full subnet for compatibility with existing environment files. For a qualified upgrade, add the ranges to the private environment file and recreate the affected Compose networks after draining the application services. Preserve the bind-backed mirror and database directories.
+
 ## Initialize or upgrade
 
 For a new cluster, run the roles script and set the two role passwords interactively to match their provisioned files. For upgrades, start with existing roles. Back up the database and mirror as described in the [publication runbook](publication.md) before changing schema or images.
@@ -42,6 +44,30 @@ Verify the proxy and backend paths after container recreation. Sync and feed hav
 
 The initial container memory limits are 768 MiB for serve, 2 GiB for sync, 128 MiB for feed, and 1 GiB for PostgreSQL. CPU limits are two for serve, sync, and PostgreSQL and 0.5 for feed. Confirm that the rootless daemon applies these settings with delegated cgroup v2 controllers. Check local logs and [control-plane health](control.md) after startup.
 
+## Operate and recover
+
+Use the same Compose project and private environment file for every command. Set `RFC_ENV_FILE` to its path. Inspect the project and the loopback serving health before opening or reopening ingress:
+
+```sh
+docker compose --env-file "$RFC_ENV_FILE" ps
+docker compose --env-file "$RFC_ENV_FILE" exec -T rfc-mcp-docker-serve \
+    wget -qO- http://127.0.0.1:8781/ready
+docker compose --env-file "$RFC_ENV_FILE" exec -T rfc-mcp-docker-serve \
+    wget -qO- http://127.0.0.1:8781/metrics
+docker compose --env-file "$RFC_ENV_FILE" exec -T postgres psql -X -U postgres -d rfc \
+    -c 'SELECT generation_id, publication_sequence FROM rfc.active_generation' \
+    -c 'SELECT id, state, outcome FROM rfc.sync_jobs ORDER BY id DESC LIMIT 10' \
+    -c 'SELECT delivery_state, count(*) FROM rfc.notification_outbox GROUP BY delivery_state'
+```
+
+Compare the publication sequence and most recent successful sync job with the expected reconciliation window. Verify a recent RFC over the public MCP route after proxy or container changes. A healthy container with a stale publication warrants checking sync and feed logs, queued jobs, and the upstream response before retrying. An outbox delay can coexist with a current MCP result because serve resolves the committed active pointer. [Control plane](control.md)
+
+HTTP 429 carries `Retry-After: 1`. Reduce client burst and concurrency, and verify that the proxy sets `X-Real-IP` from the actual client address. For a tool deadline, budget error, or partial scan, narrow the query or continue with a valid cursor. Check in-flight requests, admission rejections, database readers, and ripgrep availability before adjusting limits. Keep the sandbox and its failure checks enabled. [MCP tools and budgets](mcp.md)
+
+Use the receiver-first procedure for each [HMAC key rotation](control.md#clock-and-key-rotation). Drain and back up before an upgrade, validate the new Compose configuration and pinned image identities, then apply migrations with the local PostgreSQL administrator. Check the schema version, TLS, roles, storage, readiness, proxy path, and a pinned MCP read before reopening ingress. Use the [publication runbook](publication.md) for GC, sequence-bound rollback, backup, restore, and corruption. Schema rollback requires a compatible backup and fresh-volume restore when the previous binary cannot read the upgraded schema.
+
+For a planned shutdown, close the proxy route first. Stop feed, let running sync work settle, then stop sync and serve before PostgreSQL. Use `docker compose stop` for a restart that preserves the backing directories. Check for unfinished work and pending notifications after startup. Keep the independent backup available.
+
 ## Repeat the local qualification
 
 ```sh
@@ -50,3 +76,5 @@ python3 -B scripts/phase7/integration.py --context rootless --image-prefix rfc-p
 ```
 
 The harness uses temporary credentials and bind-backed storage under `/tmp`, isolated upstream networks, and a disposable proxy published on host loopback. Run it on each intended host architecture and kernel before serving public traffic. [Observed results](implementation-status.md#phase-7)
+
+Run the [Phase 8 release qualification](release-readiness.md) for the full acceptance matrix, fresh-stack restoration, anonymous load measurements, and supply-chain inventory.

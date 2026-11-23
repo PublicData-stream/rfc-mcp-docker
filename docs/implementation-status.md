@@ -286,3 +286,29 @@ done
 - Early fixture runs exposed a BOM placement that prevented the existing notice parser from recognizing authorship and a zero-width assertion that used a page smaller than the expected match count. The passing checks use a separate BOM line and an explicit page limit. A concurrent edit to the test overlay interrupted one teardown. The exact disposable project was cleaned up and the complete gate was rerun.
 
 The gate used synthetic sources and a disposable localhost HTTPS proxy. Live corpus reconciliation, other host profiles, hosted CI, registry publication, and public deployment have separate acceptance gates.
+
+## Phase 8
+
+**Local qualification passed A01–A39 on 2026-11-23. Public release is unapproved with A40 open.** The qualification used Linux `7.0.0-44-generic` amd64, rootless Docker Engine `29.10.0`, Compose `5.8.0`, cgroup v2, and Landlock ABI 8. The toolchain was Rust `1.99.1`, rmcp `3.11.0`, ripgrep `15.2.0` without PCRE2, and PostgreSQL `19.0` on Alpine. Cargo used `/tmp/rust/target`. Temporary certificates, test credentials, original bytes, backups, and reports stayed under `/tmp`. [Acceptance matrix and release evidence](release-readiness.md)
+
+| Qualified image | Local image ID |
+| --- | --- |
+| Serve | `sha256:5b7d3c33b32aa8360153962466849dbf4581ee497a672c22448eed7f182fb503` |
+| Sync | `sha256:75d9c4b0657b329071b8c428904fc725919eeefc044517eaf44cc34ede284a68` |
+| Feed | `sha256:4290ce2cf46ba4f33ad962fac004ba70a33151e73c741b46d945f3a4ceaac8e4` |
+| PostgreSQL | `sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188` |
+
+### Commands and evidence
+
+- `cargo fetch --locked` and `RFC_PHASE8_IMAGE_PREFIX=rfc-phase8-final bash scripts/phase8/verify.sh` passed. The runner checked frozen Rust builds, formatting, all-feature Clippy and tests, workflow lint, 258 HTTP mutations, Phase 0–7 Compose probes, destructive restore, and both capacity profiles. The runner started with Phase 8 changes in the working tree on base `a63480a`. The results, per-command logs, `restore.json`, and `capacity.json` are under `/tmp/rfc-phase8-evidence.lYnISDyA`.
+- `python3 -B scripts/phase0/upstream.py` passed with seven bounded HTTPS captures at `/tmp/rfc-mcp-upstream-n6xorhp9`.
+- `python3 -B scripts/phase2/integration.py --context rootless --image-prefix rfc-phase8-final --live` verified RFCs 2119, 8174, and 9110. Candidate manifest `405d8d2e2e97562b45c497881013d6477cb29b1d052bf49888e8d6c9d0c85fac` reached ready and the active pointer stayed unset. See the per-RFC results in the release report and the local receipt at `/tmp/rfc-phase8-observed/live-final.log`.
+- `RFC_PHASE8_IMAGE_PREFIX=rfc-phase8-final bash scripts/phase8/audit.sh /tmp/rfc-phase8-audit-signed` uses a checksum-verified Trivy archive. The outputs include four CycloneDX SBOMs, dependency and license inventories, advisories, and redacted secret reports. The audited code commit is `16fb0bb`.
+
+### Recovery and security
+
+- The crash and recovery fixtures exercised PostgreSQL and file durability boundaries, original-byte and notice checks, missed and reordered notifications, concurrent-reader retirement and reclamation, and sequence-bound rollback. The Phase 6 test observed one running and one coalesced pending sync job. Both HMAC links passed signed overlap, sender switching, outbox delivery, and expired-key rejection.
+- The final restore rehearsal destroyed the source project, verified independent backup bytes, and restored 16 blobs, 794 ranges and line starts, and three manifests into fresh volumes. Python and curl passed discovery, listing, and all five direct tool calls against the restored HTTPS service. Both clients observed HTTP 400 for the old revision and HTTP 405 for GET and DELETE.
+- The 1,000- and 10,000-RFC capacity tests covered 1, 4, 16, and 32 clients. At 32 clients, the observed successful rates were 28.1 and 25.0 calls/s. The admission test held at 16 active requests, and each profile returned to zero DB readers and ripgrep workers after overload. [Capacity measurements](release-readiness.md#capacity-methodology)
+- Initial testing found a startup race where Docker could allocate a fixed control listener address to a dynamic client. The updated example puts those clients in disjoint address pools. The qualification starts sync first and verifies address pools and reachability after recreation. An initial restore run also attempted the verifier while serve held its fixed address. The verifier now runs before serve opens. A burst hit the disposable proxy's own limits, which were raised in the fixture before rerunning the load gate.
+- The maintainer confirmed the existing MIT license for the application and its documentation. Public release still requires disposition of the pinned PostgreSQL image findings under A40, review of redistribution terms for included components, qualification of the real hosting configuration, and full live-corpus validation. Hosted CI, registry publication, and public activation are separate gates. [Supply-chain review](release-readiness.md#supply-chain-review)

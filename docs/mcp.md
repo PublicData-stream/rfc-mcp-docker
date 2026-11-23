@@ -55,8 +55,19 @@ Start `rfc-mcp-docker-serve` with its default entry point. Configure its existin
 | `RFC_MCP_TRUSTED_PROXIES` | Comma-separated trusted socket peer IPs. Each trusted peer must overwrite `X-Real-IP` with one IP. Direct callers are limited by their socket peer. |
 | `RFC_MCP_CURSOR_KEY_FILE` | Cursor key mount path. Default `/run/secrets/rfc_cursor_key`. |
 
-Terminate HTTPS at the ingress proxy and preserve the validated Host and MCP headers. Keep the database and admin listener on private routes. The server bounds request bodies to 64 KiB, reads headers within five seconds, and allows 15 seconds for a request after its headers arrive. Initial admission limits are 16 simultaneous requests and five requests per second per source with a burst of ten. Shared network egress shares a bucket. Liveness indicates the process is running. Readiness checks for an accessible active generation and describes the four read tools. Metrics separately report `rg` as unavailable.
+Terminate HTTPS at the ingress proxy and preserve the validated Host and MCP headers. Keep the database and admin listener on private routes. The server bounds request bodies to 64 KiB, reads headers within five seconds, and allows 15 seconds for a request after its headers arrive. Initial admission limits are 16 simultaneous requests and five requests per second per source with a burst of ten. Shared network egress shares a bucket. Liveness indicates the process is running. Readiness returns HTTP 200 only when an active generation is readable and the ripgrep sandbox is available. The loopback metrics report `rfc_mcp_rg_available`.
 
 Propagate downstream disconnects from the proxy. Serve closes the dedicated database socket when a read is cancelled. PostgreSQL checks that socket every 100 ms during queries so it can release a blocked read promptly. [PostgreSQL TCP settings](https://www.postgresql.org/docs/19/runtime-config-connection.html#GUC-CLIENT-CONNECTION-CHECK-INTERVAL)
 
 Run the [private Phase 5 gate](../scripts/phase5/integration.py) after preparing the images with the Phase 0 Compose probe. It uses Python 3, the Python `jsonschema` package, and OpenSSL. The gate mounts disposable keys and test data from `/tmp`.
+
+## Client compatibility
+
+The [Phase 8 restore probe](../scripts/phase8/integration.py) exercised distinct clients against the restored service behind a disposable HTTPS proxy, with certificate verification and per-request MCP metadata enabled.
+
+| Client | Discovery, listing, and direct calls to all five tools | Revision `2025-11-25` | GET stream and DELETE session |
+| --- | --- | --- | --- |
+| Python 3.14.4 `http.client` | HTTP 200 at `2026-07-28` | HTTP 400, unsupported | HTTP 405, unsupported |
+| curl 8.18.0 over HTTP/1.1 | HTTP 200 at `2026-07-28` | HTTP 400, unsupported | HTTP 405, unsupported |
+
+Other clients need to support the pinned request metadata and headers, including direct calls without initialization. Legacy initialization, stdio, and standalone HTTP+SSE are unsupported. Hosted clients require their own integration test. [Observed Phase 8 results](implementation-status.md#phase-8)

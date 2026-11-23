@@ -1,6 +1,6 @@
 # Publication and recovery
 
-The PostgreSQL `rfc.active_generation` row identifies the active generation and its publication sequence. Sync finalizes the immutable manifest and verifies the original TXT and provenance files on the mirror before moving the pointer. Promotion, demotion, the new sequence, and the pending outbox event commit together. Serve resolves visibility from PostgreSQL at the start of each guarded read. Phase 6 will deliver the outbox events as authenticated hints.
+The PostgreSQL `rfc.active_generation` row identifies the active generation and its publication sequence. Sync finalizes the immutable manifest and verifies the original TXT and provenance files on the mirror before moving the pointer. Promotion, demotion, the new sequence, and the pending outbox event commit together. Serve resolves visibility from PostgreSQL at the start of each guarded read. Sync delivers the outbox events as authenticated hints.
 
 ## Operator commands
 
@@ -29,8 +29,29 @@ Recovery also runs before each reconciliation. It reports blocked and remaining 
 
 ## Backup and restore
 
-1. Pause sync and its trigger source. Let in-flight sync work finish and keep one-shot sync commands paused through the snapshot and copy. Confirm sync has released the database coordinator. Serve can continue reading.
-2. Take a consistent PostgreSQL dump and save the active generation and sequence. Export the registered `rfc.blobs` digest and length inventory while writers are still paused. It provides a superset of all blobs reachable from the snapshot, including ready candidates and provenance. Copy those canonical paths to independent backup storage and verify each length and full BLAKE3 digest. Save the readable generation lock files with the backup or record their IDs for recreation. Resume sync after verifying the backup.
-3. Restore to fresh PostgreSQL and mirror volumes with serve and sync stopped. Provision the same scoped roles, restore the dump and verified bytes, and install the generation lock files for published and retained IDs. Use sync ownership and durable, read-only canonical files. Before reopening traffic, check the pointer, reconstruct the manifest, read original byte ranges from the active and retained snapshots, and verify permissions. Quarantine needs its own backup if operators require those incident records.
+Stop feed and wait for running sync work to finish. Then stop sync and keep all one-shot sync commands, including GC, paused until the dump and copy have been verified. From the PostgreSQL peer socket, check that `SELECT pg_try_advisory_lock(-1)` returns true in a one-shot session. Serve can continue reading.
 
-Run the [Phase 3 Compose suite](../scripts/phase3/integration.py) for the private fixture restore and failure cases. The restore copies independently of the source mirror, so later source GC has no effect on the backup.
+With a dedicated private `BACKUP_DIR` on separate storage and `RFC_ENV_FILE` set to the stack configuration, run:
+
+```sh
+umask 077
+docker compose --env-file "$RFC_ENV_FILE" exec -T postgres \
+    pg_dump -Fc --schema=rfc -U postgres -d rfc > "$BACKUP_DIR/corpus.dump"
+docker compose --env-file "$RFC_ENV_FILE" exec -T postgres psql -XqAt -U postgres -d rfc \
+    -c 'SELECT generation_id,publication_sequence FROM rfc.active_generation' > "$BACKUP_DIR/pointer"
+docker compose --env-file "$RFC_ENV_FILE" exec -T postgres psql -XqAt -U postgres -d rfc \
+    -c "SELECT encode(digest,'hex'),byte_length FROM rfc.blobs ORDER BY digest" > "$BACKUP_DIR/blobs"
+docker compose --env-file "$RFC_ENV_FILE" exec -T postgres psql -XqAt -U postgres -d rfc \
+    -c "SELECT id FROM rfc.generations WHERE state IN ('published','retained') ORDER BY id" \
+    > "$BACKUP_DIR/readable"
+```
+
+Copy every file listed in `blobs` from `blobs/blake3/<first-two-hex-digits>/<digest>` while preserving that relative path. The inventory includes originals, ready candidates, and provenance. Use a BLAKE3 tool such as `b3sum` and a byte count to check every file in the independent copy before resuming sync and feed. Save the version and image references used for the snapshot. Back up private quarantine separately when it is needed for incident review.
+
+Restore into fresh volumes with the proxy route closed and all three application processes stopped. Provision PostgreSQL and the scoped roles as in the [deployment guide](deployment.md). Provision fresh secrets for the restored instance, or securely supply the prior cursor key when outstanding cursors must survive.
+
+1. Verify the backup inventory, then restore the schema and data over the peer socket using `pg_restore --clean --if-exists --exit-on-error -U postgres -d rfc` with `corpus.dump` on stdin.
+2. Install the verified canonical tree on the fresh mirror and recreate the empty `generation-locks/<id>` files listed in `readable`. Match the original directory ownership and modes on the destination host. Canonical files and generation fences belong to sync UID/GID 10002 inside the container and use mode 0444. Flush the restored file and directory data before bringing up serve. [Storage layout](storage.md)
+3. Confirm the saved pointer, sequence, manifests, original ranges, database privileges, and readonly serve mount. Start serve and check loopback readiness and the same pinned MCP reads used before backup. Start sync and feed after the read path passes, then reopen the proxy route.
+
+For a corrupt canonical original, close the proxy route, quiesce the stack, and retain the suspect file for investigation. Restore from a matching verified backup or roll back to a complete retained generation with an expected sequence. A rollback cannot recover shared bytes if the rollback target references the same corrupt digest. Recheck readiness, manifests, and original-byte reads before reopening traffic. [Phase 8 restore rehearsal](release-readiness.md#restore-and-client-results)
