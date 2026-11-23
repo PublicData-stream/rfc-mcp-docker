@@ -1,4 +1,4 @@
-name: Rust checks
+name: RFC MCP CI
 
 on:
   push:
@@ -8,18 +8,76 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('rfc-mcp-ci-pr-{0}', github.event.pull_request.number) || format('rfc-mcp-ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
-    runs-on: ubuntu-26.04
+    name: Rust checks (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    env:
+      CARGO_TARGET_DIR: /tmp/rust/target
+      RUSTUP_HOME: /tmp/rfc-mcp-rustup
+      TMPDIR: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install pinned toolchain and prefetch dependencies
         run: |
+          rustup toolchain install --no-self-update
           rustup show active-toolchain
           cargo fetch --locked
       - name: Check the workspace
         run: scripts/phase0/check-rust.sh
+      - name: Check all features
+        run: |
+          cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+          cargo test --workspace --all-features --frozen
       - name: Exercise the HTTP parser with seeded mutations
         run: python3 -B scripts/phase8/http-smoke.py
+
+  docker-e2e:
+    name: Docker E2E (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+            cases: '["phase0","phase1","phase2","phase3","phase4","phase5","phase6","phase7","phase8"]'
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+            cases: '["phase0","phase5","phase7"]'
+    uses: ./.github/workflows/docker-e2e.yml
+    with:
+      arch: ${{ matrix.arch }}
+      runner: ${{ matrix.runner }}
+      cases: ${{ matrix.cases }}
+
+  ci-summary:
+    name: CI summary
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    needs: [rust, docker-e2e]
+    if: ${{ always() }}
+    steps:
+      - name: Require the Rust and Docker matrices
+        env:
+          RUST_RESULT: ${{ needs.rust.result }}
+          DOCKER_RESULT: ${{ needs.docker-e2e.result }}
+        run: |
+          printf 'Rust matrix: %s\nDocker E2E matrix: %s\n' "$RUST_RESULT" "$DOCKER_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$RUST_RESULT" == success && "$DOCKER_RESULT" == success ]]
