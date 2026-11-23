@@ -1,6 +1,8 @@
 # Alpine image indexes, including the linux/amd64 and linux/arm64 manifests.
 FROM docker.io/library/rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS build
 WORKDIR /src
+ARG TARGETARCH
+ARG TARGETVARIANT
 ENV CARGO_TARGET_DIR=/tmp/rust/target
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY apps apps
@@ -10,7 +12,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked cargo fet
 RUN --network=none \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/tmp/rust/target,sharing=locked \
-    cargo build --release --workspace --bins --frozen \
+    if [ "$TARGETARCH/$TARGETVARIANT" = amd64/v3 ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3"; fi \
+    && cargo build --release --workspace --bins --frozen \
     && mkdir /out \
     && cp /tmp/rust/target/release/rfc-mcp-docker-serve \
           /tmp/rust/target/release/rfc-mcp-docker-sync \
@@ -47,6 +50,8 @@ RUN --network=none \
 
 FROM docker.io/library/rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS ripgrep
 WORKDIR /ripgrep
+ARG TARGETARCH
+ARG TARGETVARIANT
 RUN apk add --no-cache make=4.4.1-r4
 RUN set -eu; \
     commit=e89fff89ac9af12e8d4ce9d5fd07beb408ca730f; \
@@ -58,8 +63,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked cargo fet
 RUN --network=none \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/tmp/rust/target,sharing=locked \
-    CARGO_PROFILE_RELEASE_STRIP=debuginfo RUSTFLAGS="-C target-feature=+crt-static" \
-      cargo build --target-dir /tmp/rust/target/rg \
+    export RUSTFLAGS="-C target-feature=+crt-static" \
+    && if [ "$TARGETARCH/$TARGETVARIANT" = amd64/v3 ]; then export RUSTFLAGS="$RUSTFLAGS -C target-cpu=x86-64-v3"; fi \
+    && CARGO_PROFILE_RELEASE_STRIP=debuginfo cargo build --target-dir /tmp/rust/target/rg \
       --release --bin rg --no-default-features --frozen \
     && cp /tmp/rust/target/rg/release/rg /tmp/rg
 
