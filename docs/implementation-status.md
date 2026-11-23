@@ -389,6 +389,14 @@ Branch pushes and pull requests run the frozen Rust checks, all-feature checks, 
 - The same rebuilt amd64 images passed Phase 0 on rootful and rootless Docker Engine `29.10.0` with Compose `5.8.0`. The probes passed for MCP `2026-07-28` over Streamable HTTP, PostgreSQL TLS and permissions, exact rsync transfer, and Landlock and seccomp. Separate `linux/amd64/v3` builds of serve, sync, and feed passed the entrypoint version checks. The AMD64v3 serve image ran ripgrep `15.2.0` with PCRE2 disabled.
 - The image bundle receipt and test logs are under `/tmp/rfc-rust100.EctmDcEt`. Cargo artifacts used `/tmp/rust/target`. Native ARM64 verification remains pending the hosted CI matrix.
 
+## RustSec dependency checks
+
+The RustSec job audits the committed workspace `Cargo.lock` on every CI run and at 04:17 UTC daily on the default branch. `CI summary` requires RustSec, Rust checks, and Docker E2E to succeed before the release workflow can accept that commit's main-branch CI result.
+
+- On 2026-11-23, the checksum-verified `cargo-audit` 0.23.0 fetched fresh RustSec data and found zero vulnerabilities across 241 locked dependencies. The audit passed with one non-blocking unmaintained warning for `chrono 0.4.45`. [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543)
+- `actionlint` passed. Local workflow probes rejected missing, empty, symlinked, malformed, and vulnerable lockfiles, an unavailable advisory database, and a corrupted scanner archive. The summary passed only when all three jobs succeeded across 64 status combinations.
+- The offline workspace checks, Phase 0 MCP wire probe, frozen all-feature Clippy and tests, and all 258 HTTP smoke cases passed with Cargo artifacts under `/tmp/rust/target`. Hosted CI and scheduled execution remain unverified.
+
 ## GHCR image publication
 
 The release workflow verifies signed tags and exact-commit main CI, builds native AMD64v3 and ARM64 service archives, and promotes the tested manifests to three fixed-version OCI indexes. The workflow publishes a digest receipt for Compose and verifies anonymous pulls. [Release procedure](ghcr-release.md)

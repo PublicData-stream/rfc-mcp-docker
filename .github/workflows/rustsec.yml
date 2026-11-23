@@ -1,0 +1,45 @@
+name: RustSec
+
+on:
+  workflow_call:
+  schedule:
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: RustSec audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Audit the workspace lockfile
+        shell: bash
+        run: |
+          lockfile="$GITHUB_WORKSPACE/Cargo.lock"
+          if [[ ! -f "$lockfile" || -L "$lockfile" || ! -s "$lockfile" ]]; then
+            echo 'Expected a nonempty regular Cargo.lock in the checkout' >&2
+            exit 1
+          fi
+
+          work=$(mktemp -d /tmp/rfc-mcp-rustsec.XXXXXXXX)
+          trap 'rm -rf -- "$work"' EXIT
+          cd "$work"
+          export CARGO_HOME="$work/cargo-home" TMPDIR="$work"
+          mkdir "$CARGO_HOME"
+
+          version=0.23.0
+          release="cargo-audit-x86_64-unknown-linux-gnu-v$version"
+          sha256=b77993532b253fcbf550996d7716465ec3d734d4e74e7f87bfb65a19add0fb59
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 2 --connect-timeout 15 --max-time 90 --output "$release.tgz" \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v$version/$release.tgz"
+          printf '%s  %s\n' "$sha256" "$release.tgz" | sha256sum --check
+          tar -xzf "$release.tgz" --strip-components=1 "$release/cargo-audit"
+
+          ./cargo-audit audit --color never --file "$lockfile" --db "$work/advisory-db"

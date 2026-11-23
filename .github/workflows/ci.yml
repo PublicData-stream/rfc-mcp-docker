@@ -68,17 +68,22 @@ jobs:
       runner: ${{ matrix.runner }}
       cases: ${{ matrix.cases }}
 
+  rustsec:
+    uses: ./.github/workflows/rustsec.yml
+
   ci-summary:
     name: CI summary
     runs-on: ubuntu-26.04
     timeout-minutes: 5
-    needs: [rust, docker-e2e]
+    needs: [rust, docker-e2e, rustsec]
     if: ${{ always() }}
     steps:
-      - name: Require the Rust and Docker matrices
+      - name: Require the Rust and Docker matrices and RustSec audit
         env:
           RUST_RESULT: ${{ needs.rust.result }}
           DOCKER_RESULT: ${{ needs.docker-e2e.result }}
+          RUSTSEC_RESULT: ${{ needs.rustsec.result }}
         run: |
-          printf 'Rust matrix: %s\nDocker E2E matrix: %s\n' "$RUST_RESULT" "$DOCKER_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
-          [[ "$RUST_RESULT" == success && "$DOCKER_RESULT" == success ]]
+          printf 'Rust matrix: %s\nDocker E2E matrix: %s\nRustSec audit: %s\n' \
+            "$RUST_RESULT" "$DOCKER_RESULT" "$RUSTSEC_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$RUST_RESULT" == success && "$DOCKER_RESULT" == success && "$RUSTSEC_RESULT" == success ]]
