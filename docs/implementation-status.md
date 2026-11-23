@@ -422,3 +422,56 @@ The release workflow verifies signed tags and exact-commit main CI, builds nativ
 - The AMD64v3 serve image `sha256:c241380a88b8d4d805ad0a25ae8a4f286f242845379161bc756650692704ae8d` also passed rootless Phase 0 with the AMD64 support images. Its worker was static PIE with no ELF interpreter or `NEEDED` entries and reported PCRE2 disabled.
 - The exported ripgrep lockfile SHA-256 was `4216c9689e2f80812a51abde30731dbbf5f36d404fda3945bb50f10973336361`. Trivy 0.76.2 used advisory database schema 2, updated at 13:07 UTC on 2026-11-23. Both Cargo lockfiles had zero matched advisories. Each service image had seven medium and four low findings and passed the stable release thresholds.
 - The image bundle receipt, runtime patch, probe logs, and audit reports are under `/tmp/rfc-rg16-verify.oUkl52Vh`. Native ARM64 qualification remains pending hosted CI.
+
+## Dual-queue bootstrap implementation Phase 0
+
+The cold-start clock covers empty-volume initialization through an active publication, loopback readiness, and a byte-exact MCP read. The ADR records the proposed TXT trust policy, resource budget, rollback, and the HTTPS request-start floor for the 900-second target. [Cold RFC bootstrap and first publication](decisions/0009-cold-rfc-bootstrap.md)
+
+### Reproduce the private baseline
+
+Use Python 3 with `jsonschema`, OpenSSL, and a Docker Compose host with delegated cgroup v2 CPU and memory controllers. Preload the PostgreSQL image pinned in the Phase 1 Compose file and build the six runtime and fixture images before starting the clock.
+
+```bash
+for image in serve:serve sync:sync feed:feed phase0-fixtures:fixtures \
+             phase3-fixture:publication-fixture phase6-fixture:control-fixture; do
+    docker --context rootless build --target "${image%:*}" -t "rfc-bootstrap-phase0-${image#*:}" .
+done
+python3 -B scripts/bootstrap/baseline.py --context rootless --image-prefix rfc-bootstrap-phase0 \
+    --evidence /tmp/rfc-bootstrap-baseline
+```
+
+Use a new evidence directory on every invocation. The runner refuses image pulls and uses a private synthetic source. It runs three fresh stacks for each fixture size and one controlled TXT disagreement. Each trial records separate setup and workflow times, database and notification timestamps, request and payload measures, and sampled resource peaks. It verifies membership, BLAKE3 manifests, byte ranges and exact fixture TXT bytes after the timed read. A failed trial keeps a receipt and any available service logs.
+
+### Observed on 2026-11-23
+
+The six paced trials used benchmark commit `61dd9d1`, the collector behavior at `db38619`, PostgreSQL 19.0, and preloaded images. The x86-64 KVM host provided 18 CPUs and 34.2 GiB RAM. Rootless Docker 29.10.0 and Compose 5.8.0 ran on Linux 7.0.0-44-generic with overlayfs and delegated cgroup v2 limits. The receipts record exact image IDs and the observed CPU and memory limits for Sync, Serve, Feed and PostgreSQL. Those limits matched the comparison profile.
+
+| Fixture TXT count | T0–T1 trials (s) | Median T0–T1 (s) | Median collector wall (s) | Median T0 to observed notification (s) |
+| ---: | --- | ---: | ---: | ---: |
+| 6 | 27.349, 27.783, 30.712 | 27.783 | 17.140 | 28.514 |
+| 96 | 212.995, 213.107, 212.124 | 212.995 | 198.786 | 213.070 |
+
+Every trial published exactly one full fixture generation at sequence 1, returned the same generation and sequence over MCP, and delivered the authenticated notification on its first attempt. The startup jobs recorded zero retries. Each size reproduced its manifest digest. The 96-RFC fixture also reproduced the manifest of the earlier paced candidate benchmark. The TXT disagreement probe recorded a failed generation at 16.033 s with the first retry scheduled, sequence zero, an empty outbox and `/ready` still returning 503. The harness observed the failure before shutting down its disposable stack.
+
+| Fixture TXT count | Rsync payload bytes | HTTPS payload bytes read | Accepted bytes | RFCXML 200 / 404 / 410 / errors | HTTPS starts | Starts/s range |
+| ---: | ---: | ---: | ---: | --- | ---: | --- |
+| 6 | 27,435 | 32,113 | 32,113 | 3 / 2 / 1 / 0 | 14 | 0.845–0.923 |
+| 96 | 2,886,555 | 2,935,483 | 2,935,483 | 33 / 62 / 1 / 0 | 194 | 0.982–0.991 |
+
+The shortest HTTPS start interval was 1,000,184 µs. The 194 starts in the 96-RFC trials impose a 193-second floor between first and last dispatch, compared with the median 198.786-second collector wall time. Across the 96-RFC trials the median cumulative stage times were 0.931 s for rsync, 2.405 s for catalog HTTPS, 63.700 s for TXT HTTPS, 115.460 s for RFCXML HTTPS, 0.022 s for parsing, 20.721 s for blob installation, 4.012 s for DB operations, and 374.855 s for queue waits across 386 waits. These spans overlap. Median PostgreSQL initialization was 3.925 s and migrations took 0.164 s. The JSON receipts include all stages and the separate publication, readiness and notification timestamps.
+
+| Fixture TXT count | Median Sync and child CPU (s) | Peak Sync process RSS (MiB) | Peak Sync cgroup memory (MiB) | Rsync scratch high-water (MiB) | Sampled mirror / PGDATA peak (MiB) |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 6 | 0.098 | 12.09 | 8.60 | 0.051 | 0.125 / 48.50 |
+| 96 | 0.702 | 12.41 | 14.12 | 1.098 | 3.40 / 66.75 |
+
+PGDATA includes WAL. Disk peaks are five-second samples with a final sample. Scratch is measured at completed rsync batches. Sync CPU here covers the process and its reaped children at candidate completion. The receipts also record the full-workflow cgroup CPU and memory measurements for each service.
+
+Preloaded image inspection and fixture extraction took 4.182 s before T0. In the 96-RFC trials the median database TLS setup was 0.136 s, proxy TLS 0.039 s, and synthetic fixture and upstream TLS preparation 0.045 s. Synthetic control-secret provisioning took 0.817 s. Compose DNS and real TLS handshakes took place inside the workflow. Manual production provisioning and cold registry pulls were outside this private benchmark and remain unmeasured. The trials qualify the measurement contract at fixture scale. The ADR’s 2 h 44 min request-start floor still applies to the 9,861-RFC planning case with the current HTTPS interval.
+
+The full receipts and service logs are under `/tmp/rfc-bootstrap-phase0-evidence/final` on the verification host. Pilot logs are alongside them. Early pilots exposed a Docker metadata format error, a wrong bind source, a duplicate Serve test address, and a mismatched expected error string. The final runs used the corrected harness.
+
+### Offline verification
+
+- `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, and frozen all-feature workspace Clippy and tests passed on Rust 1.100.0 with Cargo artifacts under `/tmp/rust/target`.
+- The repository’s offline Compose Phases 0, 1, 2, 3, 6 and 7 passed sequentially with preloaded images on the rootless context. They covered MCP wire and sandbox checks, storage roles and restore, NUL and legacy-byte preservation, publication and recovery, daemon control and authenticated notification, and production Compose confinement. The exit statuses and logs are under `/tmp/rfc-bootstrap-phase0-evidence`.
