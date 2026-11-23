@@ -1,0 +1,185 @@
+name: Publish RFC MCP images
+
+on:
+  push:
+    tags:
+      - '*.*.*-build.*'
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: rfc-mcp-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TARGET_DIR: /tmp/rust/target
+  TMPDIR: /tmp
+
+jobs:
+  source:
+    name: Verify release source and canonical CI
+    if: github.repository == 'PublicData-stream/rfc-mcp-docker'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      revision: ${{ steps.source.outputs.revision }}
+      kind: ${{ steps.source.outputs.kind }}
+      tag_object: ${{ steps.source.outputs.tag_object }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a verified tag and successful main CI
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/ci/release-source.py
+
+  build:
+    name: Build and qualify ${{ matrix.arch }}
+    needs: source
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 55
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64v3
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    env:
+      RELEASE_VERSION: ${{ needs.source.outputs.version }}
+      RELEASE_REVISION: ${{ needs.source.outputs.revision }}
+      RELEASE_KIND: ${{ needs.source.outputs.kind }}
+      RELEASE_ARCH: ${{ matrix.arch }}
+      RELEASE_ARTIFACTS: /tmp/rfc-release-artifacts
+      RELEASE_EVIDENCE: /tmp/rfc-release-evidence
+      RUSTUP_HOME: /tmp/rfc-mcp-release-rustup
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.revision }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+      - name: Prefetch locked dependencies
+        run: |
+          rustup toolchain install --no-self-update
+          cargo fetch --locked
+      - name: Build, probe, and audit the release archives
+        run: |
+          python3 -B scripts/ci/release-images.py --version "$RELEASE_VERSION" --revision "$RELEASE_REVISION" \
+            build --arch "$RELEASE_ARCH" --kind "$RELEASE_KIND" \
+            --artifacts "$RELEASE_ARTIFACTS" --evidence "$RELEASE_EVIDENCE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: release-audit-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_EVIDENCE }}/
+          if-no-files-found: ignore
+          retention-days: 30
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.arch }}
+          path: ${{ env.RELEASE_ARTIFACTS }}/
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  publish:
+    name: Publish the three tested OCI indexes
+    needs: [source, build]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_VERSION: ${{ needs.source.outputs.version }}
+      RELEASE_REVISION: ${{ needs.source.outputs.revision }}
+      RELEASE_TAG_OBJECT: ${{ needs.source.outputs.tag_object }}
+      REGISTRY_AUTH_FILE: /tmp/rfc-release-ghcr-auth.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: '{amd64v3,arm64}'
+          path: /tmp/rfc-release-artifacts
+      - name: Provide the registry client
+        run: |
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y skopeo
+          fi
+      - name: Recheck the tag and publish with the workflow token
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION" \
+            --jq '.object | select(.type == "tag") | .sha')
+          test "$actual" = "$RELEASE_TAG_OBJECT"
+          umask 077
+          trap 'rm -f -- "$REGISTRY_AUTH_FILE"' EXIT
+          printf '%s' "$GH_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          python3 -B scripts/ci/release-images.py --version "$RELEASE_VERSION" --revision "$RELEASE_REVISION" \
+            publish --artifacts /tmp/rfc-release-artifacts --receipt /tmp/ghcr-release-digests.json
+          {
+            echo 'Compose image references'
+            echo '~~~'
+            jq -r '.images | to_entries[] | "RFC_\(.key | ascii_upcase)_IMAGE=\(.value.image)@\(.value.index)"' \
+              /tmp/ghcr-release-digests.json
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ghcr-release-digests
+          path: /tmp/ghcr-release-digests.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+
+  verify:
+    name: Verify anonymous GHCR pulls
+    needs: [source, publish]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.source.outputs.version }}
+      RELEASE_REVISION: ${{ needs.source.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ghcr-release-digests
+          path: /tmp/rfc-release-digests
+      - name: Provide the registry client
+        run: |
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y skopeo
+          fi
+      - name: Pull and verify both platforms without credentials
+        run: |
+          python3 -B scripts/ci/release-images.py --version "$RELEASE_VERSION" --revision "$RELEASE_REVISION" \
+            verify-anonymous --receipt /tmp/rfc-release-digests/ghcr-release-digests.json

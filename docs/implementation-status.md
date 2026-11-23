@@ -315,7 +315,7 @@ The gate used synthetic sources and a disposable localhost HTTPS proxy. Live cor
 
 ## GitHub Actions CI matrix
 
-Push and pull request jobs run the frozen Rust checks, all-feature checks, and HTTP mutation smoke on native Linux amd64 and arm64. The Compose matrix runs Phases 0–7 and the Phase 8 restore on amd64, and Phases 0, 5, and 7 on arm64. Each architecture builds its image bundle once. The case jobs verify the archive checksum, source revision, architecture, and loaded image IDs before running the existing probes. Phase 8 capacity and live upstream checks remain part of local qualification. [CI workflow](../.github/workflows/ci.yml) · [Docker workflow](../.github/workflows/docker-e2e.yml)
+Branch pushes and pull requests run the frozen Rust checks, all-feature checks, and HTTP mutation smoke on native Linux amd64 and arm64. The Compose matrix runs Phases 0–7 and the Phase 8 restore on amd64, and Phases 0, 5, and 7 on arm64. Each architecture builds its image bundle once. The case jobs verify the archive checksum, source revision, architecture, and loaded image IDs before running the existing probes. Phase 8 capacity and live upstream checks remain part of local qualification. [CI workflow](../.github/workflows/ci.yml) · [Docker workflow](../.github/workflows/docker-e2e.yml)
 
 ### Local verification on 2026-11-23
 
@@ -336,3 +336,14 @@ Push and pull request jobs run the frozen Rust checks, all-feature checks, and H
 - The crash-recovery probe retries HTTP 503 within a 15-second window using a freshly signed request for the same event. It verifies the old epoch is rejected, checks the acknowledgment signature and event ID, and forces queue contention after the committed-event crash to verify the retry preserves the original job association.
 - On 2026-11-23, the CI runner built one native amd64 image bundle and verified it in both Docker contexts. Phase 6 passed twice on rootful Docker and once on rootless Docker. All three runs observed the forced 503 and preserved the committed event's job. Phase 0 passed in both contexts with Docker Engine `29.10.0`, Compose `5.8.0`, and Linux `7.0.0-44-generic`. The bundle receipt and probe logs are under `/tmp/rfc-phase6-fix-compose.s7KJse`.
 - The locked offline Rust checks, all-feature Clippy and tests, all 258 HTTP smoke cases, and workflow lint passed locally. The hosted result for this fix is pending.
+
+## GHCR image publication
+
+The release workflow verifies signed tags and exact-commit main CI, builds native AMD64v3 and ARM64 service archives, and promotes the tested manifests to three fixed-version OCI indexes. The workflow publishes a digest receipt for Compose and verifies anonymous pulls. [Release procedure](ghcr-release.md)
+
+### Local verification on 2026-11-23
+
+- The offline Rust checks, `actionlint`, and release shell and Python syntax checks passed. The source gate accepted the actual [successful main CI attempt](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/45127806469) for `2aef81d`. The gate rejected invalid tag events, a mismatched build suffix, missing CI, and a newer failure following an older successful attempt.
+- Native Linux AMD64v3 archives for the local candidate `1.0.0-build.a9e52bdb` reported the stamped version in all three services. The exact same images passed Phase 0 in rootless and rootful Docker Engine `29.10.0` with Compose `5.8.0`, including MCP wire, TLS, permissions, and ripgrep sandbox checks. Trivy `0.76.2` found no advisories in the two Cargo lockfiles and no critical or fixable high findings in the three images using the 2026-11-23 advisory database. The release audit policy also rejected synthetic blocking findings and missing scan results. Evidence is under `/tmp/rfc-release-validation.zlFnDuGR`.
+- The pinned BuildKit exported the requested AMD64v3 and ARM64 platform descriptors. A disposable loopback registry verified both descriptors, all three index digests, anonymous downloads, rejection of missing artifacts and conflicting tags, digest-only upload, and partial publication retry. A second rehearsal combined the real AMD64v3 images with ARM64 descriptor fixtures and confirmed that Docker selected and ran all three AMD64v3 binaries by index digest. Registry evidence is under `/tmp/rfc-release-registry.buTb2xnX` and `/tmp/rfc-release-compose-pull.QhAboRrC`.
+- Native ARM64 release-image qualification, the hosted release workflow, and anonymous GHCR pulls remain pending for the first authorized release. The release rehearsal used only the loopback registry.
