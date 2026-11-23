@@ -383,6 +383,12 @@ Branch pushes and pull requests run the frozen Rust checks, all-feature checks, 
 - On 2026-11-23, the CI runner built one native amd64 image bundle and verified it in both Docker contexts. Phase 6 passed twice on rootful Docker and once on rootless Docker. All three runs observed the forced 503 and preserved the committed event's job. Phase 0 passed in both contexts with Docker Engine `29.10.0`, Compose `5.8.0`, and Linux `7.0.0-44-generic`. The bundle receipt and probe logs are under `/tmp/rfc-phase6-fix-compose.s7KJse`.
 - The locked offline Rust checks, all-feature Clippy and tests, all 258 HTTP smoke cases, and workflow lint passed locally. The hosted result for this fix is pending.
 
+### Rust 1.100.0 minimum
+
+- On 2026-11-23, Rust `1.100.0` (`0ef1bc386`) passed the offline Phase 0 Rust checks, all-feature Clippy and tests, and all 258 HTTP smoke cases on Linux amd64. Cargo reported `1.100.0` for all six workspace crates. A frozen workspace check with Rust `1.99.1` failed with the expected minimum-version error. Workflow lint and production Compose configuration validation passed.
+- The same rebuilt amd64 images passed Phase 0 on rootful and rootless Docker Engine `29.10.0` with Compose `5.8.0`. The probes passed for MCP `2026-07-28` over Streamable HTTP, PostgreSQL TLS and permissions, exact rsync transfer, and Landlock and seccomp. Separate `linux/amd64/v3` builds of serve, sync, and feed passed the entrypoint version checks. The AMD64v3 serve image ran ripgrep `15.2.0` with PCRE2 disabled.
+- The image bundle receipt and test logs are under `/tmp/rfc-rust100.EctmDcEt`. Cargo artifacts used `/tmp/rust/target`. Native ARM64 verification remains pending the hosted CI matrix.
+
 ## GHCR image publication
 
 The release workflow verifies signed tags and exact-commit main CI, builds native AMD64v3 and ARM64 service archives, and promotes the tested manifests to three fixed-version OCI indexes. The workflow publishes a digest receipt for Compose and verifies anonymous pulls. [Release procedure](ghcr-release.md)
