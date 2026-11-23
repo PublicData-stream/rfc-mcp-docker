@@ -1,5 +1,7 @@
 //! Local-only Phase 0 application probes.
 
+pub mod control;
+
 use std::path::Path;
 use std::time::Duration;
 

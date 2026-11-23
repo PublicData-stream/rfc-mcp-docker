@@ -23,7 +23,10 @@ use hyper_util::{
     rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
-use rfc_mcp_docker::ProbeResult;
+use rfc_mcp_docker::{
+    ProbeResult,
+    control::{self, Command, Keys, Link, Outcome, Rejection},
+};
 use rfc_search::{Search, SearchError};
 use rfc_storage::postgres::{GenerationSelection, Reader};
 use rmcp::{
@@ -606,13 +609,56 @@ pub async fn run() -> ProbeResult {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .with_state(admission);
+    let notification = match std::env::var("RFC_SERVE_NOTIFY_BIND") {
+        Ok(bind) => {
+            let keys = Keys::load(Link::SyncServe)?;
+            if keys.contains(&key) {
+                return Err(invalid("notification key overlaps the cursor key").into());
+            }
+            Some((TcpListener::bind(control::address(&bind)?).await?, keys))
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
     let pub_listener = TcpListener::bind(public_addr).await?;
     let admin_listener = TcpListener::bind(admin_addr).await?;
     eprintln!("RFC MCP listening on {}", pub_listener.local_addr()?);
-    tokio::try_join!(serve_public(pub_listener, public), async {
-        axum::serve(admin_listener, admin).await
-    })?;
+    tokio::try_join!(
+        async {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                serve_public(pub_listener, public).await?,
+            )
+        },
+        async { Ok(axum::serve(admin_listener, admin).await?) },
+        async {
+            match notification {
+                Some((listener, keys)) => {
+                    control::serve(listener, Link::SyncServe, keys, notify).await
+                }
+                None => std::future::pending().await,
+            }
+        },
+    )?;
     Ok(())
+}
+
+async fn notify(command: Command) -> Result<Outcome, Rejection> {
+    let Command::Generation(event) = command else {
+        return Err(Rejection::Conflict);
+    };
+    let reader = Reader::connect()
+        .await
+        .map_err(|_| Rejection::Unavailable)?;
+    let (active, sequence) = reader.active().await.map_err(|_| Rejection::Unavailable)?;
+    if sequence > event.publication_sequence {
+        return Ok(Outcome::Superseded);
+    }
+    if sequence != event.publication_sequence
+        || active.map(|id| id.get()) != u64::try_from(event.generation_id).ok()
+    {
+        return Err(Rejection::Conflict);
+    }
+    Ok(Outcome::Observed)
 }
 
 async fn serve_public(listener: TcpListener, router: Router) -> io::Result<()> {

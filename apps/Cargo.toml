@@ -7,6 +7,15 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+base64 = "0.22.1"
+blake3.workspace = true
+getrandom = "0.4.3"
+hmac = "0.13.0"
+httparse = "1.10.1"
+httpdate = "1.0.3"
+roxmltree = "0.21.2"
+sha2 = "0.11.1"
+uuid = { version = "1.29.3", features = ["serde", "v8"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 libc.workspace = true
@@ -14,7 +23,7 @@ reqwest.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync"] }
 
 rfc-storage = { path = "../crates/storage" }
 rfc-search = { path = "../crates/search" }

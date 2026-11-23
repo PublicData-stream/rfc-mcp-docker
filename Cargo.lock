@@ -1185,6 +1185,12 @@ name = "rfc-mcp-docker"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "blake3",
+ "getrandom 0.4.3",
+ "hmac",
+ "httparse",
+ "httpdate",
  "hyper",
  "hyper-util",
  "libc",
@@ -1194,9 +1200,12 @@ dependencies = [
  "rfc-storage",
  "rfc-test-support",
  "rmcp",
+ "roxmltree",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2009,6 +2018,7 @@ checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
