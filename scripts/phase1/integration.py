@@ -70,7 +70,8 @@ class Project:
         )
 
     def command(self, *args):
-        return [*self.docker, "compose", "-f", str(HERE / "compose.yml"), "-p", self.name, *args]
+        return [*self.docker, "compose", "-f", str(HERE / "compose.yml"), "-p", self.name,
+                *phase0.compose_args(*args)]
 
     def run(self, *args, **kwargs):
         return run(self.command(*args), env=self.env, **kwargs)
@@ -322,10 +323,9 @@ def main():
         work = Path(path)
         driver = work / "fixture-driver"
         image = f"{args.image_prefix}-storage-fixture"
-        if not args.skip_fixture_build:
-            run([*docker, "build", "--target", "phase1-fixture", "-t", image, str(HERE.parent.parent)],
-                timeout=600)
-        container = capture([*docker, "create", image, "/rfc-phase1-fixture"])
+        phase0.prepare_fixture_image(docker, HERE.parent.parent, "phase1-fixture", image,
+                                     skip_build=args.skip_fixture_build)
+        container = capture([*docker, "create", *phase0.local_image_args(), image, "/rfc-phase1-fixture"])
         try:
             run([*docker, "cp", f"{container}:/rfc-phase1-fixture", str(driver)])
         finally:

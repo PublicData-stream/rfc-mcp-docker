@@ -25,8 +25,9 @@ EMPTY_DIGEST = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
 
 def fixture_driver(docker, prefix, target):
     image = f"{prefix}-publication-fixture"
-    run([*docker, "build", "--target", "phase3-fixture", "-t", image, str(phase2.REPO)], timeout=600)
-    container = phase1.capture([*docker, "create", image, "/rfc-phase3-fixture"])
+    phase1.phase0.prepare_fixture_image(docker, phase2.REPO, "phase3-fixture", image)
+    container = phase1.capture([*docker, "create", *phase1.phase0.local_image_args(), image,
+                                "/rfc-phase3-fixture"])
     try:
         run([*docker, "cp", f"{container}:/rfc-phase3-fixture", str(target)])
     finally:

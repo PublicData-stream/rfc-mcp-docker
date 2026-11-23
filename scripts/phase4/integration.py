@@ -30,9 +30,9 @@ CONTENT = NOTICE + "Élan TLS DTLS TLS-alpha\r\nuncut %_\\ path\x0c\n".encode()
 
 def search_driver(docker, prefix, target, skip_build):
     image = f"{prefix}-search-fixture"
-    if not skip_build:
-        run([*docker, "build", "--target", "phase4-fixture", "-t", image, str(phase2.REPO)], timeout=600)
-    container = phase1.capture([*docker, "create", image, "/rfc-phase4-fixture"])
+    phase1.phase0.prepare_fixture_image(docker, phase2.REPO, "phase4-fixture", image, skip_build=skip_build)
+    container = phase1.capture([*docker, "create", *phase1.phase0.local_image_args(), image,
+                                "/rfc-phase4-fixture"])
     try:
         run([*docker, "cp", f"{container}:/rfc-phase4-fixture", str(target)])
     finally:

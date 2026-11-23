@@ -450,8 +450,9 @@ def exercise(project):
 
 def fixture_binaries(docker, prefix, work):
     image = f"{prefix}-control-fixture"
-    run([*docker, "build", "--target", "phase6-fixture", "-t", image, str(phase2.REPO)], timeout=600)
-    container = phase1.capture([*docker, "create", image, "/rfc-phase6-sync"])
+    phase1.phase0.prepare_fixture_image(docker, phase2.REPO, "phase6-fixture", image)
+    container = phase1.capture([*docker, "create", *phase1.phase0.local_image_args(), image,
+                                "/rfc-phase6-sync"])
     try:
         for service in ("sync", "feed"):
             run([*docker, "cp", f"{container}:/rfc-phase6-{service}", str(work / service)])

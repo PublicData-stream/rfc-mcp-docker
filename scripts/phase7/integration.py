@@ -23,6 +23,7 @@ spec = importlib.util.spec_from_file_location("phase5", PHASE5 / "integration.py
 phase5 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(phase5)
 phase1 = phase5.phase1
+phase0 = phase1.phase0
 SERVE, SYNC, FEED = ("rfc-mcp-docker-" + role for role in ("serve", "sync", "feed"))
 
 
@@ -89,7 +90,7 @@ class Deployment:
                     f"{self.net}.0/28", self.network])
 
     def key_ownership(self, command):
-        phase5.run([*self.docker, "run", "--rm", "--network", "none", "--read-only",
+        phase5.run([*self.docker, "run", *phase0.local_image_args(), "--rm", "--network", "none", "--read-only",
                     "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "FOWNER",
                     "-u", "0:0", "-v", f"{self.keys}:/keys", "--entrypoint", "/bin/sh",
                     f"{self.prefix}-sync", "-ec", command])
@@ -99,7 +100,7 @@ class Deployment:
                    "-f", str(HERE / "compose.yml")]
         if extra:
             compose.extend(("-f", str(extra)))
-        return [*compose, *args]
+        return [*compose, *phase0.compose_args(*args)]
 
     def run(self, *args, **kwargs):
         return phase5.run(self.command(*args), env=self.env, **kwargs)
@@ -257,7 +258,7 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
     def worker_lifecycle(self):
         rust = next(line.split()[1] for line in (ROOT / "Dockerfile").read_text().splitlines()
                     if line.startswith("FROM docker.io/library/rust:"))
-        phase5.run([*self.docker, "run", "--rm", "--network", "none",
+        phase5.run([*self.docker, "run", *phase0.local_image_args(), "--rm", "--network", "none",
                     "-v", f"{HERE / 'stall-worker.c'}:/stall.c:ro", "-v", f"{self.work}:/fixture",
                     "--entrypoint", "cc", rust, "-static", "-O2", "-o", "/fixture/stall", "/stall.c"])
         override = self.work / "stall.yml"

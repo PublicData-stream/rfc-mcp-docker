@@ -26,6 +26,33 @@ def capture(command, *, timeout=30):
     return run(command, timeout=timeout, stdout=subprocess.PIPE).stdout.strip()
 
 
+def preloaded_images():
+    return os.environ.get("RFC_E2E_PRELOADED") == "1"
+
+
+def local_image_args():
+    return ("--pull=never",) if preloaded_images() else ()
+
+
+def compose_args(*args):
+    if not args or not preloaded_images():
+        return args
+    # Production volume administration selects the tools profile before "run".
+    index = 2 if args[:1] == ("--profile",) else 0
+    if args[index] == "up":
+        return (*args[:index + 1], "--no-build", "--pull=never", *args[index + 1:])
+    if args[index] == "run":
+        return (*args[:index + 1], "--pull=never", *args[index + 1:])
+    return args
+
+
+def prepare_fixture_image(docker, root, target, image, *, skip_build=False):
+    if preloaded_images():
+        run([*docker, "image", "inspect", image], stdout=subprocess.DEVNULL)
+    elif not skip_build:
+        run([*docker, "build", "--target", target, "-t", image, str(root)], timeout=600)
+
+
 def make_ca(directory, name):
     run([*CERT_COMMAND, "-x509", "-days", "2", "-subj", f"/CN={name}",
          "-addext", "basicConstraints=critical,CA:TRUE",
@@ -197,13 +224,16 @@ def integration(directory, project, image_prefix, context, skip_build):
     docker = ["docker", "--context", context]
 
     def compose(*args):
-        return [*docker, "compose", "-f", str(HERE / "compose.yml"), "-p", project, *args]
+        return [*docker, "compose", "-f", str(HERE / "compose.yml"), "-p", project, *compose_args(*args)]
 
     engine = capture([*docker, "info", "--format", "{{.ServerVersion}} {{.Architecture}} {{json .SecurityOptions}}"])
     print(platform.release(), engine, capture(compose("version")), flush=True)
     if context == "rootless":
         assert "name=rootless" in engine
-    if not skip_build:
+    if preloaded_images():
+        for service in ("serve", "sync", "feed", "fixtures"):
+            run([*docker, "image", "inspect", f"{image_prefix}-{service}"], stdout=subprocess.DEVNULL)
+    elif not skip_build:
         run(compose("build"), timeout=600)
     containers = {}
     try:
@@ -319,8 +349,8 @@ def main():
     parser.add_argument("--project", help="reuse only the specified Phase 0 test image tags")
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
-    if args.skip_build and not args.project:
-        parser.error("--skip-build requires --project with prebuilt image tags")
+    if (args.skip_build or preloaded_images()) and not args.project:
+        parser.error("prebuilt images require --project with their image prefix")
     with tempfile.TemporaryDirectory(prefix="rfc-mcp-phase0-", dir="/tmp") as path:
         directory = Path(path)
         project = directory.name.lower()

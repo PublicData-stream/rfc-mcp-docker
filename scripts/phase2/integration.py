@@ -311,8 +311,9 @@ def exercise(project):
 
 def fixture_driver(docker, prefix, target):
     image = f"{prefix}-ingestion-fixture"
-    run([*docker, "build", "--target", "phase2-fixture", "-t", image, str(REPO)], timeout=600)
-    container = phase1.capture([*docker, "create", image, "/rfc-phase2-fixture"])
+    phase1.phase0.prepare_fixture_image(docker, REPO, "phase2-fixture", image)
+    container = phase1.capture([*docker, "create", *phase1.phase0.local_image_args(), image,
+                                "/rfc-phase2-fixture"])
     try:
         run([*docker, "cp", f"{container}:/rfc-phase2-fixture", str(target)])
     finally:
