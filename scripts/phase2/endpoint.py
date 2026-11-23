@@ -39,7 +39,7 @@ class Https(BaseHTTPRequestHandler):
             time.sleep(2.35)
         if scenario == "slow-txt" and self.path == "/rfc/rfc100.txt":
             time.sleep(2.0)
-        if scenario == "benchmark":
+        if scenario in ("benchmark", "cold-bootstrap"):
             # Alternate long and short responses so ordering and overlap matter.
             longer = self.path.endswith((".xml", "0.txt", "2.txt", "4.txt", "6.txt", "8.txt"))
             time.sleep(1.20 if longer else 0.10)
@@ -85,6 +85,9 @@ class Https(BaseHTTPRequestHandler):
         if not self.path.startswith("/rfc/") or "/" in self.path[5:]:
             self.send_error(404)
             return
+        if scenario == "cold-bootstrap" and self.path == "/rfc/rfc101.xml":
+            self.send_error(410)
+            return
         if self.path == "/rfc/rfc100.txt":
             if scenario == "txt-html":
                 self.response(b"<html>Not an RFC</html>", "text/html")
@@ -115,7 +118,7 @@ class Rsync(socketserver.BaseRequestHandler):
         scenario = mode()
         if scenario == "hold-rsync":
             time.sleep(15)
-        if scenario == "benchmark":
+        if scenario in ("benchmark", "cold-bootstrap"):
             time.sleep(0.20)
         with socket.create_connection(("127.0.0.1", 9873), 3) as upstream:
             upstream.settimeout(10)

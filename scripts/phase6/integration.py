@@ -37,6 +37,11 @@ class Project(phase5.Project):
         return [*command[:index], *files, *command[index:]]
 
     def prepare_phase6(self, work):
+        self.prepare_network(work)
+        self.prepare_proxy_tls(work)
+        self.prepare_control_secrets(work)
+
+    def prepare_network(self, work):
         ids = phase1.capture([*self.docker, "network", "ls", "-q"]).splitlines()
         networks = json.loads(phase1.capture([*self.docker, "network", "inspect", *ids]))
         used = [ip_network(config["Subnet"]) for network in networks
@@ -53,13 +58,17 @@ class Project(phase5.Project):
             PHASE6_NOTIFY_TARGET=f"{net}.35:8782",
         )
         self.net = net
+        (work / "fixture-policy.json").touch()
+        (work / "spoof-mode").write_text("identity")
+
+    def prepare_proxy_tls(self, work):
+        (work / "tls").mkdir()
+        phase1.phase0.make_leaf(self.directory / "certs", "localhost", work / "tls")
+
+    def prepare_control_secrets(self, work):
         self.key = secrets.token_bytes(48)
         self.feed_key = secrets.token_bytes(48)
         self.notify_key = secrets.token_bytes(48)
-        (work / "fixture-policy.json").touch()
-        (work / "spoof-mode").write_text("identity")
-        (work / "tls").mkdir()
-        phase1.phase0.make_leaf(self.directory / "certs", "localhost", work / "tls")
         keys = {
             "cursor-key": (self.key, 10001),
             "notify-serve": (self.notify_key, 10001),

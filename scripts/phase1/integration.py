@@ -52,12 +52,19 @@ class Project:
         self.prepare()
 
     def prepare(self):
+        self.prepare_tls()
+        self.prepare_database_secrets()
+
+    def prepare_tls(self):
         certs = self.directory / "certs"
         db = self.directory / "postgres"
         phase0.make_ca(certs, "ca")
         phase0.make_ca(certs, "wrong-ca")
         phase0.make_leaf(certs, "postgres", db)
         shutil.copyfile(certs / "ca.crt", db / "ca.crt")
+
+    def prepare_database_secrets(self):
+        db = self.directory / "postgres"
         (self.directory / "reader-password").write_text(self.passwords[SERVE])
         (self.directory / "writer-password").write_text(self.passwords[SYNC])
         (db / "postgres-password").write_text(self.passwords["postgres"])
@@ -94,8 +101,17 @@ class Project:
         failed([*self.psql(role), "-c", f"BEGIN READ WRITE; {query}; ROLLBACK"], self.env, state)
 
     def start(self):
+        self.initialize_volumes()
+        self.start_postgres()
+        self.bootstrap_database()
+
+    def initialize_volumes(self):
         self.run("run", "--rm", "--no-deps", "volume-admin", VOLUME_INIT)
+
+    def start_postgres(self):
         self.run("up", "-d", "--wait", "--wait-timeout", "65", "postgres", timeout=100)
+
+    def bootstrap_database(self):
         run([*self.psql(), "-f", "/migrations/roles.sql"], env=self.env)
         passwords = "".join(f"ALTER ROLE {role} PASSWORD '{self.passwords[role]}';\n" for role in (SERVE, SYNC))
         # Pipe synthetic secrets over stdin. Keep them out of command lines and logs.

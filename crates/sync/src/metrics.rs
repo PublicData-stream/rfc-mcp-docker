@@ -52,6 +52,17 @@ pub(crate) struct Record {
     pub parse_peak: u64,
     pub staged_peak: u64,
     pub retries: u64,
+    #[cfg(feature = "phase2-fixtures")]
+    pub rsync_files: usize,
+    #[cfg(feature = "phase2-fixtures")]
+    pub rsync_payload_bytes: u64,
+    #[cfg(feature = "phase2-fixtures")]
+    pub peak_rss_bytes: Option<u64>,
+    #[cfg(feature = "phase2-fixtures")]
+    pub https_start_window_us: Option<u64>,
+    #[cfg(feature = "phase2-fixtures")]
+    #[serde(skip)]
+    first_start: Option<Instant>,
     #[serde(skip)]
     active: u64,
     #[serde(skip)]
@@ -80,6 +91,11 @@ impl Metrics {
         record.https_requests += 1;
         record.active += 1;
         record.https_peak = record.https_peak.max(record.active);
+        #[cfg(feature = "phase2-fixtures")]
+        {
+            let first = *record.first_start.get_or_insert(span.start);
+            record.https_start_window_us = Some(micros(span.start.duration_since(first)));
+        }
         if let Some(last) = record.last_start.replace(span.start) {
             let interval = micros(span.start.duration_since(last));
             record.minimum_start_spacing_us = Some(
@@ -117,6 +133,13 @@ impl Metrics {
         record.scratch_peak_bytes = record.scratch_peak_bytes.max(scratch);
     }
 
+    #[cfg(feature = "phase2-fixtures")]
+    pub(crate) fn record_rsync_payload(&self, files: usize, bytes: u64) {
+        let mut record = self.0.lock().unwrap();
+        record.rsync_files += files;
+        record.rsync_payload_bytes += bytes;
+    }
+
     pub(crate) fn out_of_order(&self) {
         self.0.lock().unwrap().out_of_order += 1;
     }
@@ -139,9 +162,18 @@ impl Metrics {
         record.memory_peak = std::fs::read_to_string("/sys/fs/cgroup/memory.peak")
             .ok()
             .and_then(|text| text.trim().parse().ok());
-        record.cpu_us = usage(libc::RUSAGE_SELF)
-            .zip(usage(libc::RUSAGE_CHILDREN))
+        let sync_usage = usage(libc::RUSAGE_SELF);
+        record.cpu_us = sync_usage
+            .as_ref()
+            .and_then(cpu_micros)
+            .zip(usage(libc::RUSAGE_CHILDREN).as_ref().and_then(cpu_micros))
             .map(|(this, children)| this + children);
+        #[cfg(feature = "phase2-fixtures")]
+        {
+            record.peak_rss_bytes = sync_usage
+                .and_then(|usage| u64::try_from(usage.ru_maxrss).ok())
+                .and_then(|kib| kib.checked_mul(1024));
+        }
         record
     }
 }
@@ -186,12 +218,15 @@ impl Drop for Span {
     }
 }
 
-fn usage(who: libc::c_int) -> Option<u64> {
+fn usage(who: libc::c_int) -> Option<libc::rusage> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     if unsafe { libc::getrusage(who, usage.as_mut_ptr()) } != 0 {
         return None;
     }
-    let usage = unsafe { usage.assume_init() };
+    Some(unsafe { usage.assume_init() })
+}
+
+fn cpu_micros(usage: &libc::rusage) -> Option<u64> {
     [usage.ru_utime, usage.ru_stime]
         .into_iter()
         .try_fold(0, |sum, value| {

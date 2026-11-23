@@ -1,0 +1,19 @@
+services:
+  serve:
+    cpus: 2.0
+    mem_limit: 768m
+  sync:
+    environment:
+      RFC_SYNC_HTTP_CONCURRENCY: "2"
+      RFC_SYNC_PARSE_CONCURRENCY: "1"
+      RFC_PHASE2_FIXED_CLOCK: "1"
+      RFC_PHASE2_PACED: "1"
+  feed:
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 32
+  postgres:
+    cpus: 2.0
+    mem_limit: 1g
+    pids_limit: 128
+    shm_size: 128m
