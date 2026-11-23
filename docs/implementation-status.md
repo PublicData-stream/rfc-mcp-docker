@@ -323,4 +323,9 @@ Push and pull request jobs run the frozen Rust checks, all-feature checks, and H
 - Docker Engine `29.10.0` and Compose `5.8.0` built the nine amd64 service and fixture images on kernel `7.0.0-44-generic` from the working tree based on `636a987`. Both Docker contexts loaded the archive and reported the expected IDs. The runner and the Phase 3 probe rejected a missing preloaded fixture. The loader rejected an incorrect checksum, a different source revision, and a nonnative host before calling Docker load. Local evidence is under `/tmp/rfc-ci-e2e.n1WaHiUy`.
 - The preloaded Phase 0–7 cases and Phase 8 destructive restore passed on rootful amd64. The restore report verified 16 blobs, 794 ranges and line starts, three manifests, and public MCP `2026-07-28` over HTTPS. Phase 0 and Phase 7 also passed on rootless amd64 with the same image IDs. The existing rootless Phase 0 invocation with `--skip-build` passed.
 
-GitHub-hosted execution and native arm64 runtime results are pending a hosted workflow run.
+### ARM64 Rust CI fix
+
+- In the [hosted PR run](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/45118553865), the amd64 Rust job and both Compose matrices passed. ARM64 workspace Clippy failed with `unused_mut` because the seccomp syscall list was only mutated on x86-64. The ARM64 all-features checks and HTTP smoke were skipped, and the CI summary failed.
+- The fix uses an immutable shared syscall list and appends the existing x86-64 entries through an iterator. The syscall entries, order, and filter actions are identical to the previous implementation.
+- On local amd64 with Rust `1.99.1`, the offline workspace checks, all-features Clippy and tests, and all 258 HTTP smoke cases passed. The rootless Compose Phase 0 probe passed on rebuilt images, including the `2026-07-28` Streamable HTTP wire checks, the expected ripgrep match, and the Landlock and seccomp controls.
+- On `aarch64-unknown-linux-gnu` with Rust `1.99.1` under Docker/QEMU, frozen workspace Clippy passed for all targets with default features and with all features, both with `-D warnings`. Hosted CI and native ARM64 runtime verification for the fix are pending.

@@ -263,7 +263,7 @@ fn install_seccomp() -> io::Result<()> {
 
     // Only process start-up, local file inspection, memory, signals and stdio
     // are needed by static, single-threaded ripgrep. Unknown syscalls fail.
-    let mut syscalls = vec![
+    let syscalls = [
         libc::SYS_read,
         libc::SYS_write,
         libc::SYS_readv,
@@ -308,7 +308,7 @@ fn install_seccomp() -> io::Result<()> {
         libc::SYS_exit_group,
     ];
     #[cfg(target_arch = "x86_64")]
-    syscalls.extend([
+    let syscalls = syscalls.into_iter().chain([
         libc::SYS_arch_prctl,
         libc::SYS_poll,
         libc::SYS_open,
