@@ -21,3 +21,5 @@ jobs:
           cargo fetch --locked
       - name: Check the workspace
         run: scripts/phase0/check-rust.sh
+      - name: Exercise the HTTP parser with seeded mutations
+        run: python3 -B scripts/phase8/http-smoke.py

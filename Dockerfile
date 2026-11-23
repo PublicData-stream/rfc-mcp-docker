@@ -63,6 +63,27 @@ RUN --network=none \
       --release --bin rg --no-default-features --frozen \
     && cp /tmp/rust/target/rg/release/rg /tmp/rg
 
+# Export the resolved Rust dependency inventories from the same build stages.
+FROM build AS app-audit
+RUN --network=none \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    mkdir /audit \
+    && cargo tree --workspace --frozen --edges normal,build --prefix none \
+      --format '{p} | {l}' > /audit/packages.txt \
+    && cp Cargo.lock /audit/
+
+FROM ripgrep AS ripgrep-audit
+RUN --network=none \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    mkdir /audit \
+    && cargo tree --frozen --no-default-features --edges normal,build --prefix none \
+      --format '{p} | {l}' > /audit/packages.txt \
+    && cp Cargo.lock /audit/
+
+FROM scratch AS audit-inputs
+COPY --from=app-audit /audit /application
+COPY --from=ripgrep-audit /audit /ripgrep
+
 FROM docker.io/library/alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 
 FROM runtime AS serve
