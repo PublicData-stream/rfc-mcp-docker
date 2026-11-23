@@ -9,6 +9,8 @@ const CHUNK: usize = 16 * 1024;
 
 pub(crate) struct TextIndex<'a> {
     pub text: Option<&'a str>,
+    pub invalid_utf8: bool,
+    pub contains_nul: bool,
     pub line_starts: Vec<i64>,
     pub sections: Vec<Section<'a>>,
     pub headings: Vec<String>,
@@ -63,7 +65,6 @@ pub(crate) fn index(bytes: &[u8]) -> Result<TextIndex<'_>> {
         .trim_ascii_start()
         .to_ascii_lowercase();
     if bytes.is_empty()
-        || bytes.contains(&0)
         || [
             b"%pdf-".as_slice(),
             b"pk\x03\x04",
@@ -82,8 +83,12 @@ pub(crate) fn index(bytes: &[u8]) -> Result<TextIndex<'_>> {
             line_starts.push(i64::try_from(offset + 1)?);
         }
     }
+    let decoded = std::str::from_utf8(bytes);
+    let contains_nul = bytes.contains(&0);
     let mut result = TextIndex {
-        text: std::str::from_utf8(bytes).ok(),
+        text: decoded.ok().filter(|_| !contains_nul),
+        invalid_utf8: decoded.is_err(),
+        contains_nul,
         line_starts,
         sections: Vec::new(),
         headings: Vec::new(),
@@ -704,12 +709,48 @@ mod tests {
     }
 
     #[test]
-    fn validity_and_boundary_choices_preserve_source() {
-        let legacy = index(b"RFC 1\nlegacy\xff\n").unwrap();
-        assert!(legacy.text.is_none());
-        assert_eq!(legacy.line_starts, [0, 6]);
-        assert_eq!(legacy.section_state, Coverage::Unavailable);
-        assert!(index(b"%PDF-1.7").is_err());
+    fn bytes_mode_preserves_line_starts_without_text_indexes() {
+        for (bytes, invalid_utf8, contains_nul) in [
+            (b"RFC 1\r\ncaf\xc3\xa9\0\nend\n".as_slice(), false, true),
+            (b"RFC 1\r\nabcde\xff\nend\n", true, false),
+            (b"RFC 1\r\nabcd\xff\0\nend\n", true, true),
+        ] {
+            let indexed = index(bytes).unwrap();
+            assert!(indexed.text.is_none());
+            assert_eq!(indexed.invalid_utf8, invalid_utf8);
+            assert_eq!(indexed.contains_nul, contains_nul);
+            assert_eq!(indexed.line_starts, [0, 7, 14]);
+            assert!(indexed.sections.is_empty());
+            assert!(indexed.headings.is_empty());
+            assert!(indexed.notices.is_empty());
+            assert!(indexed.chunks.is_empty());
+            assert!(indexed.references.is_empty());
+            assert_eq!(indexed.section_state, Coverage::Unavailable);
+            assert_eq!(indexed.notice_state, Coverage::Unavailable);
+            assert_eq!(indexed.all_references, Coverage::Unavailable);
+            assert_eq!(indexed.classified_references, Coverage::Unavailable);
+        }
+    }
+
+    #[test]
+    fn rejects_empty_input_and_other_format_signatures() {
+        for bytes in [
+            b"".as_slice(),
+            b"%PDF-1.7\0",
+            b"PK\x03\x04\0",
+            b" \n<!DOCTYPE HTML>\0",
+            b"\t<HTML>\0",
+            b"\x1f\x8b\0",
+        ] {
+            assert_eq!(
+                index(bytes).err().unwrap().to_string(),
+                "input is not RFC TXT"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_boundary_preserves_utf8_code_points() {
         let bytes = format!("{}é-tail", "x".repeat(CHUNK - 1));
         let indexed = index(bytes.as_bytes()).unwrap();
         assert_eq!(indexed.chunks[0].range.end(), (CHUNK - 1) as u64);

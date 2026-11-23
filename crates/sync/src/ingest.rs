@@ -56,6 +56,7 @@ struct Report {
     reused_txt: usize,
     catalog_only: usize,
     invalid_utf8: usize,
+    contains_nul: usize,
     incomplete_sections: usize,
     incomplete_notices: usize,
     metadata_only: usize,
@@ -83,6 +84,7 @@ impl Report {
             reused_txt: 0,
             catalog_only: 0,
             invalid_utf8: 0,
+            contains_nul: 0,
             incomplete_sections: 0,
             incomplete_notices: 0,
             metadata_only: 0,
@@ -578,7 +580,8 @@ impl Run<'_> {
             }
             None => None,
         };
-        self.report.invalid_utf8 += usize::from(indexed.text.is_none());
+        self.report.invalid_utf8 += usize::from(indexed.invalid_utf8);
+        self.report.contains_nul += usize::from(indexed.contains_nul);
         self.report.incomplete_sections += usize::from(indexed.section_state != Coverage::Complete);
         self.report.incomplete_notices += usize::from(indexed.notice_state != Coverage::Complete);
         self.report.metadata_only += usize::from(policy == "metadata_only");
