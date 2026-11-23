@@ -173,11 +173,15 @@ networks:
   sync_notify:
     internal: true
     ipam:
-      config: [{subnet: "${RFC_NOTIFY_SUBNET:?Set RFC_NOTIFY_SUBNET}"}]
+      config:
+        - subnet: "${RFC_NOTIFY_SUBNET:?Set RFC_NOTIFY_SUBNET}"
+          ip_range: "${RFC_NOTIFY_DYNAMIC_RANGE:-${RFC_NOTIFY_SUBNET:?Set RFC_NOTIFY_SUBNET}}"
   feed_control:
     internal: true
     ipam:
-      config: [{subnet: "${RFC_CONTROL_SUBNET:?Set RFC_CONTROL_SUBNET}"}]
+      config:
+        - subnet: "${RFC_CONTROL_SUBNET:?Set RFC_CONTROL_SUBNET}"
+          ip_range: "${RFC_CONTROL_DYNAMIC_RANGE:-${RFC_CONTROL_SUBNET:?Set RFC_CONTROL_SUBNET}}"
   sync_egress: {}
   feed_egress: {}
 
