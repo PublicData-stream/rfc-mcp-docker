@@ -283,7 +283,9 @@ def integration(directory, project, image_prefix, context, skip_build):
              "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
              "-v", f"{HERE / 'mcp-wire.py'}:/mcp-wire.py:ro", "--entrypoint", "python3",
              images["fixtures"], "/mcp-wire.py", "--port", "8780"], timeout=90)
-        print(capture(execute("serve", "/usr/local/bin/rg", "--version")).splitlines()[0])
+        version = capture(execute("serve", "/usr/local/bin/rg", "--version"))
+        assert version.startswith("ripgrep 15.2.0\n") and "features:-pcre2" in version, version
+        print(version.splitlines()[0])
         output = capture(execute("serve", "timeout", "8", "/usr/local/bin/rfc-mcp-docker-serve",
                                  "--phase0-sandbox"), timeout=10)
         matches = [event["data"] for line in output.splitlines()

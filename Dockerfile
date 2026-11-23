@@ -45,19 +45,23 @@ RUN --network=none \
     cargo build --release --bin rfc-phase4-fixture --features phase4-fixtures --frozen \
     && cp /tmp/rust/target/release/rfc-phase4-fixture /out/
 
-FROM docker.io/library/alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS ripgrep
-ARG TARGETARCH
+FROM docker.io/library/rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS ripgrep
+WORKDIR /ripgrep
+RUN apk add --no-cache make=4.4.1-r4
 RUN set -eu; \
-    case "$TARGETARCH" in \
-        amd64) arch=x86_64; sha=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c ;; \
-        arm64) arch=aarch64; sha=800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915 ;; \
-        *) exit 1 ;; \
-    esac; \
-    release="ripgrep-15.2.0-$arch-unknown-linux-musl"; \
-    wget -q -O /tmp/rg.tar.gz "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/$release.tar.gz"; \
-    echo "$sha  /tmp/rg.tar.gz" | sha256sum -c -; \
-    tar -xzf /tmp/rg.tar.gz -C /tmp; \
-    cp "/tmp/$release/rg" /tmp/rg
+    commit=e89fff89ac9af12e8d4ce9d5fd07beb408ca730f; \
+    wget -q -O /tmp/rg.tar.gz "https://codeload.github.com/BurntSushi/ripgrep/tar.gz/$commit"; \
+    echo 'af40d0f4cb7a55994906c009a7ba865047f0d487c95bceb8db59ffc4f2173d20  /tmp/rg.tar.gz' | sha256sum -c -; \
+    tar -xzf /tmp/rg.tar.gz --strip-components=1; \
+    rm /tmp/rg.tar.gz
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked cargo fetch --locked
+RUN --network=none \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/tmp/rust/target,sharing=locked \
+    CARGO_PROFILE_RELEASE_STRIP=debuginfo RUSTFLAGS="-C target-feature=+crt-static" \
+      cargo build --target-dir /tmp/rust/target/rg \
+      --release --bin rg --no-default-features --frozen \
+    && cp /tmp/rust/target/rg/release/rg /tmp/rg
 
 FROM docker.io/library/alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 

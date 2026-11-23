@@ -1,4 +1,4 @@
-//! Disposable, Linux-only worker confinement proof for fixed synthetic fixtures.
+//! Confinement for the fixed ripgrep executable.
 
 use std::{
     ffi::CString,
@@ -17,9 +17,10 @@ const UNSELECTED: &str = "/mirror/unselected.txt";
 const SECRET: &str = "/phase0/secret.txt";
 const SCRATCH: &str = "/tmp/phase0-denied";
 const RG: &str = "/usr/local/bin/rg";
+pub(crate) const CPU_SECONDS: u64 = 2;
 
 /// Enter the worker sandbox and replace the probe with the pinned ripgrep.
-pub fn run() -> io::Result<()> {
+pub fn sandbox_probe() -> io::Result<()> {
     // Positive controls establish that Docker mount and network policy alone do
     // not account for the worker denials.
     for path in [ALLOWED, UNSELECTED, SECRET, "/proc/self/status"] {
@@ -31,12 +32,13 @@ pub fn run() -> io::Result<()> {
     let address = listener.local_addr()?;
     let inherited_fd = TcpStream::connect(address)?.into_raw_fd();
 
-    no_new_privileges()?;
-    let landlock_abi = install_landlock()?;
+    let input = File::open(ALLOWED)?;
+    // SAFETY: the disposable probe supplies a verified fixture as stdin.
+    checked(unsafe { libc::dup2(input.as_raw_fd(), 0) }.into())?;
+    drop(input);
     // Transfer the descriptor out of the wrapper before closing all inherited FDs.
     let listening_fd = listener.into_raw_fd();
-    // SAFETY: this is a disposable single-threaded process and uses only stdio.
-    checked(unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) })?;
+    let landlock_abi = confine()?;
     for fd in [inherited_fd, listening_fd] {
         // SAFETY: F_GETFD only queries the integer descriptor.
         let result = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -45,13 +47,13 @@ pub fn run() -> io::Result<()> {
         }
     }
 
-    set_limit(libc::RLIMIT_CPU, 2)?;
-    set_limit(libc::RLIMIT_AS, 256 * 1024 * 1024)?;
-    set_limit(libc::RLIMIT_FSIZE, 1024 * 1024)?;
-    install_seccomp()?;
-
-    File::open(ALLOWED)?;
-    for path in [UNSELECTED, SECRET, "/proc/self/status"] {
+    for path in [
+        ALLOWED,
+        UNSELECTED,
+        SECRET,
+        "/proc/self/status",
+        "/proc/self/environ",
+    ] {
         require_denial(File::open(path), path)?;
     }
     require_denial(
@@ -66,24 +68,54 @@ pub fn run() -> io::Result<()> {
         "Landlock ABI {landlock_abi}, seccomp, inherited descriptors and denial controls passed"
     );
 
-    Err(Command::new(RG)
-        .current_dir("/")
-        .env_clear()
-        .args([
-            "--json",
-            "--no-config",
-            "--color",
-            "never",
-            "--encoding",
-            "none",
-            "--threads",
-            "1",
-            "-e",
-            "phase-zero",
-            "--",
-            ALLOWED,
-        ])
-        .exec())
+    exec_rg("phase-zero", true, true)
+}
+
+/// Called before the serve runtime starts, in a dedicated child process.
+pub fn sandbox_worker(pattern: &str, literal: bool, case_sensitive: bool) -> io::Result<()> {
+    confine()?;
+    exec_rg(pattern, literal, case_sensitive)
+}
+
+fn confine() -> io::Result<libc::c_long> {
+    std::env::set_current_dir("/")?;
+    // SAFETY: the helper is single-threaded and only stdio is supplied.
+    checked(unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) })?;
+    no_new_privileges()?;
+    let abi = install_landlock()?;
+    set_limit(libc::RLIMIT_CPU, CPU_SECONDS as libc::rlim_t)?;
+    set_limit(libc::RLIMIT_AS, 256 * 1024 * 1024)?;
+    set_limit(libc::RLIMIT_FSIZE, 0)?;
+    set_limit(libc::RLIMIT_CORE, 0)?;
+    install_seccomp()?;
+    Ok(abi)
+}
+
+fn exec_rg(pattern: &str, literal: bool, case_sensitive: bool) -> io::Result<()> {
+    let mut command = Command::new(RG);
+    command.env_clear().args([
+        "--json",
+        "--no-config",
+        "--color",
+        "never",
+        "--encoding",
+        "none",
+        "--text",
+        "--no-mmap",
+        "--threads",
+        "1",
+        "--engine",
+        "default",
+    ]);
+    if literal {
+        command.arg("--fixed-strings");
+    }
+    command.arg(if case_sensitive {
+        "--case-sensitive"
+    } else {
+        "--ignore-case"
+    });
+    Err(command.args(["-e", pattern, "--", "-"]).exec())
 }
 
 fn require_denial<T>(result: io::Result<T>, operation: &str) -> io::Result<()> {
@@ -162,28 +194,33 @@ fn install_landlock() -> io::Result<libc::c_long> {
     })?;
     // SAFETY: a successful create call returned a new owned descriptor.
     let ruleset = unsafe { File::from_raw_fd(ruleset as i32) };
-    for (path, access) in [(ALLOWED, READ_FILE), (RG, READ_FILE | EXECUTE)] {
-        let path = CString::new(path).expect("fixed path has no NUL");
-        // SAFETY: path is a valid C string and open creates an owned descriptor.
-        let fd =
-            checked(unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }.into())?;
-        // SAFETY: this is a fresh descriptor returned by open above.
-        let anchor = unsafe { File::from_raw_fd(fd as i32) };
-        let rule = PathBeneath {
-            allowed_access: access,
-            parent_fd: anchor.as_raw_fd(),
-        };
-        // SAFETY: the packed argument matches landlock_path_beneath_attr.
-        checked(unsafe {
-            libc::syscall(
-                libc::SYS_landlock_add_rule,
-                ruleset.as_raw_fd(),
-                1_u32,
-                &rule,
-                0_u32,
+    let path = CString::new(RG).expect("fixed path has no NUL");
+    // SAFETY: path is a valid C string and open creates an owned descriptor.
+    let fd = checked(
+        unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
-        })?;
-    }
+        }
+        .into(),
+    )?;
+    // SAFETY: this is a fresh descriptor returned by open above.
+    let anchor = unsafe { File::from_raw_fd(fd as i32) };
+    let rule = PathBeneath {
+        allowed_access: READ_FILE | EXECUTE,
+        parent_fd: anchor.as_raw_fd(),
+    };
+    // SAFETY: the packed argument matches landlock_path_beneath_attr.
+    checked(unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset.as_raw_fd(),
+            1_u32,
+            &rule,
+            0_u32,
+        )
+    })?;
     // SAFETY: the ruleset descriptor stays live through the call.
     checked(unsafe {
         libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0_u32)

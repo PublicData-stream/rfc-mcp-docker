@@ -4,20 +4,40 @@ mod mcp;
 #[path = "../public.rs"]
 mod public;
 
-#[cfg(target_os = "linux")]
-#[path = "../sandbox.rs"]
-mod sandbox;
-
 use rfc_mcp_docker::ProbeResult;
 use rfc_storage::{
     blob::BlobReader,
     postgres::{GenerationSelection, Reader, mirror_root},
 };
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ProbeResult {
+fn main() -> ProbeResult {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "linux")]
     match args.as_slice() {
+        [option] if option == "--phase0-sandbox" => return Ok(rfc_search::sandbox_probe()?),
+        [option, mode, case, pattern]
+            if option == "--rg-worker"
+                && matches!(mode.as_str(), "literal" | "regex")
+                && matches!(case.as_str(), "sensitive" | "insensitive") =>
+        {
+            if let Err(error) =
+                rfc_search::sandbox_worker(pattern, mode == "literal", case == "sensitive")
+            {
+                eprintln!("ripgrep confinement setup failed: {error}");
+                std::process::exit(125);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(&args))
+}
+
+async fn run(args: &[String]) -> ProbeResult {
+    match args {
         [] => public::run().await,
         [option] if option == "--version" => {
             println!("rfc-mcp-docker-serve {}", env!("CARGO_PKG_VERSION"));
@@ -47,8 +67,6 @@ async fn main() -> ProbeResult {
             axum::serve(listener, mcp::router()).await?;
             Ok(())
         }
-        #[cfg(target_os = "linux")]
-        [option] if option == "--phase0-sandbox" => Ok(sandbox::run()?),
         _ => Err("rfc-mcp-docker-serve: unexpected argument".into()),
     }
 }

@@ -9,11 +9,12 @@ license.workspace = true
 rfc-core = { path = "../core" }
 rfc-storage = { path = "../storage" }
 base64 = "0.22"
+libc.workspace = true
 memchr = "2"
 ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["io-util", "process", "sync"] }
 tokio-postgres.workspace = true
 
 [features]
