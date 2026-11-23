@@ -20,10 +20,27 @@ const RG: &str = "/usr/local/bin/rg";
 pub(crate) const CPU_SECONDS: u64 = 2;
 
 /// Enter the worker sandbox and replace the probe with the pinned ripgrep.
-pub fn sandbox_probe() -> io::Result<()> {
+pub fn sandbox_probe(extended: bool, burn_cpu: bool) -> io::Result<()> {
     // Positive controls establish that Docker mount and network policy alone do
     // not account for the worker denials.
-    for path in [ALLOWED, UNSELECTED, SECRET, "/proc/self/status"] {
+    // SAFETY: getppid has no pointer arguments or side effects.
+    let parent = format!("/proc/{}/environ", unsafe { libc::getppid() });
+    let mut denied = vec![
+        ALLOWED,
+        UNSELECTED,
+        SECRET,
+        "/proc/self/status",
+        "/proc/self/environ",
+    ];
+    if extended {
+        denied.extend([
+            parent.as_str(),
+            "/phase0/metadata",
+            "/phase0/staging",
+            "/phase0/retired",
+        ]);
+    }
+    for path in &denied {
         File::open(path)?;
     }
     File::create_new(SCRATCH)?;
@@ -47,13 +64,7 @@ pub fn sandbox_probe() -> io::Result<()> {
         }
     }
 
-    for path in [
-        ALLOWED,
-        UNSELECTED,
-        SECRET,
-        "/proc/self/status",
-        "/proc/self/environ",
-    ] {
+    for path in denied {
         require_denial(File::open(path), path)?;
     }
     require_denial(
@@ -64,10 +75,22 @@ pub fn sandbox_probe() -> io::Result<()> {
         SCRATCH,
     )?;
     require_denial(TcpStream::connect(address), "new network connection")?;
+    require_denial(std::os::unix::net::UnixStream::pair(), "Unix socket pair")?;
+    if Vec::<u8>::new()
+        .try_reserve_exact(512 * 1024 * 1024)
+        .is_ok()
+    {
+        return Err(io::Error::other("worker exceeded its address-space limit"));
+    }
     eprintln!(
         "Landlock ABI {landlock_abi}, seccomp, inherited descriptors and denial controls passed"
     );
 
+    if burn_cpu {
+        loop {
+            std::hint::spin_loop();
+        }
+    }
     exec_rg("phase-zero", true, true)
 }
 

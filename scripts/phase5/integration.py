@@ -43,6 +43,9 @@ TEXT = NOTICE + ("🌐\r\n".encode() + b"\x01" * 1024 + b"\x0c\r\n") * 90
 BINARY_NOTICE = b"Synthetic notice \xff.\r\n"
 BINARY = BINARY_NOTICE + b"Original RFC bytes \xff\r\n\x0c"
 LARGE_NOTICE = b"\x01" * 25_000
+RG_ORIGINAL = (b"\xef\xbb\xbf\r\n\r\n" + EXCERPT.replace(b"Comments: 102", b"Comments: 108")
+               .replace(b"TLS, exact bytes", b"TLS TLS, exact bytes") + "ÿ tls --version\r\n".encode())
+RG_DENSE = EXCERPT.replace(b"Comments: 102", b"Comments: 109") + b"z" * 65536 + b"\r\n"
 
 
 class Project(phase3.Project):
@@ -63,6 +66,8 @@ class Project(phase3.Project):
             105: (TEXT, "Reviewed UTF-8 pages"),
             106: (LARGE_NOTICE + b"Body", "Oversized notice budget"),
             107: (b"1. Root\n\n3.2. Orphaned heading\n\nBody\n", "Partial section hierarchy"),
+            108: (RG_ORIGINAL, "Raw ripgrep fixture"),
+            109: (RG_DENSE, "Dense ripgrep output fixture"),
         }
         catalog = self.source / "catalog.xml"
         entries = "".join(phase2.catalog_entry(rfc, title) for rfc, (_, title) in additions.items())
@@ -73,10 +78,11 @@ class Project(phase3.Project):
                 (self.source / transport / f"rfc{rfc}.txt").write_bytes(payload)
         registry = json.loads((phase2.REPO / "crates" / "sync" / "src" / "policy.json").read_text())
         registry["version"] = "phase5-synthetic"
-        self.digests = {rfc: self.digest(sources[rfc]) for rfc in (101, 102, 105, 106)}
-        for rfc, notice in [(101, BINARY_NOTICE), (102, None), (105, NOTICE), (106, LARGE_NOTICE)]:
+        self.digests = {rfc: self.digest(sources[rfc]) for rfc in (101, 102, 105, 106, 108, 109)}
+        for rfc, notice in [(101, BINARY_NOTICE), (102, None), (105, NOTICE),
+                            (106, LARGE_NOTICE), (108, None), (109, None)]:
             override = dict(rfc=rfc, digest=self.digests[rfc], review="Private synthetic fixture only",
-                            policy="whole_paginated" if notice else "excerpt_allowed")
+                            policy="whole_paginated" if rfc in {101, 105, 106} else "excerpt_allowed")
             if notice:
                 override["notices"] = [dict(category="copyright", start_byte=0, end_byte=len(notice))]
             registry["overrides"].append(override)
@@ -188,7 +194,7 @@ def wire_tests(client):
         client.schemas[tool["name"]] = Draft202012Validator(tool["outputSchema"])
         client.call(tool["name"], _error="invalid_arguments", **example, unknown=1)
 
-    client.call("rg", _error="sandbox_unavailable", pattern="TLS")
+    client.call("rg", _error="corpus_not_ready", pattern="TLS")
     base, standard = envelope("tools/call", {"name": "list", "arguments": {}})
     issues = [
         ({key: value for key, value in standard.items() if key != "MCP-Protocol-Version"}, 400, -32020),
@@ -337,6 +343,60 @@ def read_tests(client, project, sources):
     return cursor
 
 
+def rg_tests(client):
+    arguments = dict(pattern="tls", mode="literal", case_sensitive=False,
+                     ids=[108, 108], context_lines=1, limit=1)
+    first = client.call("rg", **arguments)[0]
+    assert first["truncation_reason"] == "match_limit" and not first["scan_complete"], first
+    cursor = first["next_cursor"]
+    assert cursor
+    hit = first["matches"][0]
+    assert hit["match_range"] == [RG_ORIGINAL.index(b"TLS"), RG_ORIGINAL.index(b"TLS") + 3]
+    notices = first["notice_groups"][0]["notices"]
+    assert notices and any(b"Copyright" in bytes_from(notice) for notice in notices)
+    for notice in notices:
+        assert bytes_from(notice) == RG_ORIGINAL[notice["start_byte"]:notice["end_byte"]]
+    arguments["ids"] = [108]
+    client.call("rg", **{**arguments, "pattern": "tlsx"}, cursor=cursor, _error="cursor_invalid")
+    page = first
+    hits = hit["match_range"],
+    while page["next_cursor"]:
+        page = client.call("rg", **arguments, cursor=page["next_cursor"])[0]
+        for hit in page["matches"]:
+            start, end = hit["start_byte"], hit["end_byte"]
+            assert bytes_from(hit) == RG_ORIGINAL[start:end]
+            hits += (hit["match_range"],)
+    assert page["scan_complete"] and len(hits) == 3
+    assert [RG_ORIGINAL[start:end] for start, end in hits] == [b"TLS", b"TLS", b"tls"]
+    assert hits == tuple(sorted(hits))
+    option = client.call("rg", pattern="--version", mode="literal", ids=[108])[0]
+    hit = option["matches"][0]
+    assert bytes_from(hit) == "ÿ tls --version\r\n".encode() and hit["encoding"] == "utf8"
+    start = RG_ORIGINAL.index(b"--version")
+    assert hit["match_range"] == [start, start + 9]
+    bom = client.call("rg", pattern="^\ufeff", ids=[108])[0]["matches"][0]
+    assert bom["match_range"] == [0, 3]
+    zero = client.call("rg", pattern="^", ids=[108])[0]
+    line_starts = [0] + [i + 1 for i, byte in enumerate(RG_ORIGINAL[:-1]) if byte == 10]
+    assert [hit["match_range"] for hit in zero["matches"]] == [[start, start] for start in line_starts]
+    client.call("rg", pattern="[", ids=[108], _error="invalid_regex")
+    client.call("rg", pattern="(?=TLS)", ids=[108], _error="invalid_regex")
+    client.call("rg", pattern="one\ntwo", mode="literal", _error="invalid_arguments")
+    restricted = client.call("rg", pattern="TLS", ids=[101])[0]
+    assert not restricted["scan_complete"] and not restricted["matches"] and not restricted["next_cursor"]
+    assert restricted["omitted"][0]["code"] == "source_policy_restricted"
+    empty = client.call("rg", pattern="absent", ids=[108])[0]
+    assert empty["scan_complete"] and empty["matches"] == [] and empty["next_cursor"] is None
+    client.call("rg", pattern="z", mode="literal", ids=[109], _error="resource_limit_exceeded")
+    partial = client.call("rg", pattern="z", mode="literal", ids=[108, 109])[0]
+    assert not partial["scan_complete"] and not partial["matches"]
+    assert partial["truncation_reason"] == "worker_budget" and partial["next_cursor"]
+    client.call("rg", pattern="z", mode="literal", ids=[108, 109], cursor=partial["next_cursor"],
+                _error="resource_limit_exceeded")
+    print("Ripgrep exact bytes, signed pagination, option-like patterns, and coverage passed", flush=True)
+    return arguments, cursor
+
+
 @contextmanager
 def block_corpus(project):
     with subprocess.Popen(project.psql(), env=project.env, text=True, stdin=subprocess.PIPE,
@@ -372,7 +432,7 @@ def cancellation(project, client):
     print("Client disconnect and a lock deadline both closed their database sessions", flush=True)
 
 
-def publication(project, client, first, get_cursor):
+def publication(project, client, first, get_cursor, rg_page):
     original = client.call("list", limit=1, sort="id_desc")[0]
     cursor = original["next_cursor"]
     assert original["items"][0]["id"] == 9110
@@ -386,6 +446,9 @@ def publication(project, client, first, get_cursor):
     pinned = client.call("list", limit=1, sort="id_desc", cursor=cursor)[0]
     assert pinned["generation_id"] == str(first) and pinned["publication_sequence"] == "1"
     assert pinned["items"][0]["id"] == 8174
+    rg_args, rg_cursor = rg_page
+    rg_pinned = client.call("rg", **rg_args, cursor=rg_cursor)[0]
+    assert (rg_pinned["generation_id"], rg_pinned["publication_sequence"]) == (str(first), "1")
     project.activate(first, 2, "rollback")
     assert client.call("list")[0]["publication_sequence"] == "3"
     assert client.call("get", id=105, cursor=get_cursor)[0]["publication_sequence"] == "1"
@@ -394,6 +457,7 @@ def publication(project, client, first, get_cursor):
                 f"UPDATE rfc.generations SET state='deleting' WHERE id={first}; "
                 f"UPDATE rfc.generations SET state='deleted' WHERE id={first}; COMMIT")
     client.call("get", id=105, cursor=get_cursor, _error="generation_unavailable")
+    client.call("rg", **rg_args, cursor=rg_cursor, _error="generation_unavailable")
     print("Fresh reads and authenticated continuations passed publication, rollback and retirement", flush=True)
 
 
@@ -460,8 +524,9 @@ def main():
             first = int(project.reconcile()["generation_id"])
             project.activate(first, 0)
             assert project.admin("/ready").returncode == 0
-            assert "rfc_mcp_rg_available 0" in project.admin("/metrics").stdout
+            assert "rfc_mcp_rg_available 1" in project.admin("/metrics").stdout
             cursor = read_tests(client, project, sources)
+            rg_page = rg_tests(client)
             project.denied_sql("DELETE FROM rfc.document_versions", phase1.SERVE)
             phase1.exercise_isolation(project)
             for service in ("sync", "feed"):
@@ -471,7 +536,7 @@ def main():
                         "-B", "/phase5/direct.py", "untrusted")
             project.run("exec", "-T", "proxy", "python3", "-B", "/phase5/direct.py", "trusted")
             cancellation(project, client)
-            publication(project, client, first, cursor)
+            publication(project, client, first, cursor, rg_page)
         except Exception:
             subprocess.run(project.command("logs", "--tail", "30", "serve", "proxy"),
                            env=project.env, timeout=15, check=False)

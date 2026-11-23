@@ -456,7 +456,7 @@ impl GenerationReadGuard<'_> {
         &self,
         command: &mut tokio::process::Command,
     ) -> Result<std::process::ExitStatus> {
-        let fence = self._fence.try_clone()?;
+        let fence = self.worker_fence()?;
         let mut child = command.process_group(0).kill_on_drop(true).spawn()?;
         let group = child
             .id()
@@ -477,6 +477,12 @@ impl GenerationReadGuard<'_> {
         let status = worker.await??;
         drop(caller);
         Ok(status)
+    }
+
+    /// Keep the guarded original alive if the database session dies before a
+    /// supervised child has been killed and reaped.
+    pub fn worker_fence(&self) -> std::io::Result<File> {
+        self._fence.try_clone()
     }
 }
 

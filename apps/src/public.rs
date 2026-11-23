@@ -27,7 +27,7 @@ use rfc_mcp_docker::{
     ProbeResult,
     control::{self, Command, Keys, Link, Outcome, Rejection},
 };
-use rfc_search::{Search, SearchError};
+use rfc_search::{Rg, Search, SearchError};
 use rfc_storage::postgres::{GenerationSelection, Reader};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
@@ -70,11 +70,12 @@ struct ToolSchema {
 #[derive(Clone)]
 struct Mcp {
     search: Arc<Search>,
+    rg: Arc<Rg>,
     tools: Arc<Vec<Tool>>,
 }
 
 impl Mcp {
-    fn new(key: &[u8; 48]) -> Result<Self, serde_json::Error> {
+    fn new(key: &[u8; 48], rg: Arc<Rg>) -> Result<Self, serde_json::Error> {
         let definitions: Vec<ToolSchema> =
             serde_json::from_str(include_str!("../schemas/tools.json"))?;
         let tools = definitions
@@ -97,6 +98,7 @@ impl Mcp {
             .collect();
         Ok(Self {
             search: Arc::new(Search::new(key)),
+            rg,
             tools: Arc::new(tools),
         })
     }
@@ -104,6 +106,17 @@ impl Mcp {
     async fn call(&self, name: &str, args: Value, id: &RequestId) -> Result<Value, SearchError> {
         let fits = |value: &Value| wire_size(id, value) <= RESPONSE_LIMIT;
         match name {
+            "rg" => {
+                let id = id.clone();
+                self.rg
+                    .clone()
+                    .run(
+                        self.search.clone(),
+                        arguments(args)?,
+                        move |value, reserve| wire_size(&id, value) <= RESPONSE_LIMIT - reserve,
+                    )
+                    .await
+            }
             "list" => self.search.list(arguments(args)?, fits).await,
             "get" => self.search.get(arguments(args)?, fits).await,
             "table" => self.search.table(arguments(args)?, fits).await,
@@ -179,17 +192,6 @@ impl ServerHandler for Mcp {
             return Err(ErrorData::invalid_params("Unknown tool", None));
         }
         let args = Value::Object(request.arguments.unwrap_or_default());
-        if request.name == "rg" {
-            let result = match arguments::<RgRequest>(args).and_then(RgRequest::validate) {
-                Ok(()) => CallToolResult::structured_error(json!({
-                    "code":"sandbox_unavailable",
-                    "message":"The rg worker sandbox is unavailable in Phase 5",
-                })),
-                Err(error) => tool_error(error, None),
-            };
-            return Ok(result.into());
-        }
-
         let started = Instant::now();
         let budget = context
             .extensions
@@ -252,52 +254,6 @@ fn arguments<T: DeserializeOwned>(value: Value) -> Result<T, SearchError> {
     serde_json::from_value(value).map_err(|_| SearchError::InvalidArguments)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RgMode {
-    Regex,
-    Literal,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RgRequest {
-    pattern: String,
-    #[serde(rename = "mode")]
-    _mode: Option<RgMode>,
-    #[serde(rename = "case_sensitive")]
-    _case_sensitive: Option<bool>,
-    ids: Option<Vec<i32>>,
-    context_lines: Option<u8>,
-    limit: Option<u16>,
-    cursor: Option<String>,
-}
-
-impl RgRequest {
-    fn validate(self) -> Result<(), SearchError> {
-        let Self {
-            pattern,
-            ids,
-            context_lines,
-            limit,
-            cursor,
-            ..
-        } = self;
-        if !(1..=2048).contains(&pattern.len())
-            || pattern.contains('\0')
-            || ids.is_some_and(|ids| {
-                ids.is_empty() || ids.len() > 100 || ids.iter().any(|id| *id <= 0)
-            })
-            || context_lines.is_some_and(|lines| lines > 5)
-            || limit.is_some_and(|limit| !(1..=100).contains(&limit))
-            || cursor.is_some_and(|cursor| cursor.is_empty() || cursor.len() > 512)
-        {
-            return Err(SearchError::InvalidArguments);
-        }
-        Ok(())
-    }
-}
-
 fn wire_size(id: &RequestId, value: &Value) -> usize {
     let result = CallToolResult::structured(value.clone());
     serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result}))
@@ -336,6 +292,7 @@ struct Bucket {
 }
 
 struct Admission {
+    rg: Arc<Rg>,
     in_flight: Semaphore,
     sources: Mutex<HashMap<IpAddr, Bucket>>,
     proxies: Vec<IpAddr>,
@@ -347,8 +304,9 @@ struct Admission {
 }
 
 impl Admission {
-    fn new(proxies: Vec<IpAddr>, hosts: Vec<Authority>, origins: Vec<String>) -> Self {
+    fn new(rg: Arc<Rg>, proxies: Vec<IpAddr>, hosts: Vec<Authority>, origins: Vec<String>) -> Self {
         Self {
+            rg,
             in_flight: Semaphore::new(REQUESTS),
             sources: Mutex::default(),
             proxies,
@@ -493,7 +451,10 @@ async fn admit(
     response
 }
 
-async fn ready() -> StatusCode {
+async fn ready(State(state): State<Arc<Admission>>) -> StatusCode {
+    if !state.rg.available() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     let ready = timeout(Duration::from_secs(2), async {
         Reader::connect()
             .await?
@@ -510,11 +471,12 @@ async fn ready() -> StatusCode {
 
 async fn metrics(State(state): State<Arc<Admission>>) -> String {
     format!(
-        "rfc_mcp_requests_total {}\nrfc_mcp_admission_rejected_total {}\n+        rfc_mcp_responses_total {}\nrfc_mcp_in_flight {}\nrfc_mcp_rg_available 0\n",
+        "rfc_mcp_requests_total {}\nrfc_mcp_admission_rejected_total {}\nrfc_mcp_responses_total {}\nrfc_mcp_in_flight {}\nrfc_mcp_rg_available {}\n",
         state.requests.load(Ordering::Relaxed),
         state.rejected.load(Ordering::Relaxed),
         state.responses.load(Ordering::Relaxed),
-        REQUESTS - state.in_flight.available_permits()
+        REQUESTS - state.in_flight.available_permits(),
+        u8::from(state.rg.available()),
     )
 }
 
@@ -601,8 +563,14 @@ pub async fn run() -> ProbeResult {
         .map_err(|_| invalid("RFC_MCP_CURSOR_KEY_FILE"))?
         .try_into()
         .map_err(|_| invalid("RFC_MCP_CURSOR_KEY_FILE (48 raw bytes required)"))?;
-    let admission = Arc::new(Admission::new(proxies, allowed, origins.clone()));
-    let public = super::mcp::transport(Mcp::new(&key)?, Some(hosts), origins)
+    let rg = Arc::new(Rg::initialize().await);
+    let admission = Arc::new(Admission::new(
+        rg.clone(),
+        proxies,
+        allowed,
+        origins.clone(),
+    ));
+    let public = super::mcp::transport(Mcp::new(&key, rg)?, Some(hosts), origins)
         .route_layer(middleware::from_fn_with_state(admission.clone(), admit));
     let admin = Router::new()
         .route("/live", get(|| async { StatusCode::OK }))

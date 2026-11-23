@@ -22,11 +22,15 @@ Mcp-Name: get
 | `search` | `query`, `limit`, `cursor`, `include_snippets` | Uses the [RFC search DSL](search.md). Optional snippets carry original match offsets and complete notice bundles. Coverage describes incomplete or budgeted evaluation. |
 | `get` | `id`, `section_id`, `filter_section_text`, `range`, `max_bytes`, `cursor`, `format` | Retrieves whole TXT by default. Supply at most one selector. Heading text matches the parser's heading exactly, including case. Duplicate headings return candidate IDs. Section slices include descendants. |
 | `table` | `id`, `max_depth`, `limit`, `cursor` | Lists indexed sections in original order. Includes section IDs, depth, parent, parser coverage, and original bounds. Exact heading bytes and the parsed heading label appear when the source policy and complete notices permit excerpts. |
-| `rg` | `pattern`, `mode`, `case_sensitive`, `ids`, `context_lines`, `limit`, `cursor` | Reserved for sandboxed ripgrep. Phase 5 returns `sandbox_unavailable`. |
+| `rg` | `pattern`, `mode`, `case_sensitive`, `ids`, `context_lines`, `limit`, `cursor` | Finds occurrences in approved original TXT, in RFC and byte order. Each result includes its original range and references its notice bundle. |
 
 Arguments are JSON objects. The [exported schemas](../apps/schemas/tools.json) describe input fields and structured success and error output. A tool error uses `isError: true` with a stable code, message, and relevant recovery details. Protocol errors use the JSON-RPC contract for the pinned revision. Successful outputs report the generation and publication sequence as decimal strings. The MCP text block contains serialized JSON matching `structuredContent`.
 
 `list`, `search`, and `table` default to 20 entries and accept 1–100. Send the same normalized arguments when resuming those tools. For `get`, send the same `id` and the returned cursor. Repeated optional arguments must agree with the cursor. Cursors expire within 30 minutes and refer to the original generation. Start a fresh request after `cursor_expired` or `generation_unavailable`.
+
+`rg` defaults to a case-sensitive single-line regex, zero context lines, and 20 matches. Use `mode: "literal"` for a fixed string. Patterns accept up to 2,048 UTF-8 bytes, `context_lines` accepts 0–5, `limit` accepts 1–100, and `ids` accepts up to 100 positive RFC numbers. Continue with the same normalized arguments and the returned cursor. A resumed document is evaluated from byte zero. Each occurrence has a zero-based half-open `match_range`. Context may be shortened to fit the response. An excerpt uses base64 when its bytes cannot be represented as UTF-8.
+
+`scan_complete` means the selected scope was fully covered through the current page. An empty partial page leaves the global match count unknown. `omitted` reports documents excluded by policy, unavailable source bytes, or per-original size limits. `source_bytes_charged` includes each original handed to the worker, including an interrupted scan. Follow a returned `next_cursor` after a budget stop. Narrow the scope or pattern if no progress is possible. A failed sandbox check yields `sandbox_unavailable`.
 
 ## Original bytes and notices
 
@@ -37,6 +41,8 @@ Each `get` page contains up to 64 KiB of original bytes. The complete serialized
 RFC 2119 and RFC 8174 have single-response, whole-file approvals. Approved excerpts include complete original notices outside the body. A separately reviewed `whole_paginated` decision allows only sequential whole-file retrieval and includes the approved notices on every page. Add such decisions to the sync registry with the RFC ID, exact TXT BLAKE3 digest, review reference, and an ordered, non-overlapping list of complete notice spans. Bump the registry version and reconcile and publish a new generation to apply the receipt. A URL is available when a request cannot return the original.
 
 ## Serving in Docker Compose
+
+For the production profile, see [Docker Compose deployment](deployment.md).
 
 Start `rfc-mcp-docker-serve` with its default entry point. Configure its existing database TLS credentials for the SELECT-only role and mount the mirror read-only. Mount a dedicated secret file containing exactly 48 random bytes for cursor authentication. Use a shared stable key for restarts that should preserve outstanding cursors.
 

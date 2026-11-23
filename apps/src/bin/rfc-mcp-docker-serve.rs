@@ -14,7 +14,14 @@ fn main() -> ProbeResult {
     let args: Vec<_> = std::env::args().skip(1).collect();
     #[cfg(target_os = "linux")]
     match args.as_slice() {
-        [option] if option == "--phase0-sandbox" => return Ok(rfc_search::sandbox_probe()?),
+        [option] if option == "--phase0-sandbox" => {
+            return Ok(rfc_search::sandbox_probe(false, false)?);
+        }
+        [option, mode]
+            if option == "--phase7-sandbox" && matches!(mode.as_str(), "denials" | "cpu") =>
+        {
+            return Ok(rfc_search::sandbox_probe(true, mode == "cpu")?);
+        }
         [option, mode, case, pattern]
             if option == "--rg-worker"
                 && matches!(mode.as_str(), "literal" | "regex")
