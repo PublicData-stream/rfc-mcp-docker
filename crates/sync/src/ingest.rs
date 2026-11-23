@@ -4,13 +4,12 @@ use crate::{
     pipeline::{DOCUMENT_SLOTS, Event, Pipeline, Prepared, PriorTxt, Shutdown, VerifiedTxt},
     policy::Registry,
     recovery::recover_before_ingestion,
-    text::{self, TextIndex},
     upstream::{self, Capture, Download, Source, Upstream},
     xml,
 };
 use rfc_core::{BlobDigest, ByteRange, Coverage, GenerationId, Relation, RelationKind, RfcNumber};
 use rfc_storage::{
-    blob::{BlobReader, BlobWriter},
+    blob::{BlobReader, BlobWriter, DurableBlob},
     postgres::{Result, mirror_root},
 };
 use serde::Serialize;
@@ -155,7 +154,7 @@ async fn execute(
     let mut report = Report::new(scope);
     let shutdown = Shutdown::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut result = async {
+    let result = async {
         let execution = async {
             let upstream = upstream?;
             let mut writer = Writer::connect().await?;
@@ -181,11 +180,6 @@ async fn execute(
         }
     }
     .await;
-    if result.is_ok() && shutdown.check().is_err() {
-        // A complete ready transaction may have won the race with the signal.
-        // Its durable result remains available for recovery.
-        result = Err("reconciliation cancelled after readiness".into());
-    }
     print_report(report, &result)?;
     result.map(|_| ())
 }
@@ -244,20 +238,22 @@ async fn run(
     let metrics = upstream.metrics();
     let root = mirror_root();
     let store = BlobWriter::open(&root)?;
+    shutdown.check()?;
     recover_before_ingestion(writer, &store).await?;
     let reader = Arc::new(BlobReader::open(&root, false)?);
     shutdown.check()?;
     upstream.after_fence().await;
     let registry = registry?;
+    let mut pipeline = Pipeline::new(upstream.clone())?;
     let id = writer.start_ingestion(PARSER, INDEX, job).await?;
     report.generation_id = Some(id.get().to_string());
-    let mut pipeline = Pipeline::new(upstream.clone());
     let mut run = Run {
         writer,
         id,
         scope,
-        store,
+        store: Arc::new(store),
         reader,
+        installing: None,
         upstream,
         registry,
         report,
@@ -271,6 +267,7 @@ async fn run(
         result = run.collect(&mut pipeline) => result,
     };
     pipeline.drain().await;
+    run.drain_install().await;
     if result.is_err()
         && let Err(error) = run.writer.fail(id).await
     {
@@ -285,8 +282,9 @@ struct Run<'a> {
     writer: &'a mut Writer,
     id: GenerationId,
     scope: Scope,
-    store: BlobWriter,
+    store: Arc<BlobWriter>,
     reader: Arc<BlobReader>,
+    installing: Option<tokio::task::JoinHandle<Result<DurableBlob>>>,
     upstream: Upstream,
     registry: Registry,
     report: &'a mut Report,
@@ -295,7 +293,10 @@ struct Run<'a> {
 impl Run<'_> {
     async fn collect(&mut self, pipeline: &mut Pipeline) -> Result<(GenerationId, BlobDigest)> {
         let start = self.catalog_capture().await?;
-        let catalog = xml::catalog(&start.bytes)?;
+        let catalog = {
+            let _parse = self.upstream.metrics().span(Stage::Parse);
+            xml::catalog(&start.bytes)?
+        };
         if catalog.entries.len() > 20_000 {
             return Err("catalog entry count exceeds bounds".into());
         }
@@ -333,7 +334,7 @@ impl Run<'_> {
             .collect();
         self.report.catalog_only = catalog_only.len();
         self.report.expected_txt = selected.len();
-        let start_digest = self.install(Source::Catalog, &start.bytes).await?;
+        let start_digest = self.install(Source::Catalog, start.bytes.clone()).await?;
         self.report.catalog_digest = Some(start_digest.to_string());
         let before = self.store_catalog(&start, start_digest).await?;
         drop(start);
@@ -344,7 +345,7 @@ impl Run<'_> {
             .await?;
 
         let end = self.catalog_capture().await?;
-        let end_digest = self.install(Source::Catalog, &end.bytes).await?;
+        let end_digest = self.install(Source::Catalog, end.bytes.clone()).await?;
         let after = self.store_catalog(&end, end_digest).await?;
         if end_digest != start_digest {
             return Err("RFC catalog changed during reconciliation".into());
@@ -482,6 +483,9 @@ impl Run<'_> {
                     }
                 }
                 Event::Document(id, result) => {
+                    if id != ordered[committed] {
+                        self.upstream.metrics().out_of_order();
+                    }
                     failed |= result.is_err();
                     if let Ok(document) = &result {
                         failed |= matches!(document.verified, VerifiedTxt::Mismatch(_));
@@ -531,13 +535,48 @@ impl Run<'_> {
         }
     }
 
-    async fn install(&self, source: Source, bytes: &[u8]) -> Result<BlobDigest> {
-        let durable = {
-            let _install = self.upstream.metrics().span(Stage::Install);
-            self.store.install(bytes, source.limit() as u64)?.blob()
-        };
+    async fn install(&mut self, source: Source, bytes: Arc<Vec<u8>>) -> Result<BlobDigest> {
+        let durable = self.install_durable(source, bytes).await?;
         let _database = self.upstream.metrics().span(Stage::Database);
         self.writer.register_blob(durable).await
+    }
+
+    async fn install_durable(
+        &mut self,
+        source: Source,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<DurableBlob> {
+        let store = self.store.clone();
+        let reader = self.reader.clone();
+        let metrics = self.upstream.metrics();
+        // The coordinator submits at most one install. Retain the handle so
+        // deadline or signal cancellation can join it before releasing the fence.
+        assert!(self.installing.is_none());
+        self.installing = Some(tokio::task::spawn_blocking(move || {
+            let _install = metrics.span(Stage::Install);
+            let durable = store
+                .install(bytes.as_slice(), source.limit() as u64)?
+                .blob();
+            if matches!(source, Source::Txt(_))
+                && reader.read_range(
+                    durable.digest(),
+                    ByteRange::new(0, durable.byte_length()).ok_or("invalid blob range")?,
+                    source.limit(),
+                )? != bytes.as_slice()
+            {
+                return Err("canonical TXT differs after durable installation".into());
+            }
+            Ok(durable)
+        }));
+        let result = self.installing.as_mut().expect("active blob install").await;
+        self.installing.take();
+        result?
+    }
+
+    async fn drain_install(&mut self) {
+        if let Some(install) = self.installing.take() {
+            let _ = install.await;
+        }
     }
 
     async fn store_catalog(&mut self, capture: &Capture, digest: BlobDigest) -> Result<BlobDigest> {
@@ -639,54 +678,40 @@ impl Run<'_> {
             digest,
             verified,
             xml,
+            parsed,
             ..
         } = *prepared;
-        let bytes = bytes.as_slice();
         self.report.accept(bytes.len())?;
         let source = Source::Txt(id);
         if let VerifiedTxt::Mismatch(capture) = &verified {
             self.store
-                .quarantine_mismatch(bytes, &capture.bytes, source.limit())?;
+                .quarantine_mismatch(&bytes, &capture.bytes, source.limit())?;
             return Err(format!("RFC {} rsync and HTTPS TXT disagree", id.get()).into());
         }
-        let mut indexed = {
-            let _parse = self.upstream.metrics().span(Stage::Parse);
-            let indexed = text::index(bytes)?;
-            validate_ranges(bytes, &indexed)?;
-            indexed
-        };
-        for (section, heading) in indexed.sections.iter_mut().zip(&indexed.headings) {
-            section.heading = heading;
-        }
-        let install = self.upstream.metrics().span(Stage::Install);
-        let durable = self.store.install(bytes, source.limit() as u64)?.blob();
-        if self.reader.read_range(
-            durable.digest(),
-            ByteRange::new(0, durable.byte_length()).ok_or("invalid blob range")?,
-            source.limit(),
-        )? != bytes
-        {
-            return Err("canonical TXT differs after durable installation".into());
-        }
-        drop(install);
+        let parsed = parsed.ok_or("missing verified parser output")?;
+        let mut indexed = parsed.txt.data.into_view(&bytes, &parsed.txt.headings)?;
+        let durable = self.install_durable(source, bytes.clone()).await?;
         {
             let _database = self.upstream.metrics().span(Stage::Database);
             self.writer.register_blob(durable).await?;
         }
-        let optional = self.rfcxml(id, xml).await?;
-        let policy = if let Some(notices) = self.registry.pagination_notices(id, digest, bytes)? {
-            indexed.notice_state = Coverage::Complete;
-            indexed.notices = notices;
-            "whole_paginated"
-        } else {
-            self.registry.decide(
-                id,
-                digest,
-                entry,
-                indexed.notice_family,
-                indexed.notice_state,
-            )
-        };
+        let optional = self.rfcxml(id, xml, parsed.references).await?;
+        let (policy, notices) =
+            if let Some(notices) = self.registry.pagination_notices(id, digest, &bytes)? {
+                indexed.notice_state = Coverage::Complete;
+                ("whole_paginated", notices)
+            } else {
+                (
+                    self.registry.decide(
+                        id,
+                        digest,
+                        entry,
+                        indexed.notice_family,
+                        indexed.notice_state,
+                    ),
+                    indexed.notices,
+                )
+            };
         let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
         let reused = matches!(verified, VerifiedTxt::Prior(_));
@@ -724,7 +749,7 @@ impl Run<'_> {
                     notice_policy: policy,
                     sections: indexed.sections,
                     chunks: indexed.chunks,
-                    notices: indexed.notices,
+                    notices,
                 },
                 Some(IndexedText {
                     section_state: indexed.section_state,
@@ -811,17 +836,18 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn rfcxml(&mut self, id: RfcNumber, download: Result<Download>) -> Result<OptionalXml> {
+    async fn rfcxml(
+        &mut self,
+        id: RfcNumber,
+        download: Result<Download>,
+        references: Option<Result<xml::XmlReferences>>,
+    ) -> Result<OptionalXml> {
         let source = Source::Xml(id);
         let mut result = OptionalXml::default();
         match download {
             Ok(Download::Captured(capture)) => {
                 self.report.accept(capture.bytes.len())?;
-                let parsed = {
-                    let _parse = self.upstream.metrics().span(Stage::Parse);
-                    xml::references(&capture.bytes, id)
-                };
-                match parsed {
+                match references.ok_or("missing RFCXML parser output")? {
                     Ok(references) => result.references = Some(references),
                     Err(error) => {
                         self.report
@@ -829,7 +855,7 @@ impl Run<'_> {
                         result.failed = true;
                     }
                 }
-                let digest = self.install(source, &capture.bytes).await?;
+                let digest = self.install(source, capture.bytes.clone()).await?;
                 result.capture = Some((capture, digest));
             }
             Ok(Download::Unavailable) => self.report.xml_unavailable += 1,
@@ -897,37 +923,4 @@ async fn store_edge(
             &[evidence],
         )
         .await
-}
-
-fn validate_ranges(bytes: &[u8], indexed: &TextIndex<'_>) -> Result<()> {
-    let valid = |range: ByteRange| {
-        range
-            .select(bytes)
-            .is_some_and(|slice| !slice.is_empty() && std::str::from_utf8(slice).is_ok())
-    };
-    if indexed.sections.iter().any(|section| {
-        !valid(section.raw_heading)
-            || !valid(section.body)
-            || section.raw_heading.start() != section.body.start()
-            || section.raw_heading.end() > section.body.end()
-    }) || indexed.notices.iter().any(|notice| !valid(notice.range))
-        || indexed
-            .references
-            .iter()
-            .any(|evidence| !valid(evidence.range))
-    {
-        return Err("TXT parser produced an invalid source range".into());
-    }
-    let mut cursor = 0;
-    for chunk in &indexed.chunks {
-        if chunk.range.start() != cursor || chunk.range.select(bytes) != Some(chunk.text.as_bytes())
-        {
-            return Err("TXT chunk does not match its exact source bytes".into());
-        }
-        cursor = chunk.range.end();
-    }
-    if indexed.text.is_some() && cursor != bytes.len() as u64 {
-        return Err("TXT chunks do not cover the verified blob".into());
-    }
-    Ok(())
 }

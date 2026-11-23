@@ -1,7 +1,7 @@
 //! Fixed upstream destinations and bounded, private transfers.
 
 use crate::{
-    metrics::{Metrics, Stage},
+    metrics::{Metrics, Stage, StageLease},
     pipeline::Shutdown,
 };
 use reqwest::{Client, StatusCode, header};
@@ -78,7 +78,7 @@ impl Source {
 
 #[derive(Debug)]
 pub(crate) struct Capture {
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<Vec<u8>>,
     pub observed_us: i64,
     pub fetched_us: i64,
     pub etag: Option<String>,
@@ -129,13 +129,26 @@ impl Upstream {
         rsync_module: &'static str,
         ca: Option<reqwest::Certificate>,
     ) -> Result<Self> {
+        let timeout = Duration::from_secs(30);
+        #[cfg(feature = "phase2-fixtures")]
+        let timeout = if ca.is_some()
+            && let Ok(value) = std::env::var("RFC_PHASE2_HTTP_TIMEOUT_MS")
+        {
+            let value: u64 = value.parse()?;
+            if !(1..=30_000).contains(&value) {
+                return Err("invalid fixture HTTPS timeout".into());
+            }
+            Duration::from_millis(value)
+        } else {
+            timeout
+        };
         let mut builder = Client::builder()
             .https_only(true)
             .no_proxy()
             .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .user_agent("rfc-mcp-docker-sync/0.0.0");
         let paced = ca.is_none();
         if let Some(ca) = ca {
@@ -152,8 +165,13 @@ impl Upstream {
             #[cfg(feature = "phase2-fixtures")]
             fixture_clock: None,
             next_request: Arc::new(Mutex::new(time::Instant::now())),
-            in_flight: Arc::new(Semaphore::new(concurrency("RFC_SYNC_HTTP_CONCURRENCY", 1)?)),
+            in_flight: Arc::new(Semaphore::new(concurrency("RFC_SYNC_HTTP_CONCURRENCY", 2)?)),
         })
+    }
+
+    #[cfg(feature = "phase2-fixtures")]
+    pub(crate) fn is_fixture(&self) -> bool {
+        self.https_origin != OFFICIAL_HTTPS
     }
 
     pub(crate) fn metrics(&self) -> Metrics {
@@ -197,7 +215,19 @@ impl Upstream {
             Poll::Ready(result) => result,
             Poll::Pending => response.await,
         }
-        .map_err(|error| format!("{} HTTPS transport: {}", source.kind(), error.without_url()))?;
+        .map_err(|error| {
+            let error = error.without_url();
+            let reason = if error.is_timeout() {
+                "timeout"
+            } else {
+                "request failed"
+            };
+            if let Some(cause) = std::error::Error::source(&error) {
+                format!("{} HTTPS transport: {reason}: {cause}", source.kind())
+            } else {
+                format!("{} HTTPS transport: {reason}: {error}", source.kind())
+            }
+        })?;
         let status = response.status();
         if matches!(source, Source::Xml(_))
             && matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE)
@@ -245,7 +275,7 @@ impl Upstream {
             return Err("HTTPS body is empty".into());
         }
         Ok(Download::Captured(Capture {
-            bytes,
+            bytes: Arc::new(bytes),
             observed_us,
             fetched_us: clock.map_or_else(now_us, |us| Ok(us + 1))?,
             etag,
@@ -270,6 +300,7 @@ impl Upstream {
         if ids.is_empty() || ids.len() > BATCH {
             return Err("rsync batch count exceeds bounds".into());
         }
+        let lease = self.metrics.stage_start();
         let temp = tempfile::Builder::new()
             .prefix("rfc-rsync-")
             .tempdir_in("/tmp")?;
@@ -331,7 +362,11 @@ impl Upstream {
             }
             status = child.wait() => status?,
         };
-        group.0 = None;
+        if status.success() {
+            group.0 = None;
+        } else {
+            group.kill();
+        }
         if !status.success() && !matches!(status.code(), Some(23 | 24)) {
             return Err(format!("rsync batch failed ({status})").into());
         }
@@ -359,9 +394,22 @@ impl Upstream {
         if !status.success() {
             return Err(format!("rsync batch failed ({status})").into());
         }
-        self.metrics.staged(staged_bytes);
-        Ok(RsyncBatch { temp, incoming })
+        self.metrics.staged(staged_bytes, scratch_used());
+        Ok(RsyncBatch {
+            temp,
+            incoming,
+            _lease: lease,
+        })
     }
+}
+
+fn scratch_used() -> Option<u64> {
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(c"/tmp".as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_blocks - stats.f_bfree) * stats.f_frsize)
 }
 
 fn filename(id: RfcNumber) -> String {
@@ -407,6 +455,7 @@ impl Drop for ProcessGroup {
 pub(crate) struct RsyncBatch {
     temp: tempfile::TempDir,
     incoming: std::path::PathBuf,
+    _lease: StageLease,
 }
 
 impl RsyncBatch {

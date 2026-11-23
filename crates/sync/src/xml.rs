@@ -1,5 +1,6 @@
 //! Bounded parsing of official catalog, RFCXML and feed inputs.
 
+use crate::parse::{Budget, BudgetExceeded};
 use crate::upstream::{CATALOG_LIMIT, XML_LIMIT};
 use rfc_core::{Coverage, RelationKind, RfcNumber};
 use rfc_storage::postgres::Result;
@@ -236,7 +237,11 @@ pub(crate) struct XmlReferences {
     pub classified: Coverage,
 }
 
-pub(crate) fn references(bytes: &[u8], expected: RfcNumber) -> Result<XmlReferences> {
+pub(crate) fn references(
+    bytes: &[u8],
+    expected: RfcNumber,
+    budget: &Budget<'_>,
+) -> Result<XmlReferences> {
     let document = parse(bytes, XML_LIMIT, 250_000)?;
     let root = document.root_element();
     if !root.has_tag_name("rfc")
@@ -253,23 +258,51 @@ pub(crate) fn references(bytes: &[u8], expected: RfcNumber) -> Result<XmlReferen
             .any(|node| node.has_tag_name((INCLUDE_NS, "include")));
     let mut unclassified = false;
     let mut edges = Vec::new();
-    for reference in back
-        .into_iter()
-        .flat_map(|back| back.descendants())
-        .filter(|node| {
-            node.has_tag_name("reference")
-                && node
-                    .ancestors()
-                    .any(|ancestor| ancestor.has_tag_name("references"))
-        })
-    {
+    let mut work = 8_000_000usize;
+    let mut visit = || -> Result<()> {
+        budget.shutdown.check()?;
+        work = work.checked_sub(1).ok_or(BudgetExceeded)?;
+        Ok(())
+    };
+    for reference in back.into_iter().flat_map(|back| back.descendants()) {
+        visit()?;
+        if !reference.has_tag_name("reference") {
+            continue;
+        }
+        let mut in_group = false;
+        let mut classification_from_parent = None;
+        for group in reference.ancestors() {
+            visit()?;
+            if !group.has_tag_name("references") {
+                continue;
+            }
+            in_group = true;
+            let mut title = group.attribute("title");
+            if title.is_none() {
+                for name in group.children() {
+                    visit()?;
+                    if name.has_tag_name("name") {
+                        title = name.text();
+                        break;
+                    }
+                }
+            }
+            classification_from_parent = title.and_then(classification);
+            if classification_from_parent.is_some() {
+                break;
+            }
+        }
+        if !in_group {
+            continue;
+        }
         let mut explicit_rfc = false;
         let mut non_rfc = false;
         let mut targets = BTreeSet::new();
-        for series in reference
-            .descendants()
-            .filter(|node| node.has_tag_name("seriesInfo"))
-        {
+        for series in reference.descendants() {
+            visit()?;
+            if !series.has_tag_name("seriesInfo") {
+                continue;
+            }
             match series.attribute("name") {
                 Some("RFC") => {
                     explicit_rfc = true;
@@ -277,6 +310,7 @@ pub(crate) fn references(bytes: &[u8], expected: RfcNumber) -> Result<XmlReferen
                         .attribute("value")
                         .and_then(|value| number(value).or_else(|| catalog_number(value)))
                     {
+                        budget.reserve(targets.len() * 64 + edges.len() * 128 + 64)?;
                         targets.insert(target);
                     } else {
                         incomplete = true;
@@ -304,21 +338,11 @@ pub(crate) fn references(bytes: &[u8], expected: RfcNumber) -> Result<XmlReferen
                 incomplete = true;
             }
         }
-        let kind = reference
-            .ancestors()
-            .filter(|node| node.has_tag_name("references"))
-            .filter_map(|group| {
-                group.attribute("title").or_else(|| {
-                    group
-                        .children()
-                        .find(|n| n.has_tag_name("name"))
-                        .and_then(|n| n.text())
-                })
-            })
-            .find_map(classification)
-            .unwrap_or(RelationKind::UnclassifiedReference);
+        let kind = classification_from_parent.unwrap_or(RelationKind::UnclassifiedReference);
         unclassified |= !targets.is_empty() && kind == RelationKind::UnclassifiedReference;
+        let target_cost = targets.len() * 64;
         for target in targets {
+            budget.reserve(target_cost + (edges.len() + 1) * 128)?;
             edges.push(XmlReference {
                 kind,
                 target,
@@ -445,7 +469,15 @@ mod tests {
         <references title="Informative References"><referencegroup><reference><seriesInfo name="RFC" value="102"/></reference></referencegroup></references>
         <reference><seriesInfo name="RFC" value="104"/></reference><reference anchor="RFC999"/>
         </references></back></rfc>"#;
-        let parsed = references(bytes, RfcNumber::new(100).unwrap()).unwrap();
+        let parsed = references(
+            bytes,
+            RfcNumber::new(100).unwrap(),
+            &Budget {
+                bytes: crate::parse::DOCUMENT_BYTES,
+                shutdown: &crate::pipeline::Shutdown::new(),
+            },
+        )
+        .unwrap();
         assert_eq!(parsed.all, Coverage::Partial);
         assert_eq!(parsed.classified, Coverage::Partial);
         assert_eq!(

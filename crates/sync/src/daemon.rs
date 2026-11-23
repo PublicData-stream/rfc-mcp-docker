@@ -97,7 +97,8 @@ pub async fn run_daemon() -> Result<()> {
     let outbox_retry = schedule.outbox_retry;
     let shutdown = Shutdown::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let worker = worker(&schedule, &shutdown);
+    let worker_shutdown = shutdown.clone();
+    let mut worker = tokio::spawn(async move { worker(&schedule, &worker_shutdown).await });
     let services = async {
         tokio::try_join!(
             control::serve(listener, Link::FeedSync, feed_keys, accept),
@@ -106,16 +107,16 @@ pub async fn run_daemon() -> Result<()> {
         )?;
         Result::Ok(())
     };
-    tokio::pin!(worker, services);
+    tokio::pin!(services);
     tokio::select! {
-        result = &mut worker => result,
+        result = &mut worker => result?,
         result = &mut services => {
             shutdown.stop();
-            result.and(worker.await)
+            result.and(worker.await?)
         }
         _ = term.recv() => {
             shutdown.stop();
-            worker.await
+            worker.await?
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Deterministic indexes over the exact RFC TXT bytes.
 
-use crate::{Chunk, Notice, Section, xml};
+use crate::{Chunk, Notice, Section, parse::Budget, xml};
 use rfc_core::{ByteRange, Coverage, RelationKind, RfcNumber, SectionId};
 use rfc_storage::postgres::Result;
 use std::collections::BTreeSet;
@@ -15,7 +15,7 @@ pub(crate) struct TextIndex<'a> {
     pub sections: Vec<Section<'a>>,
     pub headings: Vec<String>,
     pub section_state: Coverage,
-    pub notices: Vec<Notice<'a>>,
+    pub notices: Vec<Notice<'static>>,
     pub notice_state: Coverage,
     pub notice_family: &'static str,
     pub chunks: Vec<Chunk<'a>>,
@@ -58,7 +58,18 @@ fn span(start: usize, end: usize) -> Result<ByteRange> {
         .ok_or_else(|| "invalid TXT range".into())
 }
 
+#[cfg(test)]
 pub(crate) fn index(bytes: &[u8]) -> Result<TextIndex<'_>> {
+    index_with_budget(
+        bytes,
+        &Budget {
+            bytes: crate::parse::DOCUMENT_BYTES,
+            shutdown: &crate::pipeline::Shutdown::new(),
+        },
+    )
+}
+
+pub(crate) fn index_with_budget<'a>(bytes: &'a [u8], budget: &Budget<'_>) -> Result<TextIndex<'a>> {
     let prefix = bytes
         .get(..64)
         .unwrap_or(bytes)
@@ -77,14 +88,27 @@ pub(crate) fn index(bytes: &[u8]) -> Result<TextIndex<'_>> {
     {
         return Err("input is not RFC TXT".into());
     }
-    let mut line_starts = vec![0];
-    for (offset, byte) in bytes[..bytes.len() - 1].iter().enumerate() {
+    let body = &bytes[..bytes.len() - 1];
+    let lines = 1 + body.iter().filter(|&&byte| byte == b'\n').count();
+    let decoded = std::str::from_utf8(bytes);
+    let contains_nul = bytes.contains(&0);
+    let indexes_text = decoded.is_ok() && !contains_nul;
+    // Reserve for the line index plus the temporary lines, headings, sections,
+    // references, and owned handoff. Line-dense inputs skip the section pass.
+    let section_work = if indexes_text && lines <= 200_000 {
+        lines * 560
+    } else {
+        0
+    };
+    budget.reserve(lines * size_of::<i64>() + bytes.len() * 4 + section_work)?;
+    let mut line_starts = Vec::new();
+    line_starts.try_reserve_exact(lines)?;
+    line_starts.push(0);
+    for (offset, byte) in body.iter().enumerate() {
         if *byte == b'\n' {
             line_starts.push(i64::try_from(offset + 1)?);
         }
     }
-    let decoded = std::str::from_utf8(bytes);
-    let contains_nul = bytes.contains(&0);
     let mut result = TextIndex {
         text: decoded.ok().filter(|_| !contains_nul),
         invalid_utf8: decoded.is_err(),
@@ -118,12 +142,12 @@ pub(crate) fn index(bytes: &[u8]) -> Result<TextIndex<'_>> {
             raw,
         })
         .collect();
-    let (headings, uncertain) = headings(&lines)?;
+    let (headings, uncertain) = headings(&lines, budget)?;
     let (sections, section_state) = sections(&headings, text.len(), uncertain)?;
     result.section_state = section_state;
     let mut bibliography = Bibliography::default();
     for (heading, section) in headings.into_iter().zip(&sections) {
-        bibliography.read(&lines, &heading, section.body)?;
+        bibliography.read(&lines, &heading, section.body, budget)?;
         if let Some(category) = notice_category(&heading.title) {
             push_notice(&mut result.notices, category, section.body, section_state)?;
         }
@@ -200,13 +224,16 @@ fn chunks(text: &str) -> Result<Vec<Chunk<'_>>> {
     Ok(chunks)
 }
 
-fn headings<'a>(lines: &[Line<'a>]) -> Result<(Vec<Heading<'a>>, bool)> {
+fn headings<'a>(lines: &[Line<'a>], budget: &Budget<'_>) -> Result<(Vec<Heading<'a>>, bool)> {
     let mut result = Vec::new();
     let mut contents = false;
     let mut code = false;
     let mut uncertain = false;
     let mut seen = BTreeSet::new();
     for (i, &line) in lines.iter().enumerate() {
+        if i % 256 == 0 {
+            budget.shutdown.check()?;
+        }
         let label = line.text().trim_end();
         let trimmed = label.trim_start_matches('\u{feff}');
         if matches!(trimmed.trim(), "<CODE BEGINS>" | "<CODE ENDS>") || trimmed.starts_with("```") {
@@ -447,7 +474,7 @@ fn notice_category(title: &str) -> Option<&'static str> {
 }
 
 fn push_notice(
-    notices: &mut Vec<Notice<'_>>,
+    notices: &mut Vec<Notice<'static>>,
     category: &'static str,
     range: ByteRange,
     extraction: Coverage,
@@ -462,7 +489,7 @@ fn push_notice(
     Ok(())
 }
 
-fn add_inline_notices(lines: &[Line<'_>], notices: &mut Vec<Notice<'_>>) -> Result<()> {
+fn add_inline_notices(lines: &[Line<'_>], notices: &mut Vec<Notice<'static>>) -> Result<()> {
     if let Some(index) = lines.iter().take(40).position(|line| {
         line.text()
             .trim_start()
@@ -545,7 +572,13 @@ struct Bibliography {
 }
 
 impl Bibliography {
-    fn read(&mut self, lines: &[Line<'_>], heading: &Heading<'_>, body: ByteRange) -> Result<()> {
+    fn read(
+        &mut self,
+        lines: &[Line<'_>],
+        heading: &Heading<'_>,
+        body: ByteRange,
+        budget: &Budget<'_>,
+    ) -> Result<()> {
         let kind = xml::classification(&heading.title);
         if kind.is_none() && !heading.title.eq_ignore_ascii_case("references") {
             return Ok(());
@@ -561,6 +594,7 @@ impl Bibliography {
         let mut index = start;
         let mut saw_record = false;
         while index < end {
+            budget.shutdown.check()?;
             let line = lines[index];
             index += 1;
             let value = line.text().trim_start();
@@ -591,6 +625,7 @@ impl Bibliography {
             let mut possible_rfc = label.starts_with("RFC");
             let mut in_title = false;
             for record in records {
+                budget.shutdown.check()?;
                 possible_rfc |= xml::rfc_link(record);
                 external |= [
                     "DOI ",
@@ -626,6 +661,7 @@ impl Bibliography {
                 self.incomplete = true;
             } else if let Some(target) = targets.into_iter().next() {
                 let last = if stop == index { line } else { lines[stop - 1] };
+                budget.reserve((self.edges.len() + 1) * 2 * size_of::<TextReference>())?;
                 self.edges.push(TextReference {
                     kind: kind.unwrap_or(RelationKind::UnclassifiedReference),
                     target,

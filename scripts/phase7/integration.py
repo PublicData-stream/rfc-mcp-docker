@@ -171,6 +171,12 @@ class Deployment:
             assert host["NanoCpus"] > 0 and host["Memory"] > 0 and host["PortBindings"] == {}
             assert host["LogConfig"]["Type"] == "local" and host["LogConfig"]["Config"]["max-file"] == "3"
             assert set(self.capture("exec", "-T", service, "ls", "/run/secrets").split()) == secrets_expected
+            if service == SYNC:
+                assert host["Memory"] == 2 * 1024**3 and host["NanoCpus"] == 2_000_000_000
+                block_size, blocks = map(int, self.capture(
+                    "exec", "-T", SYNC, "stat", "-f", "-c", "%S %b", "/tmp"
+                ).split())
+                assert block_size * blocks == 512 * 1024**2
             if service == FEED:
                 assert not any(mount["Destination"] == "/mirror" for mount in info["Mounts"])
             if service in (SYNC, FEED):

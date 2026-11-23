@@ -1,10 +1,20 @@
 //! Bounded producer tasks supervised by the ordered ingestion coordinator.
 
-use crate::upstream::{Capture, Download, RsyncBatch, Source, TXT_LIMIT, Upstream, XML_LIMIT};
+use crate::upstream::{
+    Capture, Download, RsyncBatch, Source, TXT_LIMIT, Upstream, XML_LIMIT, concurrency,
+};
+use crate::{
+    metrics::Stage,
+    parse::{Budget, BudgetExceeded, DOCUMENT_BYTES, OwnedText},
+    xml::{self, XmlReferences},
+};
 use rfc_core::{BlobDigest, RfcNumber};
 use rfc_storage::{blob::BlobReader, postgres::Result};
 use std::{io::Read, sync::Arc, time::Instant};
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::{self, JoinSet},
+};
 
 pub(crate) const DOCUMENT_SLOTS: usize = 3;
 const RAW_PER_DOCUMENT: usize = 2 * TXT_LIMIT + XML_LIMIT;
@@ -41,11 +51,17 @@ pub(crate) struct PriorTxt {
 }
 
 pub(crate) struct Prepared {
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<Vec<u8>>,
     pub digest: BlobDigest,
     pub verified: VerifiedTxt,
     pub xml: Result<Download>,
     pub queued_at: Instant,
+    pub parsed: Option<Parsed>,
+}
+
+pub(crate) struct Parsed {
+    pub txt: OwnedText,
+    pub references: Option<Result<XmlReferences>>,
 }
 
 pub(crate) enum VerifiedTxt {
@@ -63,15 +79,22 @@ pub(crate) struct Pipeline {
     tasks: JoinSet<Event>,
     upstream: Upstream,
     shutdown: Shutdown,
+    parse_slots: Arc<Semaphore>,
+    parse_bytes: usize,
 }
 
 impl Pipeline {
-    pub(crate) fn new(upstream: Upstream) -> Self {
-        Self {
+    pub(crate) fn new(upstream: Upstream) -> Result<Self> {
+        Ok(Self {
             tasks: JoinSet::new(),
-            upstream,
             shutdown: Shutdown::new(),
-        }
+            parse_slots: Arc::new(Semaphore::new(concurrency(
+                "RFC_SYNC_PARSE_CONCURRENCY",
+                1,
+            )?)),
+            parse_bytes: parse_bytes(&upstream)?,
+            upstream,
+        })
     }
 
     pub(crate) fn stage(&mut self, ids: Vec<RfcNumber>) {
@@ -91,15 +114,61 @@ impl Pipeline {
     ) {
         let upstream = self.upstream.clone();
         let shutdown = self.shutdown.clone();
-        upstream
-            .metrics()
-            .admitted(admitted, admitted * RAW_PER_DOCUMENT);
+        let metrics = upstream.metrics();
+        metrics.admitted(admitted, admitted * RAW_PER_DOCUMENT);
+        let slots = self.parse_slots.clone();
+        let parse_bytes = self.parse_bytes;
         self.tasks.spawn(async move {
-            let result = tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => Err("document verification cancelled".into()),
-                result = verify(&upstream, id, bytes, prior, &reader) => result,
-            };
+            let result = async {
+                let mut prepared = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => Err("document verification cancelled".into()),
+                    result = verify(&upstream, id, bytes, prior, &reader) => result,
+                }?;
+                if !matches!(prepared.verified, VerifiedTxt::Mismatch(_)) {
+                    let queue = metrics.span(Stage::Queue);
+                    let slot = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return Err("document parsing cancelled".into()),
+                        result = slots.acquire_owned() => result?,
+                    };
+                    drop(queue);
+                    // Keep the join handle until completion. Dropping it would
+                    // detach a running blocking parser during graceful shutdown.
+                    prepared = task::spawn_blocking(move || {
+                        let _slot = slot;
+                        let _parse = metrics.parse_start();
+                        let budget = Budget {
+                            bytes: parse_bytes,
+                            shutdown: &shutdown,
+                        };
+                        let txt = OwnedText::parse(&prepared.bytes, &budget)?;
+                        let references = if let Ok(Download::Captured(capture)) = &prepared.xml {
+                            let budget = Budget {
+                                bytes: budget.bytes - txt.data.retained_bytes,
+                                ..budget
+                            };
+                            let result = xml::references(&capture.bytes, id, &budget);
+                            budget.shutdown.check()?;
+                            if result
+                                .as_ref()
+                                .is_err_and(|error| error.is::<BudgetExceeded>())
+                            {
+                                return Err(BudgetExceeded.into());
+                            }
+                            Some(result)
+                        } else {
+                            None
+                        };
+                        prepared.parsed = Some(Parsed { txt, references });
+                        prepared.queued_at = Instant::now();
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(prepared)
+                    })
+                    .await??;
+                }
+                Ok(prepared)
+            }
+            .await;
             Event::Document(id, result.map(Box::new))
         });
     }
@@ -136,26 +205,42 @@ async fn verify(
         let Download::Captured(mut capture) = upstream.fetch(Source::Txt(id)).await? else {
             return Err("required HTTPS TXT is unavailable".into());
         };
-        if bytes != capture.bytes {
+        if bytes.as_slice() != capture.bytes.as_slice() {
             return Ok(Prepared {
-                bytes,
+                bytes: Arc::new(bytes),
                 digest,
                 verified: VerifiedTxt::Mismatch(capture),
                 xml: Ok(Download::Unavailable),
                 queued_at: Instant::now(),
+                parsed: None,
             });
         }
-        capture.bytes = Vec::new();
+        capture.bytes = Arc::default();
         VerifiedTxt::Fresh(capture)
     };
     let xml = upstream.fetch(Source::Xml(id)).await;
     Ok(Prepared {
-        bytes,
+        bytes: Arc::new(bytes),
         digest,
         verified,
         xml,
         queued_at: Instant::now(),
+        parsed: None,
     })
+}
+
+fn parse_bytes(_upstream: &Upstream) -> Result<usize> {
+    #[cfg(feature = "phase2-fixtures")]
+    if _upstream.is_fixture()
+        && let Ok(value) = std::env::var("RFC_PHASE2_PARSE_BUDGET")
+    {
+        let bytes: usize = value.parse()?;
+        if (1..=DOCUMENT_BYTES).contains(&bytes) {
+            return Ok(bytes);
+        }
+        return Err("invalid fixture parse budget".into());
+    }
+    Ok(DOCUMENT_BYTES)
 }
 
 // The staged bytes already hash to the observation's digest. Compare the entire

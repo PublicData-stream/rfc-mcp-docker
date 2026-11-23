@@ -110,6 +110,46 @@ Verified on 2026-11-23 with Rust `1.99.1` and rootless Docker `29.10.0` with Com
 
 The Phase 2 fixture reached `ready` with six verified TXT bodies and reported `contains_nul = 1` and `invalid_utf8 = 1` for two separate documents. The valid UTF-8 NUL fixture retained its exact bytes, BLAKE3 digest, LF offsets, and verified RFCXML reference. Its sealed document version had unavailable text indexes and no TXT-derived rows. The reader reconstructed both manifests and confirmed reuse of the same document version and TXT observation after a catalog metadata refresh. A mismatched rsync body containing NUL still failed and went to quarantine. The active pointer stayed unset and the outbox stayed empty. This run used synthetic NUL input in disposable Compose projects.
 
+
+### Bounded reconciliation pipeline
+
+The collector stages one rsync batch at a time and commits RFCs in ascending order. The Compose sync service has a 512 MiB scratch mount, a 2 GiB memory limit, and two CPUs. The document pipeline reserves 48 MiB of raw payload space across three slots. A shared gate enforces one second between HTTPS starts while allowing separately configured in-flight work. [Resource budgets and operator settings](ingestion.md#pipeline-and-recovery)
+
+The serial baseline is signed commit `e2e5a41`. Measurements used the pinned Rust 1.99.1 Alpine binaries, PostgreSQL 19.0, Docker Engine 29.10.0, and Compose 5.8.0 on Linux amd64. The serial and candidate fixtures used fresh databases and mirrors, the same 512 MiB scratch and 2 GiB memory limits, deterministic delayed HTTPS and rsync, and fixed source observation timestamps for exact manifest comparison. The benchmark used the rootless engine. The offline Compose qualification used the rootful engine. Temporary evidence and image receipts are under `/tmp/rfc-pipeline.SI9kWP` on the qualification host.
+
+The initial parallel probes exhausted the rootless Docker address pool. The rootful rerun used sequential Compose probes and loaded the pinned Rust image for the Phase 7 worker fixture. A cached fixture binary lacked the new metrics. Rebuilding the sync fixture variants from source resolved that mismatch. The Phase 3 waiting-reader assertion passed on rerun with a freshly rebuilt fixture. Two early large one-request trials failed on HTTPS after 56 and 59 commits during runs with slow blob installs. The candidate then moved blob fsync to a single supervised blocking task. The collector continues to fail closed on a required transfer error.
+
+#### Paced fixture benchmark
+
+Each row uses three successful cold runs. CPU is median process and child CPU time. Memory is the highest sync cgroup peak. Stage payload is the largest set of rsync TXT files before they were drained.
+
+| RFCs | Collector | Median wall (s) | Median CPU (s) | Peak memory (MiB) | Peak stage payload (MiB) | HTTPS starts per run |
+|---:|---|---:|---:|---:|---:|---:|
+| 6 | Serial | 27.334 | 0.067 | 5.28 | 0.026 | 14 |
+| 6 | Pipeline, one in flight | 21.970 | 0.072 | 5.15 | 0.026 | 14 |
+| 6 | Pipeline, two in flight | 25.661 | 0.075 | 5.18 | 0.026 | 14 |
+| 96 | Serial | 294.322 | 0.476 | 10.64 | 1.075 | 194 |
+| 96 | Pipeline, one in flight | 249.178 | 0.518 | 8.64 | 1.075 | 194 |
+| 96 | Pipeline, two in flight | 218.306 | 0.518 | 8.06 | 1.075 | 194 |
+
+For 96 RFCs, two in flight reduced median wall time by 25.83% versus serial and 12.39% versus one in flight. This met the 10% gate and set the default to two. The shortest observed interval across the paced runs was 1,000,223 µs. The 194 starts imposed a 193-second floor between first and last dispatch. All paced repetitions agreed on manifest digests and accepted bytes for their corpus size. The 96-RFC manifest was `8fd33b84ce545b3d2827c8c6a4195ee883aa028967aa62185f9e19f6249411bb`. The manifest includes canonical TXT, document/index, membership/provenance, relation/evidence, and coverage identities.
+
+In the serial 96-RFC runs, aggregate blob installation took a median 62.4 seconds, database work 18.0 seconds, rsync 0.94 seconds, and parsing 0.017 seconds. Wall time varied with host filesystem and database latency. With six RFCs, one in flight gave the lowest median. The separate unpaced six-RFC diagnostic measured 30.4 seconds for serial and 10.1 seconds for the pipeline at two in flight, one run each. All timing results are from private fixtures.
+
+#### Offline verification
+
+`cargo fetch --locked`, `scripts/phase0/check-rust.sh`, frozen all-feature Clippy and tests, and the effective Compose configuration check passed. The rebuilt default-two images passed offline Compose Phases 0, 1, 2, 3, 6, and 7. Those checks covered the pinned public MCP wire protocol and service roles, storage restore, ingestion and cancellation, publication and recovery, daemon scheduling and control, and the effective 512 MiB production sync mount. The fixture suite ran in disposable Compose projects.
+
+The Phase 2 default check observed two in-flight HTTPS requests and two out-of-order completions. The 33-RFC stress run transferred 32 maximum-size TXT files followed by a second batch. It observed one staging directory at a time, 134,217,728 bytes of staged TXT, 134,221,824 bytes of scratch use on the 144 MiB fixture mount, 150,810,624 bytes of peak cgroup memory, and two active parsers at the configured limit. The fixture also exercised a full scratch mount, parse budget exhaustion, SIGTERM during rsync, an injected membership transaction failure, and successful recovery and retry. NUL and invalid UTF-8 originals, byte offsets, and provenance were checked in the regular Phase 2 run.
+
+| Rebuilt image | Local image ID |
+|---|---|
+| Sync | `sha256:27c22b6ed9bcc60650fd663af830bc9fb3c2a6dbe4ec07009e5e21ff485f6e2e` |
+| Ingestion fixture | `sha256:3b1b03642708d3d40893b875ca7e9772e23c0b43b382a38f943d6bcd36132c56` |
+| Publication fixture | `sha256:f44d9a37033870425c6c01aa6d9f896a039b1cac2b496f0347ca3ff848bc3a0a` |
+| Daemon fixture | `sha256:da2296e295dbb281db047139d1dfd8281ec4becd274647b4db0454f55e03a8f2` |
+
+
 ## Phase 3
 
 **Verified locally on rootless Linux amd64 on 2026-11-22.** The runtime changes are in `bde10fc` and `8204309`. Tests used kernel `7.0.0-44-generic`, Docker Engine `29.10.0`, Compose `v5.8.0`, Rust `1.99.1`, and the PostgreSQL 19.0 Alpine image pinned in Phase 0. Cargo output used `/tmp/rust/target`. The Compose projects kept test data, credentials, and volume backing directories under `/tmp`. [Operator commands, lock ordering, and backup procedure](publication.md)

@@ -36,15 +36,19 @@ class Project(phase1.Project):
         insertion = len(self.docker) + 3
         return [*command[:insertion], "-f", str(self.overlay), *command[insertion:]]
 
-    def reconcile_command(self, live, scope, settings=()):
+    def reconcile_command(self, live, scope, settings=(), *, options=(), prelude=None):
         if live:
             return self.app("sync", args=("--phase2-reconcile", f"--{scope}"))
-        options = [part for setting in settings for part in ("-e", setting)]
-        return self.app("sync", *options, "--entrypoint", "/phase2/fixture-driver", args=(scope,))
+        overrides = [part for setting in settings for part in ("-e", setting)]
+        if prelude is not None:
+            return self.app("sync", *options, *overrides, "--entrypoint", "/bin/sh",
+                            args=("-c", prelude))
+        return self.app("sync", *options, *overrides, "--entrypoint", "/phase2/fixture-driver", args=(scope,))
 
-    def reconcile(self, scope="full", expected=None, live=False, settings=(), timeout=180):
-        result = subprocess.run(self.reconcile_command(live, scope, settings), env=self.env,
-                                text=True, capture_output=True, timeout=timeout)
+    def reconcile(self, scope="full", expected=None, live=False, settings=(), timeout=180, prelude=None):
+        command = (self.reconcile_command(live, scope, settings, prelude=prelude)
+                   if settings or prelude is not None else self.reconcile_command(live, scope))
+        result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=timeout)
         if not result.stdout.strip():
             raise AssertionError(f"no ingestion report: {result.stderr}")
         report = json.loads(result.stdout.strip().splitlines()[-1])
@@ -277,7 +281,12 @@ def exercise(project):
     project.check("sync")
     project.check("serve")
     project.run("up", "-d", "--wait", "fixtures", timeout=35)
-    first = project.reconcile()
+    mode = project.source / "mode"
+    mode.write_text("overlap")
+    first = project.reconcile(settings=("RFC_PHASE2_PACED=1",))
+    assert_pipeline_bounds(first, http_limit=2, paced=True)
+    assert first["metrics"]["https_peak"] == 2 and first["metrics"]["out_of_order"] > 0
+    mode.write_text("normal")
     assert first["verified_txt"] == len(sources) and first["reused_txt"] == 0
     assert first["invalid_utf8"] == first["contains_nul"] == 1
     verify_ranges(project, first, sources)
@@ -286,6 +295,7 @@ def exercise(project):
     catalog.write_text(catalog.read_text().replace("Synthetic XML classification", "Updated catalog metadata"))
     second = project.reconcile()
     assert second["reused_txt"] == len(sources)
+    assert second["metrics"]["https_requests"] == len(sources) + 2
     assert second["invalid_utf8"] == second["contains_nul"] == 1
     assert project.sql("SELECT count(*) FROM rfc.document_versions") == str(len(sources))
     assert project.sql(
@@ -311,7 +321,6 @@ def exercise(project):
     project.reconcile(expected="catalog lost previously accepted RFC 101")
     catalog.write_text(unchanged_catalog)
 
-    mode = project.source / "mode"
     for scenario, expected in [
         ("catalog-compressed", "content encoding"),
         ("catalog-oversize", "byte limit"),
@@ -337,11 +346,15 @@ def exercise(project):
     project.reconcile(expected="missing expected TXT")
     original.unlink()
     original.write_bytes(b"Different same-ID candidate.\x00\n")
-    project.reconcile(expected="rsync and HTTPS TXT disagree")
-    quarantine = project.app("sync", "--entrypoint", "/bin/sh", args=(
-        "-ec", "test \"$(find /mirror/quarantine -name https-body | wc -l)\" -eq 1"
-    ))
-    run(quarantine, env=project.env)
+    mismatch = project.reconcile(expected="rsync and HTTPS TXT disagree")
+    assert mismatch["metrics"]["received_bytes"] > 0
+    for filename, expected in (("body", original.read_bytes()), ("https-body", sources[100])):
+        quarantine = project.app("sync", "-T", "--entrypoint", "/bin/sh", args=(
+            "-ec", 'find /mirror/quarantine -type f -name "$1" -exec cat {} +', "sh", filename,
+        ))
+        captured = subprocess.run(quarantine, env=project.env, check=True,
+                                  stdout=subprocess.PIPE, timeout=30).stdout
+        assert captured == expected
     original.write_bytes(sources[100])
 
     locks = project.psql(phase1.SYNC)
@@ -363,7 +376,151 @@ def exercise(project):
     project.denied_sql("DELETE FROM rfc.document_lexemes", phase1.SERVE)
     project.denied_sql("UPDATE rfc.active_generation SET generation_id=NULL", phase1.SYNC)
     phase1.exercise_isolation(project)
+    exercise_cancellation(project)
+    exercise_transaction_failure(project)
+
+    changed = sources[100] + b"\nCorrected original.\n"
+    original.write_bytes(changed)
+    (project.source / "https/rfc100.txt").write_bytes(changed)
+    refreshed = project.reconcile()
+    assert refreshed["reused_txt"] == 5 and refreshed["metrics"]["txt"]["calls"] == 1
+    project.verify_manifest(refreshed)
+    assert project.sql("""SELECT count(DISTINCT txt_observation) FROM rfc.generation_documents
+                          WHERE rfc_id=100""") == "2"
     print("Phase 2 fixture candidate, byte indexes, provenance, failure fences and role boundaries passed", flush=True)
+
+
+def assert_pipeline_bounds(report, *, http_limit, paced=False):
+    metrics = report["metrics"]
+    assert 1 <= metrics["https_peak"] <= http_limit, metrics
+    assert 1 <= metrics["parse_peak"] <= 2, metrics
+    assert 1 <= metrics["admitted_peak"] <= 3, metrics
+    assert metrics["raw_reserved_peak"] == metrics["admitted_peak"] * 16 * 1024**2, metrics
+    assert metrics["staged_peak"] == 1 and metrics["rsync_peak_bytes"] <= 128 * 1024**2, metrics
+    if paced:
+        assert metrics["minimum_start_spacing_us"] >= 1_000_000, metrics
+
+
+def exercise_cancellation(project):
+    mode = project.source / "mode"
+    mode.write_text("hold-rsync")
+    name = f"{project.name}-cancel"
+    script = """
+/phase2/fixture-driver full &
+child=$!
+trap 'kill -TERM "$child"' TERM
+wait "$child"
+status=$?
+if [ "$status" -gt 128 ]; then wait "$child"; status=$?; fi
+test "$status" -eq 1 || exit 2
+test -z "$(find /tmp -name 'rfc-rsync-*')" || exit 3
+if pidof rsync >/dev/null; then exit 4; fi
+printf 'cancelled and reaped\n'
+"""
+    command = project.reconcile_command(False, "full", options=("--name", name), prelude=script)
+    with subprocess.Popen(command, env=project.env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as collector:
+        try:
+            until = time.monotonic() + 12
+            while time.monotonic() < until:
+                result = subprocess.run([*project.docker, "exec", name, "pidof", "rsync"],
+                                        capture_output=True, timeout=3)
+                if result.returncode == 0:
+                    break
+                assert collector.poll() is None
+                time.sleep(0.1)
+            else:
+                raise AssertionError("rsync did not reach the cancellation boundary")
+            run([*project.docker, "kill", "--signal", "TERM", name], stdout=subprocess.DEVNULL)
+            stdout, stderr = collector.communicate(timeout=15)
+            assert collector.returncode == 0 and "cancelled and reaped" in stdout, (stdout, stderr)
+            assert "reconciliation cancelled" in stdout
+        finally:
+            subprocess.run([*project.docker, "rm", "-f", name], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+            mode.write_text("normal")
+    assert project.sql("SELECT state FROM rfc.generations ORDER BY id DESC LIMIT 1") == "failed"
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
+
+
+def exercise_transaction_failure(project):
+    project.sql("""CREATE FUNCTION rfc.fixture_fail_member() RETURNS trigger LANGUAGE plpgsql
+        AS $$ BEGIN RAISE EXCEPTION 'fixture member transaction failure'; END $$;
+        REVOKE EXECUTE ON FUNCTION rfc.fixture_fail_member() FROM PUBLIC;
+        CREATE TRIGGER fixture_fail_member BEFORE INSERT ON rfc.generation_documents
+        FOR EACH ROW WHEN (NEW.rfc_id = 101) EXECUTE FUNCTION rfc.fixture_fail_member()""")
+    try:
+        failure = project.reconcile(expected="db error")
+        generation = int(failure["generation_id"])
+        assert project.sql(f"SELECT string_agg(rfc_id::text,',' ORDER BY rfc_id)"
+                           f" FROM rfc.generation_documents WHERE generation_id={generation}") == "100"
+    finally:
+        project.sql("""DROP TRIGGER fixture_fail_member ON rfc.generation_documents;
+                       DROP FUNCTION rfc.fixture_fail_member()""")
+    retry = project.reconcile()
+    assert retry["verified_txt"] == retry["reused_txt"] == 6
+    project.verify_manifest(retry)
+    assert project.sql("SELECT count(*) FROM rfc.generations WHERE state='building'") == "0"
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
+    assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "0"
+
+
+def exercise_resources(project):
+    project.env["PHASE2_TMPFS"] = "144m"
+    prepare(project, include_nul=True)
+    source = project.source
+    entries = []
+    for rfc in range(100, 133):
+        entries.append(catalog_entry(rfc, f"Capacity {rfc}"))
+        for directory in ("rsync", "https"):
+            with (source / directory / f"rfc{rfc}.txt").open("wb") as file:
+                file.write(f"RFC {rfc}\n".encode() + b"\0")
+                if rfc < 132:
+                    file.truncate(4 * 1024**2)
+    (source / "catalog.xml").write_text(
+        '<rfc-index xmlns="https://www.rfc-editor.org/rfc-index">' + "".join(entries) + "</rfc-index>"
+    )
+    project.start()
+    project.migrate()
+    project.run("up", "-d", "--wait", "fixtures", timeout=35)
+    result = project.reconcile(settings=("RFC_SYNC_HTTP_CONCURRENCY=2", "RFC_SYNC_PARSE_CONCURRENCY=2"))
+    assert result["verified_txt"] == result["contains_nul"] == 33
+    assert result["metrics"]["rsync"]["calls"] == 2
+    assert_pipeline_bounds(result, http_limit=2)
+    metrics = result["metrics"]
+    assert metrics["rsync_peak_bytes"] == 128 * 1024**2, metrics
+    assert 128 * 1024**2 <= metrics["scratch_peak_bytes"] < 144 * 1024**2, metrics
+    assert 0 < metrics["memory_peak"] < 1536 * 1024**2, metrics
+    project.verify_manifest(result)
+
+    project.reconcile(expected="rsync", prelude=
+                      "dd if=/dev/zero of=/tmp/occupied bs=1M count=140 2>/dev/null || exit; "
+                      "exec /phase2/fixture-driver full")
+    project.reconcile(expected="parse budget exceeded", settings=("RFC_PHASE2_PARSE_BUDGET=512",))
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
+
+
+def exercise_timeout(project):
+    prepare(project, include_nul=True)
+    project.start()
+    project.migrate()
+    project.run("up", "-d", "--wait", "fixtures", timeout=35)
+    mode = project.source / "mode"
+    for scenario, expected in (
+        ("txt-html", "txt unexpected HTTPS media type"),
+        ("txt-compressed", "unsupported HTTPS content encoding"),
+        ("txt-redirect", "txt unexpected HTTPS status 302"),
+    ):
+        mode.write_text(scenario)
+        project.reconcile(expected=expected)
+    mode.write_text("slow-txt")
+    project.reconcile(expected="txt HTTPS transport", settings=("RFC_PHASE2_HTTP_TIMEOUT_MS=500",))
+    mode.write_text("normal")
+    result = project.reconcile()
+    assert result["verified_txt"] == 6 and result["reused_txt"] == 0
+    project.verify_manifest(result)
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
+
 
 
 def fixture_driver(docker, prefix, target):
@@ -419,6 +576,14 @@ def benchmark(args, docker, work, driver):
                "configured_https_concurrency": args.http_concurrency, "runs": runs,
                "median_wall_us": {size: median(run["metrics"]["wall_us"] for run in runs if run["size"] == size)
                                   for size in args.benchmark}}
+    if args.reference_receipt:
+        reference = json.loads(args.reference_receipt.read_text())
+        expected = {(item["size"], item["repeat"]): item for item in reference["runs"]}
+        for item in runs:
+            original = expected[item["size"], item["repeat"]]
+            for key in ("manifest_digest", "catalog_digest", "verified_txt", "accepted_bytes"):
+                assert item[key] == original[key], (key, item, original)
+            assert item["metrics"]["https_requests"] == original["metrics"]["https_requests"]
     if args.receipt:
         args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt, sort_keys=True), flush=True)
@@ -437,6 +602,7 @@ def main():
     parser.add_argument("--http-concurrency", type=int, choices=(1, 2), default=1)
     parser.add_argument("--unpaced", action="store_true")
     parser.add_argument("--receipt", type=Path)
+    parser.add_argument("--reference-receipt", type=Path)
     args = parser.parse_args()
     if args.live and args.benchmark:
         parser.error("the benchmark requires private fixtures")
@@ -480,6 +646,14 @@ def main():
                 exercise(project)
         finally:
             project.close()
+        if args.live:
+            return 0
+        for name, exercise_case in (("resources", exercise_resources), ("timeout", exercise_timeout)):
+            with ExitStack() as cleanup:
+                case = Project(work / f"{work.name}-{name}", driver, args.image_prefix, docker, False)
+                cleanup.callback(case.close)
+                exercise_case(case)
+
     return 0
 
 

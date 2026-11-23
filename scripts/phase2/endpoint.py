@@ -28,10 +28,17 @@ class Https(BaseHTTPRequestHandler):
         self.send_header("ETag", '"fixture"')
         self.send_header("Last-Modified", "Sun, 22 Nov 2026 00:00:00 GMT")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+            pass
 
     def do_GET(self):
         scenario = mode()
+        if scenario == "overlap" and self.path == "/rfc/rfc100.txt":
+            time.sleep(2.35)
+        if scenario == "slow-txt" and self.path == "/rfc/rfc100.txt":
+            time.sleep(2.0)
         if scenario == "benchmark":
             # Alternate long and short responses so ordering and overlap matter.
             longer = self.path.endswith((".xml", "0.txt", "2.txt", "4.txt", "6.txt", "8.txt"))
@@ -78,6 +85,21 @@ class Https(BaseHTTPRequestHandler):
         if not self.path.startswith("/rfc/") or "/" in self.path[5:]:
             self.send_error(404)
             return
+        if self.path == "/rfc/rfc100.txt":
+            if scenario == "txt-html":
+                self.response(b"<html>Not an RFC</html>", "text/html")
+                return
+            if scenario in {"txt-compressed", "txt-redirect"}:
+                redirect = scenario == "txt-redirect"
+                self.send_response(302 if redirect else 200)
+                if redirect:
+                    self.send_header("Location", "https://invalid.example/rfc100.txt")
+                else:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
         file = ROOT / "https" / self.path[5:]
         if not file.is_file():
             self.send_error(404)
@@ -90,7 +112,10 @@ class Https(BaseHTTPRequestHandler):
 
 class Rsync(socketserver.BaseRequestHandler):
     def handle(self):
-        if mode() == "benchmark":
+        scenario = mode()
+        if scenario == "hold-rsync":
+            time.sleep(15)
+        if scenario == "benchmark":
             time.sleep(0.20)
         with socket.create_connection(("127.0.0.1", 9873), 3) as upstream:
             upstream.settimeout(10)

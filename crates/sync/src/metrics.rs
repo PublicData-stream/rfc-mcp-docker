@@ -45,6 +45,8 @@ pub(crate) struct Record {
     pub https_peak: u64,
     pub minimum_start_spacing_us: Option<u64>,
     pub rsync_peak_bytes: u64,
+    pub scratch_peak_bytes: Option<u64>,
+    pub out_of_order: u64,
     pub admitted_peak: u64,
     pub raw_reserved_peak: u64,
     pub parse_peak: u64,
@@ -52,6 +54,10 @@ pub(crate) struct Record {
     pub retries: u64,
     #[serde(skip)]
     active: u64,
+    #[serde(skip)]
+    parsing: u64,
+    #[serde(skip)]
+    staging: u64,
     #[serde(skip)]
     last_start: Option<Instant>,
 }
@@ -63,6 +69,7 @@ impl Metrics {
             stage,
             start: Instant::now(),
             http: false,
+            parser: false,
         }
     }
 
@@ -84,14 +91,34 @@ impl Metrics {
         span
     }
 
+    pub(crate) fn parse_start(&self) -> Span {
+        let mut span = self.span(Stage::Parse);
+        span.parser = true;
+        let mut record = self.0.lock().unwrap();
+        record.parsing += 1;
+        record.parse_peak = record.parse_peak.max(record.parsing);
+        span
+    }
+
     pub(crate) fn received(&self, bytes: usize) {
         self.0.lock().unwrap().received_bytes += bytes as u64;
     }
 
-    pub(crate) fn staged(&self, bytes: u64) {
+    pub(crate) fn stage_start(&self) -> StageLease {
+        let mut record = self.0.lock().unwrap();
+        record.staging += 1;
+        record.staged_peak = record.staged_peak.max(record.staging);
+        StageLease(self.clone())
+    }
+
+    pub(crate) fn staged(&self, bytes: u64, scratch: Option<u64>) {
         let mut record = self.0.lock().unwrap();
         record.rsync_peak_bytes = record.rsync_peak_bytes.max(bytes);
-        record.staged_peak = 1;
+        record.scratch_peak_bytes = record.scratch_peak_bytes.max(scratch);
+    }
+
+    pub(crate) fn out_of_order(&self) {
+        self.0.lock().unwrap().out_of_order += 1;
     }
 
     pub(crate) fn admitted(&self, entries: usize, raw_bytes: usize) {
@@ -119,11 +146,20 @@ impl Metrics {
     }
 }
 
+pub(crate) struct StageLease(Metrics);
+
+impl Drop for StageLease {
+    fn drop(&mut self) {
+        self.0.0.lock().unwrap().staging -= 1;
+    }
+}
+
 pub(crate) struct Span {
     metrics: Metrics,
     stage: Stage,
     start: Instant,
     http: bool,
+    parser: bool,
 }
 
 impl Drop for Span {
@@ -131,6 +167,9 @@ impl Drop for Span {
         let mut record = self.metrics.0.lock().unwrap();
         if self.http {
             record.active -= 1;
+        }
+        if self.parser {
+            record.parsing -= 1;
         }
         let timing = match self.stage {
             Stage::Catalog => &mut record.catalog,
