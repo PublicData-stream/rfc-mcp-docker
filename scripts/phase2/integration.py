@@ -18,6 +18,7 @@ SPEC = importlib.util.spec_from_file_location("phase1", HERE.parent / "phase1" /
 phase1 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(phase1)
 run = phase1.run
+NUL_RFC = 102
 
 
 class Project(phase1.Project):
@@ -68,7 +69,7 @@ def catalog_entry(rfc, title, tags="", file_format="TXT", day=""):
             f"{tags}<current-status>INFORMATIONAL</current-status><stream>IRTF</stream></rfc-entry>")
 
 
-def prepare(project):
+def prepare(project, *, include_nul=False):
     source = project.source
     source.mkdir()
     for name in ("https", "rsync"):
@@ -90,6 +91,10 @@ def prepare(project):
         8174: (REPO / "fixtures/rfc/rfc8174.txt").read_bytes(),
         9110: b"1. An RFCXML classification fixture\n\n   Text.\n",
     }
+    if include_nul:
+        sources[NUL_RFC] = (b"1. Introduction\r\n\r\n   caf\xc3\xa9\x00text.\n\n"
+                            b"2. Copyright Notice\n\n   Copyright example.\n\n"
+                            b"3. References\n\n   [RFC100] Example\n")
     for rfc, payload in sources.items():
         for directory in ("https", "rsync"):
             (source / directory / f"rfc{rfc}.txt").write_bytes(payload)
@@ -113,6 +118,12 @@ def prepare(project):
         catalog_entry(9110, "Synthetic XML classification"),
         "<rfc-not-issued-entry><doc-id>RFC104</doc-id></rfc-not-issued-entry>",
     ]
+    if include_nul:
+        entries.append(catalog_entry(NUL_RFC, "NUL bytes with RFCXML"))
+        (source / f"https/rfc{NUL_RFC}.xml").write_bytes(
+            b'<rfc number="102"><back><references><name>Normative References</name>'
+            b'<reference><seriesInfo name="RFC" value="2119"/></reference></references></back></rfc>'
+        )
     (source / "catalog.xml").write_text(
         '<rfc-index xmlns="https://www.rfc-editor.org/rfc-index">' + "".join(entries) + "</rfc-index>"
     )
@@ -151,9 +162,10 @@ def verify_ranges(project, report, sources):
     assert [doc[0] for doc in docs] == sorted(sources)
     for rfc, digest, line_starts, encoding, policy in docs:
         raw = sources[rfc]
+        bytes_mode = rfc in {101, NUL_RFC}
         assert (project.directory / "mirror/blobs/blake3" / digest[:2] / digest).read_bytes() == raw
         assert line_starts == [0, *(i + 1 for i, byte in enumerate(raw[:-1]) if byte == 10)]
-        assert encoding == ("bytes" if rfc == 101 else "utf8")
+        assert encoding == ("bytes" if bytes_mode else "utf8")
         assert policy == ("whole_only" if rfc in {2119, 8174} else "metadata_only")
         version = (f"(SELECT document_version FROM rfc.generation_documents WHERE generation_id={generation}"
                    f" AND rfc_id={rfc})")
@@ -188,7 +200,14 @@ def verify_ranges(project, report, sources):
             if rfc == 100:
                 assert b"boundarytoken" not in bytes.fromhex(hex_text)
             recovered.extend(bytes.fromhex(hex_text))
-        assert bytes(recovered) == (b"" if rfc == 101 else raw)
+        assert bytes(recovered) == (b"" if bytes_mode else raw)
+        if bytes_mode:
+            assert not sections and not ranges and not chunks
+            assert project.sql(
+                f"SELECT count(*) FROM rfc.document_lexemes WHERE document_version={version}", phase1.SERVE,
+            ) == "0"
+        if rfc == NUL_RFC:
+            verify_nul_document(project, generation, version, digest, raw)
         if rfc == 100:
             assert b"boundarytoken" in recovered
             assert project.sql(
@@ -224,8 +243,32 @@ def verify_ranges(project, report, sources):
     ) == "partial"
 
 
+def verify_nul_document(project, generation, version, digest, raw):
+    assert raw.decode("utf-8").count("\x00") == 1
+    assert project.sql(
+        "SELECT byte_length,sealed,indexing_state,section_state,notice_state"
+        f" FROM rfc.document_versions WHERE identity={version}", phase1.SERVE,
+    ) == f"{len(raw)}|t|unavailable|unavailable|unavailable"
+    command = project.app("serve", "-T", "--entrypoint", "/phase2/fixture-driver",
+                          args=("read-blob", digest, str(len(raw))))
+    result = subprocess.run(command, env=project.env, capture_output=True, check=True, timeout=30)
+    assert result.stdout == raw
+    assert project.sql(
+        "SELECT g.title,t.https_verification,t.raw_digest=d.txt_digest,x.kind,x.https_verification"
+        " FROM rfc.generation_documents g JOIN rfc.document_versions d ON d.identity=g.document_version"
+        " JOIN rfc.source_observations t ON t.identity=g.txt_observation"
+        " JOIN rfc.source_observations x ON x.identity=g.rfcxml_observation"
+        f" WHERE g.generation_id={generation} AND g.rfc_id={NUL_RFC}", phase1.SERVE,
+    ) == "NUL bytes with RFCXML|verified|t|rfcxml|verified"
+    assert project.sql(
+        "SELECT r.method FROM rfc.edge_evidence e JOIN rfc.relation_evidence r ON r.identity=e.evidence"
+        f" WHERE e.generation_id={generation} AND e.source_rfc={NUL_RFC}"
+        " AND e.kind='normative_reference' AND e.target_rfc=2119", phase1.SERVE,
+    ) == "rfcxml"
+
+
 def exercise(project):
-    sources = prepare(project)
+    sources = prepare(project, include_nul=True)
     project.start()
     migrate_v1_then_v2(project)
     project.check("sync")
@@ -233,13 +276,24 @@ def exercise(project):
     project.run("up", "-d", "--wait", "fixtures", timeout=35)
     first = project.reconcile()
     assert first["verified_txt"] == len(sources) and first["reused_txt"] == 0
+    assert first["invalid_utf8"] == first["contains_nul"] == 1
     verify_ranges(project, first, sources)
     project.verify_manifest(first)
     catalog = project.source / "catalog.xml"
     catalog.write_text(catalog.read_text().replace("Synthetic XML classification", "Updated catalog metadata"))
     second = project.reconcile()
     assert second["reused_txt"] == len(sources)
+    assert second["invalid_utf8"] == second["contains_nul"] == 1
     assert project.sql("SELECT count(*) FROM rfc.document_versions") == str(len(sources))
+    assert project.sql(
+        "SELECT count(*),count(DISTINCT document_version),count(DISTINCT txt_observation)"
+        f" FROM rfc.generation_documents WHERE rfc_id={NUL_RFC}"
+        f" AND generation_id IN ({int(first['generation_id'])},{int(second['generation_id'])})",
+    ) == "2|1|1"
+    assert project.sql(
+        "SELECT count(*) FROM rfc.source_observations WHERE kind='txt'"
+        f" AND source_url='https://www.rfc-editor.org/rfc/rfc{NUL_RFC}.txt'",
+    ) == "1"
     assert project.sql(
         f"SELECT title FROM rfc.generation_documents WHERE generation_id={int(second['generation_id'])} AND rfc_id=9110"
     ) == "Updated catalog metadata"
@@ -279,7 +333,7 @@ def exercise(project):
     original.symlink_to("../https/rfc100.txt")
     project.reconcile(expected="missing expected TXT")
     original.unlink()
-    original.write_bytes(b"Different same-ID candidate.\n")
+    original.write_bytes(b"Different same-ID candidate.\x00\n")
     project.reconcile(expected="rsync and HTTPS TXT disagree")
     quarantine = project.app("sync", "--entrypoint", "/bin/sh", args=(
         "-ec", "test \"$(find /mirror/quarantine -name https-body | wc -l)\" -eq 1"

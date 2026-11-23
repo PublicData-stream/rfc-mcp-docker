@@ -104,6 +104,12 @@ The Phase 1 gate covers the local rootless amd64 fixture profile and process int
 
 The live sample is the extent of upstream verification. Full live reconciliation, publication, and production-scale capacity remain later verification work.
 
+### NUL-containing TXT regression
+
+Verified on 2026-11-23 with Rust `1.99.1` and rootless Docker `29.10.0` with Compose `v5.8.0` on Linux amd64. `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, and frozen workspace Clippy with all targets and features passed. The Phase 0, 1, and 2 offline Compose probes passed against the rebuilt `rfc-nul-regression` app images. Phase 0 exercised the MCP wire, PostgreSQL, and service isolation. Phase 1 verified original bytes, ranges, and manifests after restoring into a fresh PostgreSQL and mirror project.
+
+The Phase 2 fixture reached `ready` with six verified TXT bodies and reported `contains_nul = 1` and `invalid_utf8 = 1` for two separate documents. The valid UTF-8 NUL fixture retained its exact bytes, BLAKE3 digest, LF offsets, and verified RFCXML reference. Its sealed document version had unavailable text indexes and no TXT-derived rows. The reader reconstructed both manifests and confirmed reuse of the same document version and TXT observation after a catalog metadata refresh. A mismatched rsync body containing NUL still failed and went to quarantine. The active pointer stayed unset and the outbox stayed empty. This run used synthetic NUL input in disposable Compose projects.
+
 ## Phase 3
 
 **Verified locally on rootless Linux amd64 on 2026-11-22.** The runtime changes are in `bde10fc` and `8204309`. Tests used kernel `7.0.0-44-generic`, Docker Engine `29.10.0`, Compose `v5.8.0`, Rust `1.99.1`, and the PostgreSQL 19.0 Alpine image pinned in Phase 0. Cargo output used `/tmp/rust/target`. The Compose projects kept test data, credentials, and volume backing directories under `/tmp`. [Operator commands, lock ordering, and backup procedure](publication.md)

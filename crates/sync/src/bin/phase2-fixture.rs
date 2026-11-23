@@ -1,8 +1,12 @@
 //! Exercises the production ingestion pipeline against only the private fixture endpoints.
 
-use rfc_core::GenerationId;
+use rfc_core::{BlobDigest, ByteRange, GenerationId};
 use rfc_mcp_docker_sync::{Scope, reconcile_fixture};
-use rfc_storage::postgres::{Reader, Result};
+use rfc_storage::{
+    blob::BlobReader,
+    postgres::{Reader, Result, mirror_root},
+};
+use std::io::{self, Write};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -15,7 +19,17 @@ async fn main() -> Result<()> {
             let digest = Reader::connect().await?.verify_manifest(id).await?;
             println!("verified {} {digest}", id.get());
         }
-        _ => return Err("usage: full | sample | verify GENERATION".into()),
+        [command, digest, length] if command == "read-blob" => {
+            let digest = BlobDigest::from_hex(digest).ok_or("invalid blob digest")?;
+            let range = ByteRange::new(0, length.parse()?).ok_or("invalid blob range")?;
+            let bytes =
+                BlobReader::open(&mirror_root(), true)?.read_range(digest, range, 64 * 1024)?;
+            if BlobDigest::hash(&bytes) != digest {
+                return Err("canonical blob differs from its digest".into());
+            }
+            io::stdout().lock().write_all(&bytes)?;
+        }
+        _ => return Err("usage: full | sample | verify ID | read-blob DIGEST LENGTH".into()),
     }
     Ok(())
 }
