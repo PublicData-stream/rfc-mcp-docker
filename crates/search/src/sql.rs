@@ -380,6 +380,35 @@ mod tests {
     }
 
     #[test]
+    fn seeded_queries_keep_values_in_bound_parameters() {
+        let mut seed = 20260728_u32;
+        for index in 0..512 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let id = (seed % 2_000_000_000 + 1) as i32;
+            let literal = format!("fixture-{seed:x} É %_ '");
+            let field = ["title", "fulltext"][index % 2];
+            let operator = ["AND", "OR"][(index / 2) % 2];
+            let negation = ["", "!"][(index / 4) % 2];
+            let query = format!(
+                "{negation}(in::{field}:\"{literal}\" {operator} relation::references:{id})"
+            );
+            let plan = Plan::new(parse(&query).unwrap());
+            let evaluation = plan.compile();
+            assert!(!evaluation.sql.contains(&literal));
+            match evaluation.params.as_slice() {
+                [Parameter::Literal(value), Parameter::Rfc(number)] if field == "title" => {
+                    assert_eq!((value, *number), (&literal, id));
+                }
+                [Parameter::Rfc(number)] if field == "fulltext" => {
+                    assert_eq!(*number, id);
+                    assert_eq!(plan.exact, [0]);
+                }
+                _ => panic!("unexpected parameter layout for {query}"),
+            }
+        }
+    }
+
+    #[test]
     fn fingerprint_normalizes_syntax_but_binds_arguments() {
         let plan = |query| Plan::new(parse(query).unwrap());
         let first = plan("depend::id:01");

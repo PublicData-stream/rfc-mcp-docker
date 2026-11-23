@@ -5,11 +5,14 @@ use rfc_mcp_docker_sync::{
     Maintenance, Scope, maintain, promote, reconcile_fixture, reconcile_fixture_with_reviews,
 };
 use rfc_storage::{
-    blob::BlobWriter,
+    blob::{BlobReader, BlobWriter},
     fixture_boundary,
-    postgres::{GenerationSelection, Reader, Result, mirror_root, verify_stored_manifest},
+    postgres::{
+        GenerationSelection, Reader, Result, RuntimeRole, connect, mirror_root,
+        verify_stored_manifest,
+    },
 };
-use std::{io::Read, process::Stdio, time::Duration};
+use std::{collections::BTreeMap, io::Read, process::Stdio, time::Duration};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -57,8 +60,100 @@ async fn main() -> Result<()> {
         [action, id] if action == "restore-fence" => {
             BlobWriter::open(&mirror_root())?.prepare_generation_fence(generation(id)?)?;
         }
+        [action] if action == "verify-restore" => verify_restore().await?,
         _ => return Err("unknown publication fixture command".into()),
     }
+    Ok(())
+}
+
+// The caller keeps writers stopped for the entire verification.
+async fn verify_restore() -> Result<()> {
+    const CAP: usize = 64 * 1024 * 1024;
+    let db = connect(RuntimeRole::Serve).await?;
+    let store = BlobReader::open(&mirror_root(), true)?;
+    let mut inventory = BTreeMap::new();
+    for row in db
+        .query(
+            "SELECT digest::bytea, byte_length::bigint FROM rfc.blobs",
+            &[],
+        )
+        .await?
+    {
+        let digest = BlobDigest::from_bytes(row.try_get::<_, &[u8]>(0)?.try_into()?);
+        let length: i64 = row.try_get(1)?;
+        let bytes = store.read_range(
+            digest,
+            ByteRange::new(0, length).ok_or("invalid length")?,
+            CAP,
+        )?;
+        assert_eq!(
+            store.open_blob(digest)?.metadata()?.len(),
+            u64::try_from(length)?
+        );
+        assert_eq!(BlobDigest::hash(&bytes), digest, "restored blob {digest}");
+        inventory.insert(digest.to_string(), bytes);
+    }
+    let mut manifests = BTreeMap::new();
+    for row in db
+        .query(
+            "SELECT id FROM rfc.generations WHERE state IN ('ready','published','retained')",
+            &[],
+        )
+        .await?
+    {
+        let id = row.try_get::<_, i64>(0)?.to_string();
+        manifests.insert(
+            id.clone(),
+            verify_stored_manifest(&db, generation(&id)?)
+                .await?
+                .to_string(),
+        );
+    }
+    let mut ranges = 0;
+    for row in db.query(
+        "SELECT encode(d.txt_digest,'hex'), r.first::bigint, r.last::bigint
+         FROM rfc.document_versions d JOIN (
+            SELECT document_version, start_byte AS first, end_byte AS last FROM rfc.sections
+            UNION ALL SELECT document_version, heading_start_byte, heading_end_byte FROM rfc.sections
+            UNION ALL SELECT document_version, start_byte, end_byte FROM rfc.text_chunks
+            UNION ALL SELECT document_version, start_byte, end_byte FROM rfc.notice_ranges
+            UNION ALL SELECT document_version, start_byte, end_byte FROM rfc.relation_evidence
+                WHERE start_byte IS NOT NULL
+         ) r ON r.document_version = d.identity", &[],
+    ).await? {
+        let hex: String = row.try_get(0)?;
+        let digest = BlobDigest::from_hex(&hex).ok_or("invalid original digest")?;
+        let range = ByteRange::new(row.try_get(1)?, row.try_get(2)?).ok_or("invalid byte range")?;
+        let expected = range.select(&inventory[&hex]).ok_or("range outside restored original")?;
+        assert_eq!(store.read_range(digest, range, CAP)?, expected);
+        ranges += 1;
+    }
+    for row in db
+        .query(
+            "SELECT encode(txt_digest,'hex'), line_starts FROM rfc.document_versions
+             WHERE line_starts IS NOT NULL",
+            &[],
+        )
+        .await?
+    {
+        let hex: String = row.try_get(0)?;
+        let actual: Vec<i64> = row.try_get(1)?;
+        let bytes = &inventory[&hex];
+        let mut expected = vec![0];
+        for (index, &byte) in bytes.iter().enumerate().take(bytes.len().saturating_sub(1)) {
+            if byte == b'\n' {
+                expected.push(i64::try_from(index + 1)?);
+            }
+        }
+        assert_eq!(actual, expected);
+        ranges += actual.len();
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "blobs": inventory.len(), "ranges": ranges, "manifests": manifests,
+        })
+    );
     Ok(())
 }
 

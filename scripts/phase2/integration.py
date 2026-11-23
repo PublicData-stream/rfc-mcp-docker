@@ -347,6 +347,20 @@ def main():
                     return 1
                 assert report["verified_txt"] == 3
                 assert re.fullmatch("[0-9a-f]{64}", report["manifest_digest"])
+                observations = json.loads(project.sql("""
+                    SELECT json_agg(json_build_object(
+                        'rfc', d.rfc_id, 'url', o.source_url, 'fetched_at', o.fetched_at,
+                        'digest', encode(o.raw_digest,'hex'), 'length', v.byte_length,
+                        'notice_policy', v.notice_policy, 'section_state', v.section_state,
+                        'https_verification', o.https_verification
+                    ) ORDER BY d.rfc_id)
+                    FROM rfc.generation_documents d
+                    JOIN rfc.source_observations o ON o.identity=d.txt_observation
+                    JOIN rfc.document_versions v ON v.identity=d.document_version
+                """))
+                assert [entry["rfc"] for entry in observations] == [2119, 8174, 9110]
+                assert all(entry["https_verification"] == "verified" for entry in observations)
+                print(json.dumps({"txt_observations": observations}, sort_keys=True), flush=True)
             else:
                 exercise(project)
         finally:

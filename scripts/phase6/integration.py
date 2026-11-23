@@ -30,7 +30,10 @@ class Project(phase5.Project):
     def command(self, *args):
         command = super().command(*args)
         index = command.index("-p")
-        return [*command[:index], "-f", str(HERE / "compose.yml"), *command[index:]]
+        files = ["-f", str(HERE / "compose.yml")]
+        if hasattr(self, "rotation"):
+            files.extend(("-f", str(self.rotation)))
+        return [*command[:index], *files, *command[index:]]
 
     def prepare_phase6(self, work):
         ids = phase1.capture([*self.docker, "network", "ls", "-q"]).splitlines()
@@ -123,6 +126,7 @@ def wait(predicate, seconds=40):
 def request(project, path, epoch="bootstrap", body=b"{}", to_serve=False, **overrides):
     caller, target, key_id, key = ((SYNC, SERVE, "fixture-notify", project.notify_key) if to_serve
                                     else (FEED, SYNC, "fixture-feed", project.feed_key))
+    key_id, key = overrides.get("credentials", (key_id, key))
     nonce = token(secrets.token_bytes(32))
     timestamp = str(int(time.time()))
     signature = mac(key, ["RFMCP-HMAC-SHA384-V1", key_id, caller, target, epoch,
@@ -199,6 +203,99 @@ def wire_checks(project, epoch):
     assert statuses == [200, 409, 409, 409], statuses
 
 
+def rotate_links(project):
+    work = project.directory.parent
+    project.rotation = work / "rotation.json"
+    services = {role: {"environment": {}, "volumes": []} for role in ("serve", "sync", "feed")}
+    groups = {"serve": 10001, "sync": 10002, "feed": 10003}
+    path = "/internal/v1/identify"
+    overlap = str(int(time.time()) + 600)
+    expired = str(int(time.time()) - 1)
+    events_sql = "SELECT count(*) FROM rfc.control_events"
+    pending_sql = "SELECT count(*) FROM rfc.notification_outbox WHERE delivery_state='pending'"
+
+    def delivered_after(sequence):
+        wait(lambda: project.publication() > sequence)
+        wait(lambda: project.sql(pending_sql) == "0")
+
+    def save():
+        project.rotation.write_text(json.dumps({"services": services}))
+
+    def restart(role):
+        save()
+        project.run("up", "-d", "--no-deps", "--force-recreate", role)
+
+    def check(active, target, status):
+        wire, expected = request(project, path, to_serve=target, credentials=active)
+        actual, headers, body = project.send(wire, target)
+        if actual != status:
+            return False
+        if status == 200:
+            assert headers["x-rfc-response-signature"] == response_mac(*expected, body)
+        return True
+
+    def configure(role, filename, prefix, key_id, key, previous=False):
+        new = f"rotated-{filename}-{role}"
+        (work / new).write_bytes(key)
+        (work / new).chmod(0o400)
+        project.run("run", "--rm", "--no-deps", "-v", f"{work}:/keys", "volume-admin",
+                    f"chown 0:{groups[role]} /keys/{new} && chmod 0440 /keys/{new}")
+        settings = services[role]
+        active_path = f"/run/secrets/rfc_{filename}"
+        settings["environment"][prefix + "_KEY_ID"] = key_id
+        settings["volumes"].append(f"{work / new}:{active_path}:ro")
+        if previous:
+            old_path = active_path + "_previous"
+            settings["environment"].update({
+                prefix + "_PREVIOUS_KEY_ID": f"fixture-{filename}",
+                prefix + "_PREVIOUS_KEY_FILE": old_path,
+                prefix + "_PREVIOUS_KEY_EXPIRES": overlap,
+            })
+            settings["volumes"].append(f"{work / (filename + '-' + role)}:{old_path}:ro")
+
+    save()
+    for filename, sender, receiver, prefix, key, target in (
+        ("feed", "feed", "sync", "RFC_FEED_SYNC", project.feed_key, False),
+        ("notify", "sync", "serve", "RFC_SYNC_SERVE", project.notify_key, True),
+    ):
+        old = (f"fixture-{filename}", key)
+        new = (f"rotated-{filename}", secrets.token_bytes(48))
+        configure(receiver, filename, prefix, *new, previous=True)
+        restart(receiver)
+        wait(lambda: check(old, target, 200))
+        wait(lambda: check(new, target, 200))
+        before = project.publication()
+        if target:
+            restart(sender)
+        else:
+            events = int(project.sql(events_sql))
+            feed_data(project, [2119, 8174, 9110])
+            wait(lambda: int(project.sql(events_sql)) == events + 1)
+        delivered_after(before)
+        configure(sender, filename, prefix, *new)
+        before = project.publication()
+        restart(sender)
+        if not target:
+            events = int(project.sql(events_sql))
+            feed_data(project, [2119, 8174, 9110, 9000])
+            wait(lambda: int(project.sql(events_sql)) == events + 1)
+        delivered_after(before)
+        services[receiver]["environment"][prefix + "_PREVIOUS_KEY_EXPIRES"] = expired
+        restart(receiver)
+        wait(lambda: check(new, target, 200))
+        assert check(old, target, 401)
+        for suffix in ("_PREVIOUS_KEY_ID", "_PREVIOUS_KEY_FILE", "_PREVIOUS_KEY_EXPIRES"):
+            del services[receiver]["environment"][prefix + suffix]
+        services[receiver]["volumes"] = [
+            mount for mount in services[receiver]["volumes"]
+            if not mount.endswith(f":/run/secrets/rfc_{filename}_previous:ro")
+        ]
+        restart(receiver)
+        wait(lambda: check(new, target, 200))
+        print(f"{filename} receiver-first rotation, signed overlap, sender switch, "
+              "outbox delivery and expired-key denial passed", flush=True)
+
+
 def exercise(project):
     project.start()
     project.upgrade_control()
@@ -222,6 +319,7 @@ def exercise(project):
             conflicting["observation_digest"] = payload["observation_digest"][:-2] + "01"
         assert project.send(trigger(project, epoch, conflicting)[0])[0] == 409
         assert project.sql("SELECT state || ':' || count(*) FROM rfc.sync_jobs WHERE state IN ('pending','running') GROUP BY state ORDER BY state") == "pending:1\nrunning:1"
+        print("Sync queue saturation retained one running job and one coalesced pending job", flush=True)
     finally:
         hold.unlink()
     wait(lambda: project.publication() == 2)
@@ -347,6 +445,7 @@ def exercise(project):
     wait(lambda: '"GET /rfcrss.xml HTTP/1.1" 304' in project.capture("logs", "fixtures"))
     assert int(project.sql("SELECT count(*) FROM rfc.control_events")) == initial + 2
     print("conditional Atom and RSS polling, malformed and oversized feeds, and duplicate suppression passed", flush=True)
+    rotate_links(project)
 
 
 def fixture_binaries(docker, prefix, work):

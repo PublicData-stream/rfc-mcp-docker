@@ -45,9 +45,13 @@ class Proxy(BaseHTTPRequestHandler):
         pass
 
 
+class TestProxyServer(ThreadingHTTPServer):
+    request_queue_size = 128
+
+
 if __name__ == "__main__":
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain("/tls/localhost.crt", "/tls/localhost.key")
-    server = ThreadingHTTPServer(("0.0.0.0", 8443), Proxy)
+    server = TestProxyServer(("0.0.0.0", 8443), Proxy)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     server.serve_forever()

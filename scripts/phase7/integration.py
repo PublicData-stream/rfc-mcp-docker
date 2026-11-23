@@ -4,7 +4,7 @@
 import argparse
 from contextlib import ExitStack
 import importlib.util
-from ipaddress import ip_network
+from ipaddress import ip_address, ip_network
 import json
 import os
 from pathlib import Path
@@ -29,6 +29,7 @@ SERVE, SYNC, FEED = ("rfc-mcp-docker-" + role for role in ("serve", "sync", "fee
 class Deployment:
     def __init__(self, work, seed, prefix):
         self.work, self.docker = work, seed.docker
+        self.ca = seed.directory / "certs/ca.crt"
         self.name = work.name + "-prod"
         self.network = self.name + "-ingress"
         self.prefix = prefix
@@ -117,7 +118,7 @@ class Deployment:
     def admin(self, path):
         return self.capture("exec", "-T", SERVE, "wget", "-qO-", "http://127.0.0.1:8781" + path)
 
-    def start(self):
+    def provision(self):
         base = [*self.docker, "compose", "-f", str(ROOT / "compose.yml"), "config", "--quiet"]
         phase5.run(base, env=self.env)
         self.run("--profile", "tools", "run", "--rm", "--no-deps", "volume-admin")
@@ -132,16 +133,27 @@ class Deployment:
         self.sql("-f", "/migrations/bootstrap.sql")
         self.sql("-f", "/migrations/migrate.sql")
         assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "6"
-        with (self.work / "fixture.dump").open("rb") as fixture:
-            subprocess.run(self.command("exec", "-T", "postgres", "pg_restore", "--clean", "--if-exists",
-                                        "--exit-on-error", "-U", "postgres", "-d", "rfc"),
-                           env=self.env, stdin=fixture, check=True, timeout=55)
         assert self.sql("-c", "SELECT current_setting('server_encoding') || ':' || datlocale || ':' "
                         "|| datlocprovider::text FROM pg_database WHERE datname = current_database()") == "UTF8:und:i"
         assert self.sql("-c", "SELECT has_table_privilege('rfc_serve','rfc.generation_documents','INSERT')") == "f"
-        self.run("up", "-d", "--wait", "--wait-timeout", "55", timeout=85)
+
+    def restore(self, dump):
+        with dump.open("rb") as fixture:
+            subprocess.run(self.command("exec", "-T", "postgres", "pg_restore", "--clean", "--if-exists",
+                                        "--exit-on-error", "-U", "postgres", "-d", "rfc"),
+                           env=self.env, stdin=fixture, check=True, timeout=55)
+
+    def open(self, *services):
+        self.run("up", "-d", "--wait", "--wait-timeout", "55", *services, timeout=85)
         port = int(self.capture("port", "test-proxy", "8443").rsplit(":", 1)[1])
-        self.client = phase5.Client(port, self.work / self.work.name / "certs" / "ca.crt")
+        self.client = phase5.Client(port, self.ca)
+
+    def start(self):
+        self.provision()
+        self.restore(self.work / "fixture.dump")
+        # Dynamic clients can start before the corresponding fixed listener.
+        self.run("up", "-d", "--no-deps", SYNC, timeout=55)
+        self.open()
 
     def verify(self):
         for service, uid, secrets_expected in (
@@ -161,7 +173,12 @@ class Deployment:
             if service == FEED:
                 assert not any(mount["Destination"] == "/mirror" for mount in info["Mounts"])
             if service in (SYNC, FEED):
-                assert self.network not in info["NetworkSettings"]["Networks"]
+                networks = info["NetworkSettings"]["Networks"]
+                assert self.network not in networks
+                network, pool = (("sync_notify", "RFC_NOTIFY_DYNAMIC_RANGE") if service == SYNC
+                                 else ("feed_control", "RFC_CONTROL_DYNAMIC_RANGE"))
+                address = networks[f"{self.name}_{network}"]["IPAddress"]
+                assert ip_address(address) in ip_network(self.env[pool])
             if service != "postgres":
                 self.run("exec", "-T", service, "sh", "-ec",
                          "for key in /run/secrets/*; do case $key in */db_ca) continue;; esac; "
