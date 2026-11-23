@@ -1,0 +1,31 @@
+name: Release supply-chain audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and audit candidate images
+        env:
+          RFC_PHASE8_CONTEXT: default
+          RFC_PHASE8_IMAGE_PREFIX: rfc-mcp-audit
+        run: |
+          for role in serve sync feed; do
+            docker --context default build --target "$role" -t "$RFC_PHASE8_IMAGE_PREFIX-$role" .
+          done
+          bash scripts/phase8/audit.sh /tmp/rfc-mcp-release-audit
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: release-audit-${{ github.sha }}
+          path: /tmp/rfc-mcp-release-audit/
+          if-no-files-found: warn

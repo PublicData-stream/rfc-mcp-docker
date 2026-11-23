@@ -1,0 +1,222 @@
+x-runtime: &runtime
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 64
+  tmpfs:
+    - /tmp:size=16m,mode=1777,nosuid,nodev,noexec
+  logging:
+    driver: local
+    options: {max-size: 10m, max-file: "3"}
+  restart: unless-stopped
+
+x-db-client: &db-client
+  RFC_DB_HOST: postgres
+  RFC_DB_CA_FILE: /run/secrets/db_ca
+  RFC_DB_PASSWORD_FILE: /run/secrets/db_password
+
+services:
+  rfc-mcp-docker-serve:
+    <<: *runtime
+    image: ${RFC_SERVE_IMAGE:?Set RFC_SERVE_IMAGE}
+    user: "10001:10001"
+    cpus: 2.0
+    mem_limit: 768m
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      <<: *db-client
+      RFC_MCP_BIND: ${RFC_INGRESS_SERVE_IP:?Set RFC_INGRESS_SERVE_IP}:8780
+      RFC_MCP_HOSTS: ${RFC_MCP_HOSTS:?Set RFC_MCP_HOSTS}
+      RFC_MCP_ORIGINS: ${RFC_MCP_ORIGINS:-}
+      RFC_MCP_TRUSTED_PROXIES: ${RFC_INGRESS_PROXY_IP:?Set RFC_INGRESS_PROXY_IP}
+      RFC_MCP_CURSOR_KEY_FILE: /run/secrets/cursor_key
+      RFC_SERVE_NOTIFY_BIND: ${RFC_NOTIFY_SERVE_IP:?Set RFC_NOTIFY_SERVE_IP}:8782
+      RFC_SYNC_SERVE_KEY_ID: ${RFC_SYNC_SERVE_KEY_ID:?Set RFC_SYNC_SERVE_KEY_ID}
+      RFC_SYNC_SERVE_KEY_FILE: /run/secrets/notify_key
+    volumes:
+      - mirror:/mirror:ro
+    secrets:
+      - {source: db_ca, target: db_ca}
+      - {source: serve_database_password, target: db_password}
+      - {source: serve_cursor_key, target: cursor_key}
+      - {source: serve_notify_key, target: notify_key}
+    networks:
+      public_ingress: {ipv4_address: "${RFC_INGRESS_SERVE_IP:?Set RFC_INGRESS_SERVE_IP}"}
+      db_read: {}
+      sync_notify: {ipv4_address: "${RFC_NOTIFY_SERVE_IP:?Set RFC_NOTIFY_SERVE_IP}"}
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:8781/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  rfc-mcp-docker-sync:
+    <<: *runtime
+    image: ${RFC_SYNC_IMAGE:?Set RFC_SYNC_IMAGE}
+    user: "10002:10002"
+    cpus: 2.0
+    mem_limit: 2g
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      <<: *db-client
+      RFC_SYNC_CONTROL_BIND: ${RFC_CONTROL_SYNC_IP:?Set RFC_CONTROL_SYNC_IP}:8783
+      RFC_SYNC_SERVE_ADDR: ${RFC_NOTIFY_SERVE_IP:?Set RFC_NOTIFY_SERVE_IP}:8782
+      RFC_SYNC_SERVE_KEY_ID: ${RFC_SYNC_SERVE_KEY_ID:?Set RFC_SYNC_SERVE_KEY_ID}
+      RFC_SYNC_SERVE_KEY_FILE: /run/secrets/notify_key
+      RFC_FEED_SYNC_KEY_ID: ${RFC_FEED_SYNC_KEY_ID:?Set RFC_FEED_SYNC_KEY_ID}
+      RFC_FEED_SYNC_KEY_FILE: /run/secrets/feed_key
+    volumes:
+      - mirror:/mirror:rw
+    secrets:
+      - {source: db_ca, target: db_ca}
+      - {source: sync_database_password, target: db_password}
+      - {source: sync_notify_key, target: notify_key}
+      - {source: sync_feed_key, target: feed_key}
+    networks:
+      db_write: {}
+      sync_notify: {}
+      feed_control: {ipv4_address: "${RFC_CONTROL_SYNC_IP:?Set RFC_CONTROL_SYNC_IP}"}
+      sync_egress: {gw_priority: 1}
+
+  rfc-mcp-docker-feed:
+    <<: *runtime
+    image: ${RFC_FEED_IMAGE:?Set RFC_FEED_IMAGE}
+    user: "10003:10003"
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 32
+    depends_on:
+      rfc-mcp-docker-sync: {condition: service_started}
+    environment:
+      RFC_FEED_SYNC_ADDR: ${RFC_CONTROL_SYNC_IP:?Set RFC_CONTROL_SYNC_IP}:8783
+      RFC_FEED_SYNC_KEY_ID: ${RFC_FEED_SYNC_KEY_ID:?Set RFC_FEED_SYNC_KEY_ID}
+      RFC_FEED_SYNC_KEY_FILE: /run/secrets/feed_key
+      RFC_FEED_FORMAT: ${RFC_FEED_FORMAT:-atom}
+    secrets:
+      - {source: feed_feed_key, target: feed_key}
+    networks:
+      feed_control: {}
+      feed_egress: {gw_priority: 1}
+
+  postgres:
+    <<: *runtime
+    image: docker.io/library/postgres:19.0-alpine3.24@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188
+    user: "70:70"
+    cpus: 2.0
+    mem_limit: 1g
+    pids_limit: 128
+    shm_size: 128m
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: rfc
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C --locale-provider=icu --icu-locale=und --auth-host=scram-sha-256 --auth-local=peer
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        cp /run/secrets/postgres_key /run/postgresql/server.key
+        exec docker-entrypoint.sh postgres -c ssl=on \
+          -c ssl_cert_file=/run/secrets/postgres_cert \
+          -c ssl_key_file=/run/postgresql/server.key \
+          -c hba_file=/etc/rfc-pg-hba.conf
+    tmpfs:
+      - /tmp:size=16m,mode=1777,nosuid,nodev,noexec
+      - /run/postgresql:size=2m,uid=70,gid=70,mode=0770,nosuid,nodev,noexec
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./migrations:/migrations:ro
+    configs:
+      - {source: pg_hba, target: /etc/rfc-pg-hba.conf}
+    secrets:
+      - postgres_password
+      - postgres_cert
+      - postgres_key
+    networks: [db_read, db_write]
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, postgres, -d, rfc]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  volume-admin:
+    <<: *runtime
+    profiles: [tools]
+    image: ${RFC_SYNC_IMAGE:?Set RFC_SYNC_IMAGE}
+    user: "0:0"
+    cpus: 0.5
+    mem_limit: 64m
+    restart: "no"
+    network_mode: none
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    entrypoint: [/bin/sh, -ec]
+    command: ["chown 10002:10002 /mirror; chmod 0755 /mirror; chown 70:70 /pgdata; chmod 0700 /pgdata"]
+    volumes:
+      - mirror:/mirror
+      - pgdata:/pgdata
+
+networks:
+  public_ingress:
+    external: true
+    name: ${RFC_INGRESS_NETWORK:?Set RFC_INGRESS_NETWORK}
+  db_read:
+    internal: true
+    ipam:
+      config: [{subnet: "${RFC_DB_READ_SUBNET:?Set RFC_DB_READ_SUBNET}"}]
+  db_write:
+    internal: true
+    ipam:
+      config: [{subnet: "${RFC_DB_WRITE_SUBNET:?Set RFC_DB_WRITE_SUBNET}"}]
+  sync_notify:
+    internal: true
+    ipam:
+      config:
+        - subnet: "${RFC_NOTIFY_SUBNET:?Set RFC_NOTIFY_SUBNET}"
+          ip_range: "${RFC_NOTIFY_DYNAMIC_RANGE:-${RFC_NOTIFY_SUBNET:?Set RFC_NOTIFY_SUBNET}}"
+  feed_control:
+    internal: true
+    ipam:
+      config:
+        - subnet: "${RFC_CONTROL_SUBNET:?Set RFC_CONTROL_SUBNET}"
+          ip_range: "${RFC_CONTROL_DYNAMIC_RANGE:-${RFC_CONTROL_SUBNET:?Set RFC_CONTROL_SUBNET}}"
+  sync_egress: {}
+  feed_egress: {}
+
+volumes:
+  mirror:
+    driver: local
+    driver_opts: {type: none, o: bind, device: "${RFC_MIRROR_DIR:?Set RFC_MIRROR_DIR}"}
+  pgdata:
+    driver: local
+    driver_opts: {type: none, o: bind, device: "${RFC_PGDATA_DIR:?Set RFC_PGDATA_DIR}"}
+
+configs:
+  pg_hba:
+    file: ${RFC_PG_HBA:?Set RFC_PG_HBA}
+
+secrets:
+  db_ca:
+    file: ${RFC_DB_CA:?Set RFC_DB_CA}
+  postgres_cert:
+    file: ${RFC_POSTGRES_CERT:?Set RFC_POSTGRES_CERT}
+  postgres_key:
+    file: ${RFC_POSTGRES_KEY:?Set RFC_POSTGRES_KEY}
+  postgres_password:
+    file: ${RFC_POSTGRES_PASSWORD:?Set RFC_POSTGRES_PASSWORD}
+  serve_database_password:
+    file: ${RFC_SERVE_DB_PASSWORD:?Set RFC_SERVE_DB_PASSWORD}
+  sync_database_password:
+    file: ${RFC_SYNC_DB_PASSWORD:?Set RFC_SYNC_DB_PASSWORD}
+  serve_cursor_key:
+    file: ${RFC_SERVE_CURSOR_KEY:?Set RFC_SERVE_CURSOR_KEY}
+  serve_notify_key:
+    file: ${RFC_SERVE_NOTIFY_KEY:?Set RFC_SERVE_NOTIFY_KEY}
+  sync_notify_key:
+    file: ${RFC_SYNC_NOTIFY_KEY:?Set RFC_SYNC_NOTIFY_KEY}
+  sync_feed_key:
+    file: ${RFC_SYNC_FEED_KEY:?Set RFC_SYNC_FEED_KEY}
+  feed_feed_key:
+    file: ${RFC_FEED_FEED_KEY:?Set RFC_FEED_FEED_KEY}

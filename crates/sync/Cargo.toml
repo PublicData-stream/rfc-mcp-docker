@@ -1,0 +1,44 @@
+[package]
+name = "rfc-mcp-docker-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rfc-mcp-docker-sync"
+path = "src/main.rs"
+
+[dependencies]
+rfc-core = { path = "../core" }
+rfc-mcp-docker = { path = "../../apps" }
+rfc-storage = { path = "../storage" }
+tokio-postgres.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process", "rt-multi-thread"] }
+tempfile = "3"
+libc.workspace = true
+roxmltree = "0.21"
+
+[features]
+phase1-fixtures = []
+phase2-fixtures = []
+phase3-fixtures = ["phase2-fixtures", "rfc-storage/phase3-fixtures"]
+phase6-fixtures = ["phase3-fixtures"]
+
+[[bin]]
+name = "rfc-phase1-fixture"
+path = "src/bin/phase1-fixture.rs"
+required-features = ["phase1-fixtures"]
+
+[[bin]]
+name = "rfc-phase2-fixture"
+path = "src/bin/phase2-fixture.rs"
+required-features = ["phase2-fixtures"]
+
+[[bin]]
+name = "rfc-phase3-fixture"
+path = "src/bin/phase3-fixture.rs"
+required-features = ["phase3-fixtures"]

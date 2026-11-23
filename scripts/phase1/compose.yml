@@ -1,0 +1,96 @@
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 64
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+
+x-database-environment: &database-environment
+  RFC_DB_HOST: postgres
+  RFC_DB_CA_FILE: /phase1/ca.crt
+  RFC_DB_PASSWORD_FILE: /phase1/db-password
+
+services:
+  serve:
+    <<: *hardened
+    image: ${PHASE1_IMAGE_PREFIX}-serve
+    environment: *database-environment
+    networks: [db_read]
+    volumes:
+      - mirror:/mirror:ro
+      - ${PHASE1_DIR}/reader-password:/phase1/db-password:ro
+      - ${PHASE1_DIR}/certs/ca.crt:/phase1/ca.crt:ro
+      - ${PHASE1_DIR}/certs/wrong-ca.crt:/phase1/wrong-ca.crt:ro
+      - ${PHASE1_DRIVER}:/phase1/fixture-driver:ro
+  sync:
+    <<: *hardened
+    image: ${PHASE1_IMAGE_PREFIX}-sync
+    environment: *database-environment
+    networks: [db_write, feed_control]
+    volumes:
+      - mirror:/mirror:rw
+      - ${PHASE1_DIR}/writer-password:/phase1/db-password:ro
+      - ${PHASE1_DIR}/certs/ca.crt:/phase1/ca.crt:ro
+      - ${PHASE1_DIR}/fixture:/fixture:ro
+      - ${PHASE1_DRIVER}:/phase1/fixture-driver:ro
+  feed:
+    <<: *hardened
+    image: ${PHASE1_IMAGE_PREFIX}-feed
+    networks: [feed_control]
+  postgres:
+    <<: *hardened
+    image: docker.io/library/postgres:19.0-alpine3.24@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188
+    user: "70:70"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: rfc
+      POSTGRES_PASSWORD_FILE: /phase1/postgres-password
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C --locale-provider=icu --icu-locale=und --auth-host=scram-sha-256 --auth-local=peer
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        cp /phase1/postgres.key /run/postgresql/server.key
+        cp /phase1/pgpass /run/postgresql/pgpass
+        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/phase1/postgres.crt \
+          -c ssl_key_file=/run/postgresql/server.key -c hba_file=/phase1/pg_hba.conf
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /run/postgresql:size=2m,uid=70,gid=70,mode=0770
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ${PHASE1_DIR}/postgres:/phase1:ro
+      - ../../migrations:/migrations:ro
+    networks:
+      db_read: {aliases: [wrong-postgres]}
+      db_write: {}
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -d, rfc, -U, postgres]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+  volume-admin:
+    <<: *hardened
+    image: ${PHASE1_IMAGE_PREFIX}-sync
+    profiles: [tools]
+    user: "0:0"
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    network_mode: none
+    entrypoint: [/bin/sh, -ec]
+    volumes:
+      - mirror:/mirror
+      - pgdata:/pgdata
+networks:
+  db_read: {internal: true}
+  db_write: {internal: true}
+  feed_control: {internal: true}
+
+volumes:
+  mirror:
+    driver: local
+    driver_opts: {type: none, o: bind, device: "${PHASE1_DIR}/mirror"}
+  pgdata:
+    driver: local
+    driver_opts: {type: none, o: bind, device: "${PHASE1_DIR}/pgdata"}

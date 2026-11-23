@@ -1,0 +1,32 @@
+services:
+  serve:
+    environment:
+      RFC_MCP_BIND: 0.0.0.0:8780
+      RFC_MCP_HOSTS: rfc.test
+      RFC_MCP_ORIGINS: https://rfc.test
+      RFC_MCP_TRUSTED_PROXIES: ${PHASE5_PROXY_IP:-}
+    volumes:
+      - ${PHASE5_DIR}/cursor-key:/run/secrets/rfc_cursor_key:ro
+    networks:
+      phase5_ingress: {}
+  sync:
+    volumes:
+      - ${PHASE5_DIR}/fixture-policy.json:/phase5/fixture-policy.json:ro
+  proxy:
+    image: ${PHASE1_IMAGE_PREFIX}-fixtures
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    entrypoint: [python3, -B, /phase5/proxy.py]
+    volumes:
+      - ${PHASE5_SCRIPTS}:/phase5:ro
+      - ${PHASE5_DIR}/tls:/tls:ro
+    networks: [phase5_ingress, phase5_edge]
+    ports:
+      - target: 8443
+        host_ip: 127.0.0.1
+
+networks:
+  phase5_ingress: {internal: true}
+  phase5_edge: {}
