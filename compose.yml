@@ -57,10 +57,14 @@ services:
     user: "10002:10002"
     cpus: 2.0
     mem_limit: 2g
+    tmpfs:
+      - /tmp:size=512m,mode=1777,nosuid,nodev,noexec
     depends_on:
       postgres: {condition: service_healthy}
     environment:
       <<: *db-client
+      RFC_SYNC_HTTP_CONCURRENCY: ${RFC_SYNC_HTTP_CONCURRENCY:-1}
+      RFC_SYNC_PARSE_CONCURRENCY: ${RFC_SYNC_PARSE_CONCURRENCY:-1}
       RFC_SYNC_CONTROL_BIND: ${RFC_CONTROL_SYNC_IP:?Set RFC_CONTROL_SYNC_IP}:8783
       RFC_SYNC_SERVE_ADDR: ${RFC_NOTIFY_SERVE_IP:?Set RFC_NOTIFY_SERVE_IP}:8782
       RFC_SYNC_SERVE_KEY_ID: ${RFC_SYNC_SERVE_KEY_ID:?Set RFC_SYNC_SERVE_KEY_ID}

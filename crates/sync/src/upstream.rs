@@ -1,17 +1,26 @@
 //! Fixed upstream destinations and bounded, private transfers.
 
-use crate::metrics::{Metrics, Stage};
+use crate::{
+    metrics::{Metrics, Stage},
+    pipeline::Shutdown,
+};
 use reqwest::{Client, StatusCode, header};
 use rfc_core::RfcNumber;
 use rfc_storage::{blob::BlobWriter, postgres::Result};
 use std::{
     collections::BTreeSet,
+    future::{Future, poll_fn},
     io::Read,
-    path::Path,
     process::Stdio,
+    sync::Arc,
+    task::Poll,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{process::Command, time};
+use tokio::{
+    process::Command,
+    sync::{Mutex, Semaphore},
+    time,
+};
 
 pub(crate) const TXT_LIMIT: usize = 4 * 1024 * 1024;
 pub(crate) const CATALOG_LIMIT: usize = 32 * 1024 * 1024;
@@ -81,6 +90,7 @@ pub(crate) enum Download {
     Unavailable,
 }
 
+#[derive(Clone)]
 pub(crate) struct Upstream {
     http: Client,
     https_origin: &'static str,
@@ -88,8 +98,9 @@ pub(crate) struct Upstream {
     paced: bool,
     metrics: Metrics,
     #[cfg(feature = "phase2-fixtures")]
-    fixture_clock: Option<i64>,
-    next_request: time::Instant,
+    fixture_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
+    next_request: Arc<Mutex<time::Instant>>,
+    in_flight: Arc<Semaphore>,
 }
 
 impl Upstream {
@@ -108,7 +119,7 @@ impl Upstream {
         )?;
         upstream.paced = std::env::var("RFC_PHASE2_PACED").as_deref() == Ok("1");
         if std::env::var("RFC_PHASE2_FIXED_CLOCK").as_deref() == Ok("1") {
-            upstream.fixture_clock = Some(1_790_000_000_000_000);
+            upstream.fixture_clock = Some(Arc::new(1_790_000_000_000_000.into()));
         }
         Ok(upstream)
     }
@@ -140,7 +151,8 @@ impl Upstream {
             metrics: Metrics::default(),
             #[cfg(feature = "phase2-fixtures")]
             fixture_clock: None,
-            next_request: time::Instant::now(),
+            next_request: Arc::new(Mutex::new(time::Instant::now())),
+            in_flight: Arc::new(Semaphore::new(concurrency("RFC_SYNC_HTTP_CONCURRENCY", 1)?)),
         })
     }
 
@@ -148,29 +160,44 @@ impl Upstream {
         self.metrics.clone()
     }
 
-    pub(crate) async fn fetch(&mut self, source: Source) -> Result<Download> {
+    pub(crate) async fn after_fence(&self) {
         if self.paced {
-            time::sleep_until(self.next_request).await;
+            *self.next_request.lock().await = time::Instant::now() + Duration::from_secs(1);
         }
+    }
+
+    pub(crate) async fn fetch(&self, source: Source) -> Result<Download> {
+        let queue = self.metrics.span(Stage::Queue);
+        let _permit = self.in_flight.acquire().await?;
+        let mut next = self.next_request.lock().await;
+        if self.paced {
+            time::sleep_until(*next).await;
+        }
+        let clock = self.capture_clock(source);
+        let observed_us = clock.map_or_else(now_us, Ok)?;
+        let request = self
+            .http
+            .get(format!("{}{}", self.https_origin, source.path()))
+            .header(header::ACCEPT_ENCODING, "identity")
+            .build()?;
+        drop(queue);
         let _http = self.metrics.http_start(match source {
             Source::Catalog => Stage::Catalog,
             Source::Txt(_) => Stage::Txt,
             Source::Xml(_) => Stage::Xml,
         });
-        if self.paced {
-            self.next_request = time::Instant::now() + Duration::from_secs(1);
+        let response = self.http.execute(request);
+        tokio::pin!(response);
+        // First-poll under the start gate, then release it before awaiting anything
+        // from the network. Late scheduling cannot create a burst of starts.
+        let initial = poll_fn(|context| Poll::Ready(response.as_mut().poll(context))).await;
+        *next = time::Instant::now() + Duration::from_secs(1);
+        drop(next);
+        let mut response = match initial {
+            Poll::Ready(result) => result,
+            Poll::Pending => response.await,
         }
-        let clock = self.capture_clock(source);
-        let observed_us = clock.map_or_else(now_us, Ok)?;
-        let mut response = self
-            .http
-            .get(format!("{}{}", self.https_origin, source.path()))
-            .header(header::ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-            .map_err(|error| {
-                format!("{} HTTPS transport: {}", source.kind(), error.without_url())
-            })?;
+        .map_err(|error| format!("{} HTTPS transport: {}", source.kind(), error.without_url()))?;
         let status = response.status();
         if matches!(source, Source::Xml(_))
             && matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE)
@@ -206,6 +233,7 @@ impl Upstream {
             return Err("HTTPS transfer exceeds byte limit".into());
         }
         let mut bytes = Vec::new();
+        bytes.try_reserve_exact(limit)?;
         while let Some(chunk) = response.chunk().await? {
             if chunk.len() > limit - bytes.len() {
                 return Err("HTTPS transfer exceeds byte limit".into());
@@ -225,14 +253,11 @@ impl Upstream {
         }))
     }
 
-    fn capture_clock(&mut self, _source: Source) -> Option<i64> {
+    fn capture_clock(&self, _source: Source) -> Option<i64> {
         #[cfg(feature = "phase2-fixtures")]
-        if let Some(base) = self.fixture_clock.as_mut() {
+        if let Some(base) = self.fixture_clock.as_ref() {
             return Some(match _source {
-                Source::Catalog => {
-                    *base += 1;
-                    *base
-                }
+                Source::Catalog => 1 + base.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 Source::Txt(id) => 1_790_000_010_000_000 + i64::from(id.get()),
                 Source::Xml(id) => 1_790_000_020_000_000 + i64::from(id.get()),
             });
@@ -240,7 +265,7 @@ impl Upstream {
         None
     }
 
-    pub(crate) async fn stage(&self, ids: &[RfcNumber]) -> Result<RsyncBatch> {
+    pub(crate) async fn stage(&self, ids: &[RfcNumber], shutdown: &Shutdown) -> Result<RsyncBatch> {
         let _timing = self.metrics.span(Stage::Rsync);
         if ids.is_empty() || ids.len() > BATCH {
             return Err("rsync batch count exceeds bounds".into());
@@ -292,13 +317,19 @@ impl Upstream {
         }
         let mut child = command.spawn()?;
         let mut group = ProcessGroup(child.id().map(i32::try_from).transpose()?);
-        let status = match time::timeout(Duration::from_secs(120), child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
+        let status = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                group.kill();
+                child.wait().await?;
+                return Err("rsync batch cancelled".into());
+            }
+            _ = time::sleep(Duration::from_secs(120)) => {
                 group.kill();
                 child.wait().await?;
                 return Err("rsync batch deadline exceeded".into());
             }
+            status = child.wait() => status?,
         };
         group.0 = None;
         if !status.success() && !matches!(status.code(), Some(23 | 24)) {
@@ -315,7 +346,11 @@ impl Upstream {
             if !names.contains(&name) || !entry.file_type()?.is_file() {
                 return Err("unexpected or non-regular rsync input".into());
             }
-            staged_bytes += entry.metadata()?.len();
+            let length = entry.metadata()?.len();
+            if length > TXT_LIMIT as u64 {
+                return Err("rsync TXT size exceeds bounds".into());
+            }
+            staged_bytes += length;
             seen.insert(name);
         }
         if let Some(missing) = names.difference(&seen).next() {
@@ -325,10 +360,7 @@ impl Upstream {
             return Err(format!("rsync batch failed ({status})").into());
         }
         self.metrics.staged(staged_bytes);
-        Ok(RsyncBatch {
-            _temp: temp,
-            incoming,
-        })
+        Ok(RsyncBatch { temp, incoming })
     }
 }
 
@@ -373,22 +405,41 @@ impl Drop for ProcessGroup {
 }
 
 pub(crate) struct RsyncBatch {
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
     incoming: std::path::PathBuf,
 }
 
 impl RsyncBatch {
-    pub(crate) fn read(&self, store: &BlobWriter, id: RfcNumber) -> Result<Vec<u8>> {
-        bounded_txt(store, &self.incoming, &filename(id))
+    pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<Vec<u8>> {
+        let name = filename(id);
+        let mut file = store.open_candidate(&self.incoming, &name)?;
+        let length = usize::try_from(file.metadata()?.len())?;
+        if length == 0 || length > TXT_LIMIT {
+            return Err("rsync TXT size exceeds bounds".into());
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length)?;
+        bytes.resize(length, 0);
+        file.read_exact(&mut bytes)?;
+        if file.read(&mut [0])? != 0 {
+            return Err("rsync TXT changed during read".into());
+        }
+        drop(file);
+        std::fs::remove_file(self.incoming.join(name))?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn close(self) -> Result<()> {
+        self.temp.close()?;
+        Ok(())
     }
 }
 
-fn bounded_txt(store: &BlobWriter, root: &Path, name: &str) -> Result<Vec<u8>> {
-    let file = store.open_candidate(root, name)?;
-    let mut bytes = Vec::new();
-    file.take(TXT_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.is_empty() || bytes.len() > TXT_LIMIT {
-        return Err("rsync TXT size exceeds bounds".into());
+pub(crate) fn concurrency(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(value) if value == "1" => Ok(1),
+        Ok(value) if value == "2" => Ok(2),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        _ => Err(format!("{name} must be 1 or 2").into()),
     }
-    Ok(bytes)
 }

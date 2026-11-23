@@ -1,7 +1,7 @@
 services:
   sync:
     tmpfs: !override
-      - /tmp:size=144m,mode=1777,noexec,nosuid,nodev
+      - /tmp:size=512m,mode=1777,noexec,nosuid,nodev
     networks:
       source_egress: {}
 

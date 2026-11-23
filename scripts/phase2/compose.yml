@@ -3,8 +3,10 @@ services:
     volumes:
       - ${PHASE2_DRIVER}:/phase2/fixture-driver:ro
   sync:
+    cpus: 2.0
+    mem_limit: 2g
     tmpfs: !override
-      - /tmp:size=144m,mode=1777,noexec,nosuid,nodev
+      - /tmp:size=${PHASE2_TMPFS:-512m},mode=1777,noexec,nosuid,nodev
     networks:
       fixture_source: {}
     volumes:

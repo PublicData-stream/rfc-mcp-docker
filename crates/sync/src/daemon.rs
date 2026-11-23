@@ -1,6 +1,7 @@
 use crate::{
     Scope, Writer,
     ingest::ingest_locked,
+    pipeline::Shutdown,
     policy::Registry,
     publication::promote_locked,
     upstream::{Download, Source, Upstream},
@@ -94,14 +95,29 @@ pub async fn run_daemon() -> Result<()> {
     let schedule = Schedule::new()?;
     let notify = Client::new(notify, Link::SyncServe, notify_keys);
     let outbox_retry = schedule.outbox_retry;
-    let worker = tokio::spawn(async move { worker(&schedule).await });
-    tokio::try_join!(
-        control::serve(listener, Link::FeedSync, feed_keys, accept),
-        async { worker.await? },
-        dispatch(notify, outbox_retry),
-        watch_leader(leader),
-    )?;
-    Ok(())
+    let shutdown = Shutdown::new();
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let worker = worker(&schedule, &shutdown);
+    let services = async {
+        tokio::try_join!(
+            control::serve(listener, Link::FeedSync, feed_keys, accept),
+            dispatch(notify, outbox_retry),
+            watch_leader(leader),
+        )?;
+        Result::Ok(())
+    };
+    tokio::pin!(worker, services);
+    tokio::select! {
+        result = &mut worker => result,
+        result = &mut services => {
+            shutdown.stop();
+            result.and(worker.await)
+        }
+        _ = term.recv() => {
+            shutdown.stop();
+            worker.await
+        }
+    }
 }
 
 async fn watch_leader(leader: Writer) -> Result<()> {
@@ -296,7 +312,7 @@ async fn schedule_retry(writer: &mut Writer, job: i64) -> Result<()> {
     Ok(())
 }
 
-async fn reconcile(job: i64) -> Result<()> {
+async fn reconcile(job: i64, shutdown: &Shutdown) -> Result<()> {
     let mut writer = Writer::connect().await?;
     let _corpus = writer.acquire_coordinator().await?;
     let row = writer.client.query_one(
@@ -326,6 +342,7 @@ async fn reconcile(job: i64) -> Result<()> {
                 Registry::load(),
                 Scope::Full,
                 Some(job),
+                shutdown,
             )
             .await?;
             let sequence = writer
@@ -339,18 +356,24 @@ async fn reconcile(job: i64) -> Result<()> {
             (id, sequence)
         }
     };
+    shutdown.check()?;
     promote_locked(&mut writer, candidate, sequence, false, Some(job)).await?;
     Ok(())
 }
 
-async fn catalog_changed(writer: &Writer) -> Result<bool> {
+async fn catalog_changed() -> Result<bool> {
+    // Use a short-lived session so the advisory lock is released on return.
+    let writer = Writer::connect().await?;
+    let _corpus = writer.acquire_coordinator().await?;
+    let upstream = upstream()?;
+    upstream.after_fence().await;
     let stored: Option<String> = writer.client.query_opt(
         "SELECT encode(o.raw_digest, 'hex')
          FROM rfc.active_generation a JOIN rfc.generation_ingestion i ON i.generation_id = a.generation_id
          JOIN rfc.source_observations o ON o.identity = i.catalog_after WHERE a.singleton",
         &[],
     ).await?.map(|row| row.try_get(0)).transpose()?;
-    let Download::Captured(capture) = upstream()?.fetch(Source::Catalog).await? else {
+    let Download::Captured(capture) = upstream.fetch(Source::Catalog).await? else {
         return Err("catalog is unavailable".into());
     };
     let digest = rfc_core::BlobDigest::hash(&capture.bytes).to_string();
@@ -361,17 +384,17 @@ async fn catalog_changed(writer: &Writer) -> Result<bool> {
     Ok(true)
 }
 
-async fn worker(schedule: &Schedule) -> Result<()> {
+async fn worker(schedule: &Schedule, shutdown: &Shutdown) -> Result<()> {
     let mut writer = Writer::connect().await?;
     let mut daily = Instant::now() + jitter(schedule.daily);
     let mut hourly = Instant::now() + jitter(schedule.hourly);
-    loop {
+    while shutdown.check().is_ok() {
         if Instant::now() >= daily && enqueue(&mut writer, None, false).await.is_ok() {
             daily = Instant::now() + jitter(schedule.daily);
         }
         match claim(&mut writer).await {
             Ok(NextJob::Ready(job)) => {
-                if reconcile(job).await.is_err() {
+                if reconcile(job, shutdown).await.is_err() && shutdown.check().is_ok() {
                     eprintln!("reconciliation job {job} encountered an error");
                     if schedule_retry(&mut writer, job).await.is_err() {
                         sleep(LOOP_TICK).await;
@@ -380,7 +403,12 @@ async fn worker(schedule: &Schedule) -> Result<()> {
             }
             Ok(NextJob::Idle) if Instant::now() >= hourly => {
                 hourly = Instant::now() + jitter(schedule.hourly);
-                match catalog_changed(&writer).await {
+                let changed = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    result = catalog_changed() => result,
+                };
+                match changed {
                     Ok(true) if enqueue(&mut writer, None, false).await.is_err() => {
                         eprintln!("catalog change could not be queued");
                         hourly = Instant::now() + LOOP_TICK;
@@ -389,12 +417,17 @@ async fn worker(schedule: &Schedule) -> Result<()> {
                     Err(_) => eprintln!("hourly catalog check failed"),
                 }
             }
-            _ => sleep(LOOP_TICK).await,
+            _ => tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                _ = sleep(LOOP_TICK) => {}
+            },
         }
         if writer.client.is_closed() {
             return Err("synchronization worker lost its database connection".into());
         }
     }
+    Ok(())
 }
 
 async fn dispatch(mut client: Client, base_retry: Duration) -> Result<()> {

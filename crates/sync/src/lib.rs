@@ -12,6 +12,7 @@ use tokio_postgres::{Client, Transaction};
 mod daemon;
 mod ingest;
 mod metrics;
+mod pipeline;
 mod policy;
 mod publication;
 mod recovery;

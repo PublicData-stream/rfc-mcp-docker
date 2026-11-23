@@ -1,6 +1,7 @@
 use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
     metrics::{Record, Stage},
+    pipeline::{DOCUMENT_SLOTS, Event, Pipeline, Prepared, PriorTxt, Shutdown, VerifiedTxt},
     policy::Registry,
     recovery::recover_before_ingestion,
     text::{self, TextIndex},
@@ -15,6 +16,7 @@ use rfc_storage::{
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -151,13 +153,39 @@ async fn execute(
     scope: Scope,
 ) -> Result<()> {
     let mut report = Report::new(scope);
-    let result = async {
-        let upstream = upstream?;
-        let mut writer = Writer::connect().await?;
-        let _coordinator = writer.acquire_coordinator().await?;
-        run(&mut writer, upstream, registry, scope, None, &mut report).await
+    let shutdown = Shutdown::new();
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut result = async {
+        let execution = async {
+            let upstream = upstream?;
+            let mut writer = Writer::connect().await?;
+            let _coordinator = writer.acquire_coordinator().await?;
+            run(
+                &mut writer,
+                upstream,
+                registry,
+                scope,
+                None,
+                &mut report,
+                &shutdown,
+            )
+            .await
+        };
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => result,
+            _ = term.recv() => {
+                shutdown.stop();
+                execution.await
+            }
+        }
     }
     .await;
+    if result.is_ok() && shutdown.check().is_err() {
+        // A complete ready transaction may have won the race with the signal.
+        // Its durable result remains available for recovery.
+        result = Err("reconciliation cancelled after readiness".into());
+    }
     print_report(report, &result)?;
     result.map(|_| ())
 }
@@ -168,10 +196,22 @@ pub(crate) async fn ingest_locked(
     registry: Result<Registry>,
     scope: Scope,
     job: Option<i64>,
+    shutdown: &Shutdown,
 ) -> Result<(GenerationId, BlobDigest)> {
     let mut report = Report::new(scope);
     let result = match upstream {
-        Ok(upstream) => run(writer, upstream, registry, scope, job, &mut report).await,
+        Ok(upstream) => {
+            run(
+                writer,
+                upstream,
+                registry,
+                scope,
+                job,
+                &mut report,
+                shutdown,
+            )
+            .await
+        }
         Err(error) => Err(error),
     };
     print_report(report, &result)?;
@@ -198,16 +238,20 @@ async fn run(
     scope: Scope,
     job: Option<i64>,
     report: &mut Report,
+    shutdown: &Shutdown,
 ) -> Result<(GenerationId, BlobDigest)> {
     let started = Instant::now();
     let metrics = upstream.metrics();
     let root = mirror_root();
     let store = BlobWriter::open(&root)?;
     recover_before_ingestion(writer, &store).await?;
-    let reader = BlobReader::open(&root, false)?;
+    let reader = Arc::new(BlobReader::open(&root, false)?);
+    shutdown.check()?;
+    upstream.after_fence().await;
     let registry = registry?;
     let id = writer.start_ingestion(PARSER, INDEX, job).await?;
     report.generation_id = Some(id.get().to_string());
+    let mut pipeline = Pipeline::new(upstream.clone());
     let mut run = Run {
         writer,
         id,
@@ -218,11 +262,15 @@ async fn run(
         registry,
         report,
     };
-    let result = match tokio::time::timeout(Duration::from_secs(12 * 60 * 60), run.collect()).await
-    {
-        Ok(result) => result,
-        Err(_) => Err("reconciliation deadline exceeded".into()),
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Err("reconciliation cancelled".into()),
+        _ = tokio::time::sleep(Duration::from_secs(12 * 60 * 60)) => {
+            Err("reconciliation deadline exceeded".into())
+        }
+        result = run.collect(&mut pipeline) => result,
     };
+    pipeline.drain().await;
     if result.is_err()
         && let Err(error) = run.writer.fail(id).await
     {
@@ -238,20 +286,14 @@ struct Run<'a> {
     id: GenerationId,
     scope: Scope,
     store: BlobWriter,
-    reader: BlobReader,
+    reader: Arc<BlobReader>,
     upstream: Upstream,
     registry: Registry,
     report: &'a mut Report,
 }
 
-#[derive(Clone, Copy)]
-struct PriorTxt {
-    digest: BlobDigest,
-    observation: BlobDigest,
-}
-
 impl Run<'_> {
-    async fn collect(&mut self) -> Result<(GenerationId, BlobDigest)> {
+    async fn collect(&mut self, pipeline: &mut Pipeline) -> Result<(GenerationId, BlobDigest)> {
         let start = self.catalog_capture().await?;
         let catalog = xml::catalog(&start.bytes)?;
         if catalog.entries.len() > 20_000 {
@@ -298,27 +340,8 @@ impl Run<'_> {
         self.store_catalog_graph(&catalog, &selected, before)
             .await?;
 
-        let ordered: Vec<_> = selected.iter().copied().collect();
-        for ids in ordered.chunks(upstream::BATCH) {
-            let batch = self.upstream.stage(ids).await?;
-            for &id in ids {
-                self.report.current_rfc = Some(id.get());
-                let bytes = {
-                    let _queue = self.upstream.metrics().span(Stage::Queue);
-                    batch.read(&self.store, id)?
-                };
-                self.store_document(
-                    id,
-                    &catalog.entries[&id],
-                    before,
-                    baseline.get(&id).copied(),
-                    &bytes,
-                    &selected,
-                )
-                .await?;
-            }
-        }
-        self.report.current_rfc = None;
+        self.collect_documents(pipeline, &catalog, &selected, &baseline, before)
+            .await?;
 
         let end = self.catalog_capture().await?;
         let end_digest = self.install(Source::Catalog, &end.bytes).await?;
@@ -389,6 +412,86 @@ impl Run<'_> {
             return Err("candidate failed membership or coverage validation".into());
         }
         candidate.ready().await
+    }
+
+    async fn collect_documents(
+        &mut self,
+        pipeline: &mut Pipeline,
+        catalog: &xml::Catalog,
+        selected: &BTreeSet<RfcNumber>,
+        baseline: &BTreeMap<RfcNumber, PriorTxt>,
+        before: BlobDigest,
+    ) -> Result<()> {
+        let ordered: Vec<_> = selected.iter().copied().collect();
+        let mut batch: Option<upstream::RsyncBatch> = None;
+        let mut staging = false;
+        let mut stage_end = 0;
+        let mut admitted = 0;
+        let mut committed = 0;
+        let mut completed = BTreeMap::new();
+        let mut failed = false;
+        let mut stage_error = None;
+        while committed < ordered.len() {
+            if !failed && !staging && batch.is_none() && admitted < ordered.len() {
+                stage_end = (admitted + upstream::BATCH).min(ordered.len());
+                pipeline.stage(ordered[admitted..stage_end].to_vec());
+                staging = true;
+            }
+            if !failed && let Some(staged) = batch.as_ref() {
+                while admitted < stage_end && admitted - committed < DOCUMENT_SLOTS {
+                    let id = ordered[admitted];
+                    self.report.current_rfc = Some(id.get());
+                    let bytes = staged.take(&self.store, id)?;
+                    admitted += 1;
+                    pipeline.prepare(
+                        id,
+                        bytes,
+                        baseline.get(&id).copied(),
+                        self.reader.clone(),
+                        admitted - committed,
+                    );
+                }
+                if admitted == stage_end {
+                    batch.take().expect("staged batch").close()?;
+                    // The next rsync may overlap the remaining admitted documents.
+                    continue;
+                }
+            }
+            if committed == admitted
+                && let Some(error) = stage_error.take()
+            {
+                return Err(error);
+            }
+            let id = ordered[committed];
+            if let Some(document) = completed.remove(&id) {
+                self.report.current_rfc = Some(id.get());
+                self.store_document(id, &catalog.entries[&id], before, document?, selected)
+                    .await?;
+                committed += 1;
+                continue;
+            }
+            match pipeline.next().await? {
+                Event::Staged(result) => {
+                    staging = false;
+                    match result {
+                        Ok(staged) => batch = Some(staged),
+                        Err(error) => {
+                            failed = true;
+                            stage_error = Some(error);
+                        }
+                    }
+                }
+                Event::Document(id, result) => {
+                    failed |= result.is_err();
+                    if let Ok(document) = &result {
+                        failed |= matches!(document.verified, VerifiedTxt::Mismatch(_));
+                    }
+                    completed.insert(id, result);
+                }
+            }
+        }
+        self.report.current_rfc = None;
+        Ok(())
     }
 
     async fn baseline(&self) -> Result<BTreeMap<RfcNumber, PriorTxt>> {
@@ -525,36 +628,27 @@ impl Run<'_> {
         id: RfcNumber,
         entry: &xml::Entry,
         catalog: BlobDigest,
-        prior: Option<PriorTxt>,
-        bytes: &[u8],
+        prepared: Box<Prepared>,
         selected: &BTreeSet<RfcNumber>,
     ) -> Result<()> {
+        self.upstream
+            .metrics()
+            .queue_wait(prepared.queued_at.elapsed());
+        let Prepared {
+            bytes,
+            digest,
+            verified,
+            xml,
+            ..
+        } = *prepared;
+        let bytes = bytes.as_slice();
         self.report.accept(bytes.len())?;
-        let digest = BlobDigest::hash(bytes);
-        let mut prior = prior.filter(|prior| prior.digest == digest);
-        if let Some(previous) = prior
-            && let Err(error) = self.reader.open_blob(previous.digest)
-        {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                prior = None;
-            } else {
-                return Err(error.into());
-            }
-        }
         let source = Source::Txt(id);
-        let fresh_txt = if prior.is_some() {
-            None
-        } else {
-            let Download::Captured(capture) = self.upstream.fetch(source).await? else {
-                return Err("required HTTPS TXT is unavailable".into());
-            };
-            if bytes != capture.bytes {
-                self.store
-                    .quarantine_mismatch(bytes, &capture.bytes, source.limit())?;
-                return Err(format!("RFC {} rsync and HTTPS TXT disagree", id.get()).into());
-            }
-            Some(capture)
-        };
+        if let VerifiedTxt::Mismatch(capture) = &verified {
+            self.store
+                .quarantine_mismatch(bytes, &capture.bytes, source.limit())?;
+            return Err(format!("RFC {} rsync and HTTPS TXT disagree", id.get()).into());
+        }
         let mut indexed = {
             let _parse = self.upstream.metrics().span(Stage::Parse);
             let indexed = text::index(bytes)?;
@@ -579,7 +673,7 @@ impl Run<'_> {
             let _database = self.upstream.metrics().span(Stage::Database);
             self.writer.register_blob(durable).await?;
         }
-        let optional = self.rfcxml(id).await?;
+        let optional = self.rfcxml(id, xml).await?;
         let policy = if let Some(notices) = self.registry.pagination_notices(id, digest, bytes)? {
             indexed.notice_state = Coverage::Complete;
             indexed.notices = notices;
@@ -595,10 +689,11 @@ impl Run<'_> {
         };
         let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
-        let txt = match (prior, fresh_txt.as_ref()) {
-            (Some(prior), None) => prior.observation,
-            (None, Some(capture)) => observe(&candidate, source, capture, digest).await?,
-            _ => return Err("missing verified TXT observation".into()),
+        let reused = matches!(verified, VerifiedTxt::Prior(_));
+        let txt = match verified {
+            VerifiedTxt::Prior(observation) => observation,
+            VerifiedTxt::Fresh(capture) => observe(&candidate, source, &capture, digest).await?,
+            VerifiedTxt::Mismatch(_) => unreachable!("mismatches are quarantined before commit"),
         };
         let xml_observation = match &optional.capture {
             Some((capture, digest)) => {
@@ -711,15 +806,15 @@ impl Run<'_> {
         self.report.partial_references += usize::from(all != Coverage::Complete);
         self.report.unclassified_or_incomplete += usize::from(classified != Coverage::Complete);
         candidate.commit().await?;
-        self.report.reused_txt += usize::from(prior.is_some());
+        self.report.reused_txt += usize::from(reused);
         self.report.verified_txt += 1;
         Ok(())
     }
 
-    async fn rfcxml(&mut self, id: RfcNumber) -> Result<OptionalXml> {
+    async fn rfcxml(&mut self, id: RfcNumber, download: Result<Download>) -> Result<OptionalXml> {
         let source = Source::Xml(id);
         let mut result = OptionalXml::default();
-        match self.upstream.fetch(source).await {
+        match download {
             Ok(Download::Captured(capture)) => {
                 self.report.accept(capture.bytes.len())?;
                 let parsed = {

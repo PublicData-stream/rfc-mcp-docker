@@ -94,6 +94,18 @@ impl Metrics {
         record.staged_peak = 1;
     }
 
+    pub(crate) fn admitted(&self, entries: usize, raw_bytes: usize) {
+        let mut record = self.0.lock().unwrap();
+        record.admitted_peak = record.admitted_peak.max(entries as u64);
+        record.raw_reserved_peak = record.raw_reserved_peak.max(raw_bytes as u64);
+    }
+
+    pub(crate) fn queue_wait(&self, elapsed: Duration) {
+        let mut record = self.0.lock().unwrap();
+        record.queue.calls += 1;
+        record.queue.elapsed_us += micros(elapsed);
+    }
+
     pub(crate) fn snapshot(&self, elapsed: Duration) -> Record {
         let mut record = self.0.lock().unwrap().clone();
         record.wall_us = micros(elapsed);
