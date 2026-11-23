@@ -25,6 +25,7 @@ PLATFORMS = {
 INDEX = "application/vnd.oci.image.index.v1+json"
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+STABLE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}")
 
 
 def require(condition, message):
@@ -234,11 +235,12 @@ def registry_options(args, prefix=""):
     return [f"--{prefix}tls-verify=false"] if args.local_registry else []
 
 
-def registry_digest(args, ref, *, allow_missing=False, allow_bootstrap=False):
-    result = subprocess.run(["skopeo", "inspect", "--raw", *registry_options(args), f"docker://{ref}"],
+def registry_manifest(args, ref, *, allow_missing=False, allow_bootstrap=False, anonymous_auth=None):
+    auth = ["--no-creds", "--authfile", str(anonymous_auth)] if anonymous_auth else []
+    result = subprocess.run(["skopeo", "inspect", "--raw", *auth, *registry_options(args), f"docker://{ref}"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode == 0:
-        return sha256(result.stdout)
+        return result.stdout
     error = result.stderr.decode(errors="replace")
     if allow_missing and re.search(r"\b(?:manifest unknown|name unknown)\b", error, re.I):
         return None
@@ -246,6 +248,11 @@ def registry_digest(args, ref, *, allow_missing=False, allow_bootstrap=False):
             and re.search(r"Requesting bearer token: .*\b403 Forbidden\b", error, re.I)):
         return "bootstrap"
     raise ValueError(f"cannot inspect {ref}: {error.strip()}")
+
+
+def registry_digest(args, ref, **options):
+    manifest = registry_manifest(args, ref, **options)
+    return sha256(manifest) if isinstance(manifest, bytes) else manifest
 
 
 def copy_index(args, source, ref):
@@ -279,18 +286,24 @@ def publish(args):
         write_json(args.receipt, {**identity(args), "images": images})
 
 
-def verify_anonymous(args):
+def publication_images(args):
     receipt = json.loads(args.receipt.read_bytes())
     require(all(receipt.get(key) == value for key, value in identity(args).items())
             and set(receipt["images"]) == set(ROLES), "invalid publication receipt")
+    for role, entry in receipt["images"].items():
+        require(entry["image"] == f"{args.registry}/rfc-mcp-docker-{role}"
+                and DIGEST.fullmatch(entry["index"]) and set(entry["platforms"]) == set(PLATFORMS),
+                f"invalid publication receipt entry for {role}")
+    return receipt["images"]
+
+
+def verify_anonymous(args):
+    images = publication_images(args)
     with tempfile.TemporaryDirectory(prefix="rfc-release-anonymous-", dir="/tmp") as temporary:
         directory = Path(temporary)
         auth = directory / "auth.json"
         auth.write_text("{}\n")
-        for role, entry in receipt["images"].items():
-            require(entry["image"] == f"{args.registry}/rfc-mcp-docker-{role}"
-                    and DIGEST.fullmatch(entry["index"]) and set(entry["platforms"]) == set(PLATFORMS),
-                    f"invalid publication receipt entry for {role}")
+        for role, entry in images.items():
             ref = f"{entry['image']}:{args.version}"
             local = directory / role
             try:
@@ -312,6 +325,53 @@ def verify_anonymous(args):
             print(f"Verified anonymous pull of {ref}@{entry['index']}")
 
 
+def stable_version(value, message):
+    require(isinstance(value, str) and len(value) <= 128 and STABLE.fullmatch(value), message)
+    return tuple(map(int, value.split(".")))
+
+
+def promote_latest(args):
+    version = stable_version(args.version, "latest promotion requires a stable release")
+    images = publication_images(args)
+    updates = {}
+    newer = []
+    for entry in images.values():
+        image, digest = entry["image"], entry["index"]
+        tagged = f"{image}:{args.version}"
+        require(registry_digest(args, tagged) == digest, f"registry index mismatch for {tagged}")
+        alias = f"{image}:latest"
+        current = registry_manifest(args, alias, allow_missing=True)
+        if current is None:
+            updates[alias] = f"{image}@{digest}"
+            continue
+        index = json.loads(current)
+        require(isinstance(index, dict) and index.get("mediaType") == INDEX
+                and isinstance(index.get("annotations"), dict), f"invalid OCI index or annotations for {alias}")
+        current_label = index["annotations"].get("org.opencontainers.image.version")
+        current_version = stable_version(current_label, f"invalid stable version annotation for {alias}")
+        if current_version > version:
+            newer.append(f"{alias} ({current_label})")
+        elif current_version < version:
+            updates[alias] = f"{image}@{digest}"
+        else:
+            require(sha256(current) == digest, f"conflicting digest for {alias} at {args.version}")
+    if newer:
+        print(f"Skipped latest promotion for {args.version}. Higher versions already present: {', '.join(newer)}")
+        return
+
+    for alias, source in updates.items():
+        run("skopeo", "copy", "--all", "--preserve-digests", *registry_options(args, "src-"),
+            *registry_options(args, "dest-"), f"docker://{source}", f"docker://{alias}")
+    with tempfile.TemporaryDirectory(prefix="rfc-release-latest-", dir="/tmp") as temporary:
+        auth = Path(temporary) / "auth.json"
+        auth.write_text("{}\n")
+        for entry in images.values():
+            alias = f"{entry['image']}:latest"
+            require(registry_digest(args, alias, anonymous_auth=auth) == entry["index"],
+                    f"anonymous index mismatch for {alias}")
+            print(f"Verified anonymous index {alias}@{entry['index']}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
@@ -323,7 +383,7 @@ def main():
     builder.add_argument("--kind", choices=("build", "beta", "stable"), required=True)
     builder.add_argument("--artifacts", type=Path, required=True)
     builder.add_argument("--evidence", type=Path, required=True)
-    for command in ("publish", "verify-anonymous"):
+    for command in ("publish", "verify-anonymous", "promote-latest"):
         registry = commands.add_parser(command)
         registry.add_argument("--local-registry", help="use a disposable loopback registry instead of GHCR")
         registry.add_argument("--receipt", type=Path, required=True)
@@ -341,6 +401,8 @@ def main():
     args.registry = args.local_registry or "ghcr.io/publicdata-stream"
     if args.command == "publish":
         publish(args)
+    elif args.command == "promote-latest":
+        promote_latest(args)
     else:
         verify_anonymous(args)
 
