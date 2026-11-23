@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from random import SystemRandom
 import secrets
+import select
 import subprocess
 import sys
 import tempfile
@@ -169,12 +170,48 @@ def trigger(project, epoch, payload):
     return request(project, "/internal/v1/sync-requested", epoch, body)
 
 
-def assert_ack(project, signed):
+def assert_ack(project, signed, event_id, *, retry_busy=False):
     wire, expected = signed
     status, headers, body = project.send(wire)
-    assert status == 200, status
+    if status == 503 and retry_busy:
+        return False
+    assert status == 200, (event_id, status)
     assert headers["x-rfc-response-signature"] == response_mac(*expected, body)
-    assert json.loads(body)["outcome"] == "accepted"
+    ack = json.loads(body)
+    assert ack["event_id"] == event_id
+    assert ack["outcome"] == "accepted"
+    return True
+
+
+def assert_queue_busy(project, accept_event):
+    with subprocess.Popen(project.psql(), env=project.env, text=True,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE) as holder:
+        try:
+            holder.stdin.write("SET statement_timeout = '5s';\n"
+                               "SET idle_session_timeout = '25s';\n"
+                               "SELECT true FROM pg_advisory_lock(-4::bigint);\n")
+            holder.stdin.flush()
+            assert select.select([holder.stdout], [], [], 6)[0], "queue lock timed out"
+            assert holder.stdout.readline().strip() == "t", "queue lock was not acquired"
+            assert not accept_event(), "expected HTTP 503 while the queue is locked"
+        finally:
+            holder.stdin.close()
+            try:
+                holder.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=6)
+                raise
+        assert holder.returncode == 0, holder.returncode
+
+
+def recover_event(project, epoch, payload, *, force_queue_busy):
+    def accept_event():
+        return assert_ack(project, trigger(project, epoch, payload), payload["event_id"], retry_busy=True)
+
+    if force_queue_busy:
+        assert_queue_busy(project, accept_event)
+    wait(accept_event, seconds=15)
 
 
 def feed_data(project, ids):
@@ -311,9 +348,9 @@ def exercise(project):
         assert project.publication() == 0
         wire_checks(project, epoch)
         payload = event("repeat")
-        assert_ack(project, trigger(project, epoch, payload))
+        assert_ack(project, trigger(project, epoch, payload), payload["event_id"])
         payload["observed_at"] -= 1
-        assert_ack(project, trigger(project, epoch, payload))
+        assert_ack(project, trigger(project, epoch, payload), payload["event_id"])
         conflicting = {**payload, "observation_digest": payload["observation_digest"][:-2] + "00"}
         if conflicting["observation_digest"] == payload["observation_digest"]:
             conflicting["observation_digest"] = payload["observation_digest"][:-2] + "01"
@@ -399,14 +436,19 @@ def exercise(project):
             assert status in (0, 503), (boundary, status)
             return signed if project.crashed(boundary) else None
         signed = wait(trigger_crash)
-        stmt = f"SELECT count(*) FROM rfc.control_events WHERE id = '{payload['event_id']}'"
-        assert project.sql(stmt) == str(int(persisted))
+        stmt = f"SELECT count(*), min(job_id) FROM rfc.control_events WHERE id = '{payload['event_id']}'"
+        count, original_job = project.sql(stmt).split("|")
+        assert (count, original_job.isdecimal()) == (str(int(persisted)), persisted)
         project.restart_sync()
         new_epoch = identity(project)
         assert new_epoch != epoch
         assert project.send(signed[0])[0] == 409
-        assert_ack(project, trigger(project, new_epoch, payload))
-        assert project.sql(stmt) == "1"
+        recover_event(project, new_epoch, payload, force_queue_busy=persisted)
+        count, job = project.sql(stmt).split("|")
+        assert count == "1" and job.isdecimal(), (boundary, count, job)
+        if persisted:
+            assert job == original_job, (job, original_job)
+            print("forced queue contention returned HTTP 503 and retry preserved the committed event's job", flush=True)
     wait(lambda: project.sql("SELECT count(*) FROM rfc.sync_jobs WHERE state IN ('pending','running')") == "0")
 
     for boundary in ("before_publication_commit", "after_publication_commit"):
