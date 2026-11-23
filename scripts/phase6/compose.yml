@@ -1,0 +1,86 @@
+services:
+  serve:
+    stop_grace_period: 1s
+    environment:
+      RFC_MCP_BIND: ${PHASE6_NET}.18:8780
+      RFC_SERVE_NOTIFY_BIND: ${PHASE6_NET}.34:8782
+      RFC_SYNC_SERVE_KEY_ID: fixture-notify
+      RFC_SYNC_SERVE_KEY_FILE: /run/secrets/rfc_notify
+    volumes:
+      - ${PHASE6_DIR}/notify-serve:/run/secrets/rfc_notify:ro
+    networks:
+      phase5_ingress: {ipv4_address: "${PHASE6_NET}.18"}
+      sync_notify: {ipv4_address: "${PHASE6_NET}.34"}
+  sync:
+    stop_grace_period: 1s
+    entrypoint: [/phase6/sync]
+    environment:
+      RFC_PHASE6_FIXTURES: "1"
+      RFC_PHASE6_HOURLY_SECS: ${PHASE6_HOURLY:-3600}
+      RFC_PHASE6_DAILY_SECS: ${PHASE6_DAILY:-3600}
+      RFC_PHASE3_CRASH: ${PHASE6_CRASH:-}
+      RFC_SYNC_CONTROL_BIND: ${PHASE6_NET}.2:8783
+      RFC_SYNC_SERVE_ADDR: ${PHASE6_NOTIFY_TARGET}
+      RFC_SYNC_SERVE_KEY_ID: fixture-notify
+      RFC_SYNC_SERVE_KEY_FILE: /run/secrets/rfc_notify
+      RFC_FEED_SYNC_KEY_ID: fixture-feed
+      RFC_FEED_SYNC_KEY_FILE: /run/secrets/rfc_feed
+    volumes:
+      - ${PHASE6_DIR}/sync:/phase6/sync:ro
+      - ${PHASE6_DIR}/notify-sync:/run/secrets/rfc_notify:ro
+      - ${PHASE6_DIR}/feed-sync:/run/secrets/rfc_feed:ro
+    networks:
+      feed_control: {ipv4_address: "${PHASE6_NET}.2"}
+      sync_notify: {ipv4_address: "${PHASE6_NET}.36"}
+  feed:
+    stop_grace_period: 1s
+    entrypoint: [/phase6/feed]
+    environment:
+      RFC_PHASE6_FIXTURES: "1"
+      RFC_FEED_FORMAT: ${PHASE6_FORMAT:-atom}
+      RFC_FEED_SYNC_ADDR: ${PHASE6_NET}.2:8783
+      RFC_FEED_SYNC_KEY_ID: fixture-feed
+      RFC_FEED_SYNC_KEY_FILE: /run/secrets/rfc_feed
+    volumes:
+      - ${PHASE6_DIR}/feed:/phase6/feed:ro
+      - ${PHASE6_DIR}/feed-feed:/run/secrets/rfc_feed:ro
+      - ${PHASE1_DIR}/certs/ca.crt:/phase2/ca.crt:ro
+    networks:
+      feed_control: {ipv4_address: "${PHASE6_NET}.3"}
+      fixture_source: {}
+  proxy:
+    stop_grace_period: 1s
+    networks:
+      phase5_ingress: {ipv4_address: "${PHASE6_NET}.19"}
+  fixtures:
+    stop_grace_period: 1s
+    volumes:
+      - ${PHASE6_SCRIPTS}:/phase6-tests:ro
+    entrypoint: [python3, -B, /phase6-tests/upstream.py]
+  control-probe:
+    stop_grace_period: 1s
+    image: ${PHASE1_IMAGE_PREFIX}-fixtures
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    entrypoint: [python3, -B, /phase6-tests/probe.py, spoof]
+    volumes:
+      - ${PHASE6_SCRIPTS}:/phase6-tests:ro
+      - ${PHASE6_DIR}/notify-probe:/run/secrets/fixture:ro
+      - ${PHASE6_DIR}/spoof-mode:/fixture-spoof-mode:ro
+    networks:
+      feed_control: {ipv4_address: "${PHASE6_NET}.4"}
+      sync_notify: {ipv4_address: "${PHASE6_NET}.35"}
+
+networks:
+  feed_control:
+    ipam:
+      config: [{subnet: "${PHASE6_NET}.0/28"}]
+  phase5_ingress:
+    ipam:
+      config: [{subnet: "${PHASE6_NET}.16/28"}]
+  sync_notify:
+    internal: true
+    ipam:
+      config: [{subnet: "${PHASE6_NET}.32/28"}]

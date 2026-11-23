@@ -95,3 +95,16 @@ COPY --from=phase3-build /out/rfc-phase3-fixture /rfc-phase3-fixture
 
 FROM runtime AS phase4-fixture
 COPY --from=phase4-build /out/rfc-phase4-fixture /rfc-phase4-fixture
+
+# Phase 6 exercises daemon entrypoints with synthetic upstreams and crash hooks.
+FROM build AS phase6-build
+RUN --network=none \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/tmp/rust/target,sharing=locked \
+    cargo build --release --bin rfc-mcp-docker-sync --bin rfc-mcp-docker-feed \
+        --features rfc-mcp-docker/phase6-fixtures,rfc-mcp-docker-sync/phase6-fixtures --frozen \
+    && cp /tmp/rust/target/release/rfc-mcp-docker-sync /out/rfc-phase6-sync \
+    && cp /tmp/rust/target/release/rfc-mcp-docker-feed /out/rfc-phase6-feed
+
+FROM runtime AS phase6-fixture
+COPY --from=phase6-build /out/rfc-phase6-sync /out/rfc-phase6-feed /

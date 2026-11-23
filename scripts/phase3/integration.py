@@ -122,7 +122,7 @@ def upgrade(project):
     project.check("sync", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6"
     assert project.sql(f"SELECT state,manifest_format,encode(manifest_bytes,'hex') FROM rfc.generations WHERE id={old}") == "ready|1|0123"
     project.activate(old, 0, error="not eligible")
 
@@ -202,17 +202,44 @@ def check_reader_gc(project, first, old_digest, shared_digest):
 
     with paused(project, "sync", "retirement_locked", "gc") as collector:
         project.invoke("sync", "full", error="another synchronization holds the corpus lock")
-        reader = subprocess.Popen(project.operation("serve", "read", first), env=project.env,
-                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            wait_for_sql(project, f"SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid={first} AND NOT granted", "1")
-            stdout, stderr = release(collector)
-            assert collector.returncode == 0 and json.loads(stdout)["retired_generations"] == 1, stderr
-            stdout, stderr = reader.communicate(timeout=20)
-            assert reader.returncode != 0 and "GenerationUnavailable" in stderr and "worker read" not in stderr, stderr
-        finally:
-            if reader.poll() is None:
-                reader.communicate(timeout=20)
+        # Warm one psql connection before starting a disposable reader. Poll
+        # inside PostgreSQL so container startup does not hide the lock wait.
+        with subprocess.Popen(project.psql(), env=project.env, text=True, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as observer:
+            observer.stdin.write("\\echo ready\n")
+            observer.stdin.flush()
+            assert select.select([observer.stdout], [], [], 15)[0], "lock observer did not start"
+            assert observer.stdout.readline().strip() == "ready"
+            reader = subprocess.Popen(project.operation("serve", "read", first), env=project.env,
+                                      text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                watch = f"""
+DO $observer$
+DECLARE deadline timestamptz := clock_timestamp() + interval '20 seconds';
+BEGIN
+  LOOP
+    IF EXISTS (SELECT FROM pg_locks WHERE locktype = 'advisory' AND objid = {first} AND NOT granted) THEN
+      RETURN;
+    END IF;
+    IF clock_timestamp() >= deadline THEN
+      RAISE EXCEPTION 'waiting reader never acquired a place in the advisory lock queue';
+    END IF;
+    PERFORM pg_sleep(0.025);
+  END LOOP;
+END
+$observer$;
+"""
+                _, observer_error = observer.communicate(watch, timeout=24)
+                assert observer.returncode == 0, observer_error
+                stdout, stderr = release(collector)
+                assert collector.returncode == 0 and json.loads(stdout)["retired_generations"] == 1, stderr
+                stdout, stderr = reader.communicate(timeout=20)
+                assert reader.returncode != 0 and "GenerationUnavailable" in stderr and "worker read" not in stderr, stderr
+            finally:
+                if collector.poll() is None:
+                    release(collector)
+                if reader.poll() is None:
+                    reader.communicate(timeout=20)
     assert project.state(first) == "deleted"
     assert not first_path.exists()
     assert shared.stat().st_ino == shared_inode

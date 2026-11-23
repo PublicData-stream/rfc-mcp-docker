@@ -122,7 +122,7 @@ def upgrade(project):
     project.check("serve", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6"
     assert project.sql(row) == before
     project.denied_sql("DELETE FROM rfc.generation_documents", phase1.SERVE)
 
