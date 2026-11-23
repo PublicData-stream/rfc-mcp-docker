@@ -376,7 +376,7 @@ def rg_tests(client):
     assert hit["match_range"] == [start, start + 9]
     bom = client.call("rg", pattern="^\ufeff", ids=[108])[0]["matches"][0]
     assert bom["match_range"] == [0, 3]
-    zero = client.call("rg", pattern="^", ids=[108])[0]
+    zero = client.call("rg", pattern="^", ids=[108], limit=100)[0]
     line_starts = [0] + [i + 1 for i, byte in enumerate(RG_ORIGINAL[:-1]) if byte == 10]
     assert [hit["match_range"] for hit in zero["matches"]] == [[start, start] for start in line_starts]
     client.call("rg", pattern="[", ids=[108], _error="invalid_regex")

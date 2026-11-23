@@ -1,0 +1,33 @@
+# The production Compose file supplies the whole runtime profile. Keep test
+# upstream networks isolated and add only the disposable TLS proxy and fixture.
+services:
+  rfc-mcp-docker-serve:
+    volumes:
+      - "${PHASE7_DIR}/sandbox-secret:/phase0/secret.txt:ro"
+      - "${PHASE7_DIR}/sandbox-secret:/phase0/metadata:ro"
+      - "${PHASE7_DIR}/sandbox-secret:/phase0/staging:ro"
+      - "${PHASE7_DIR}/sandbox-secret:/phase0/retired:ro"
+  test-proxy:
+    image: ${PHASE7_IMAGE_PREFIX}-fixtures
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    environment:
+      RFC_TEST_UPSTREAM: rfc-mcp-docker-serve
+    entrypoint: [python3, -B, /phase5/proxy.py]
+    volumes:
+      - "${PHASE7_PHASE5}:/phase5:ro"
+      - "${PHASE7_SCRIPTS}:/phase7:ro"
+      - "${PHASE7_DIR}/tls:/tls:ro"
+    ports:
+      - target: 8443
+        host_ip: 127.0.0.1
+    networks:
+      public_ingress: {ipv4_address: "${RFC_INGRESS_PROXY_IP}"}
+      test_edge: {gw_priority: 1}
+
+networks:
+  sync_egress: {internal: true}
+  feed_egress: {internal: true}
+  test_edge: {}

@@ -1,0 +1,7 @@
+# Keep the two CIDRs in sync with RFC_DB_READ_SUBNET and RFC_DB_WRITE_SUBNET.
+local   all  postgres                    peer
+local   all  all                         reject
+hostssl rfc  rfc_serve  172.30.70.16/28   scram-sha-256
+hostssl rfc  rfc_sync   172.30.70.32/28   scram-sha-256
+host    all  all       0.0.0.0/0         reject
+host    all  all       ::/0              reject

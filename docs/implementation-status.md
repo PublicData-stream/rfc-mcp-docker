@@ -229,7 +229,7 @@ done
 - The gate exercised rate limits for trusted and untrusted peers and the 16-request admission limit. PostgreSQL denied writes under the serving role, serve could not write to the mirror, and sync and feed lacked the cursor key. Fresh reads saw the committed pointer without a notification, while continuations stayed pinned across promotion and rollback and failed after retirement.
 - Early fixture runs exposed a disposable CA missing its key-usage extension, a NUL in the binary fixture, and an incorrect assumption about the original headings fixture's coverage. The private suite now uses a strict TLS chain, an ingestible non-UTF-8 fixture, and an explicit orphan-section fixture. The disconnect probe also found a blocked PostgreSQL backend still present at the end of the observation window. With connection-loss checks enabled for serve, the private gate observed the blocked session cleared within 78 ms of disconnect. A separate lock deadline returned `deadline_exceeded` and left zero reader sessions. [PostgreSQL TCP settings](https://www.postgresql.org/docs/19/runtime-config-connection.html#GUC-CLIENT-CONNECTION-CHECK-INTERVAL)
 
-Official RFCs require digest-scoped review receipts before enabling whole-document pagination. `rg` returns `sandbox_unavailable` pending the Phase 7 worker gate. Hosted CI, a live corpus, and public deployment have separate acceptance gates.
+Official RFCs require digest-scoped review receipts before enabling whole-document pagination. The Phase 5 implementation returned `sandbox_unavailable` for `rg`. Hosted CI, a live corpus, and public deployment have separate acceptance gates.
 
 ## Phase 6
 
@@ -248,3 +248,41 @@ Official RFCs require digest-scoped review receipts before enabling whole-docume
 - **Authentication and isolation (A27–A30).** Independent request and response golden vectors matched. Checks covered original-body and whitespace mutations, method, path and header rejection, clock skew, expired previous keys, old epochs, and replay-cache exhaustion. A forged identity response prevented command delivery, and forged acknowledgments left the outbox pending. The same rows cleared after a genuine signed acknowledgment. Compose checked per-service key mounts, read-only mirror access, denied database mutations, and ingress isolation after recreation.
 - **Polling and upgrade.** Schema 6 upgraded a schema 5 database, preserved the existing job row, and reapplied cleanly. Atom and RSS each returned 304 after the client supplied validators. Repeated and reordered entries and a format switch produced the same logical IDs. Malformed and oversized feeds produced no events. Successive requests after HTTP 429 honored the fixture's four-second retry interval.
 - Early runs exposed a missing JSON lock-error report in the refactored manual command and fixture issues involving Compose subnet overlap, container startup timing, and transient queue contention. The final run kept the original CLI report, selected an unused private subnet, and retried test submissions with fresh nonces. The runtime database permissions and lock deadlines remained in effect.
+
+## Phase 7
+
+**Verified locally on rootless Linux amd64 on 2026-11-23.** Runtime changes are in `ccd01c2` and `932df99`. The qualification used Rust 1.99.1, Docker Engine 29.10.0, Compose 5.8.0, Linux 7.0.0-44-generic, cgroup v2, and Landlock ABI 8. Cargo used `/tmp/rust/target`. Disposable originals, secrets, certificates, and volume backing directories used `/tmp`. [Operator configuration and verification](deployment.md)
+
+| Image | Local image ID |
+|---|---|
+| Serve | `sha256:f61136884b17e10562be086859c9683f549b951b51899f8eff892d693acee37d` |
+| Sync | `sha256:276f1a60df9501fdc0be8c671450bce527a2b43d7d0e667ffd3b8a7d7579bdb8` |
+| Feed | `sha256:8581b1df79302eb5f26a26d5f173965134e94381b0c8f102a86c1320c935a269` |
+| PostgreSQL 19.0 Alpine | `sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188` |
+
+### Commands
+
+```sh
+export CARGO_TARGET_DIR=/tmp/rust/target TMPDIR=/tmp
+cargo fetch --locked
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+actionlint .github/workflows/ci.yml
+docker compose --env-file deploy/compose.env.example config --quiet
+python3 -B scripts/phase0/integration.py --project rfc-phase7-qualified
+for phase in 1 2 3 4 5 6 7; do
+    python3 -B "scripts/phase$phase/integration.py" --image-prefix rfc-phase7-qualified
+done
+```
+
+### Observations
+
+- The locked Rust checks, full-feature Clippy and tests, workflow lint, Compose configuration check, and Phase 0 Docker probe passed. The built ripgrep reported 15.2.0 and `-pcre2`. Phase 0 verified the pinned Streamable HTTP protocol, TLS and separate database grants, and Landlock and seccomp enforcement in the rebuilt image.
+- The Phase 1–6 regression suites passed on the qualified images. They covered storage and restore, original-byte ingestion, publication and recovery, the pinned search DSL, MCP reads, and authenticated control and feed behavior.
+- Phase 5 exercised all five tools through a local HTTPS proxy. Ripgrep returned original byte ranges and notices for reviewed synthetic RFCs, rejected invalid and PCRE2-only regex syntax, treated option-like patterns as data, and handled BOMs, CRLF, Unicode, repeated and zero-width matches. Dense output reached the frame limit and returned explicit partial coverage or a typed resource error. Signed continuations stayed pinned across publication and rollback and became unavailable after generation retirement.
+- The production profile initialized an empty PostgreSQL 19.0 cluster at `/var/lib/postgresql/19/docker`, applied schema 6 through the local peer socket, and restored a synthetic generation. It verified the runtime UIDs, file permissions and service secret mounts, effective cgroup limits, serve’s read-only mirror, feed’s isolation from PostgreSQL, and ingress reachability before and after recreation.
+- The production sandbox probe denied the mounted test secret, metadata, staging and retired fixture paths, parent process credentials, writes, new TCP and Unix sockets, and inherited sockets. It enforced the address-space and CPU limits and preserved raw binary offsets. A disposable blocking executable exercised the production supervisor. Two occupied slots rejected a third call. Disconnect and wall deadlines killed and reaped workers and released the mirror fences. The canceled database reader closed. A simulated Landlock refusal disabled `rg` and returned HTTP 503 from readiness while the other read tools remained usable.
+- Early fixture runs exposed a BOM placement that prevented the existing notice parser from recognizing authorship and a zero-width assertion that used a page smaller than the expected match count. The passing checks use a separate BOM line and an explicit page limit. A concurrent edit to the test overlay interrupted one teardown. The exact disposable project was cleaned up and the complete gate was rerun.
+
+The gate used synthetic sources and a disposable localhost HTTPS proxy. Live corpus reconciliation, other host profiles, hosted CI, registry publication, and public deployment have separate acceptance gates.

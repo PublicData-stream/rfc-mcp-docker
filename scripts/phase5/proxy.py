@@ -3,6 +3,7 @@
 
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 import ssl
 
 
@@ -19,7 +20,7 @@ class Proxy(BaseHTTPRequestHandler):
         headers = {key: value for key, value in self.headers.items() if key.lower() in allow}
         headers["X-Real-IP"] = self.client_address[0]
         headers["Connection"] = "close"
-        upstream = http.client.HTTPConnection("serve", 8780, timeout=17)
+        upstream = http.client.HTTPConnection(os.getenv("RFC_TEST_UPSTREAM", "serve"), 8780, timeout=17)
         try:
             upstream.request(self.command, self.path, self.rfile.read(size) if size else None, headers)
             response = upstream.getresponse()
