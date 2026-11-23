@@ -2,10 +2,12 @@
 """Exercise source verification and candidate indexing in disposable Compose projects."""
 
 import argparse
+from contextlib import ExitStack
 import importlib.util
 import json
 from pathlib import Path
 import re
+from statistics import median
 import subprocess
 import sys
 import tempfile
@@ -34,14 +36,15 @@ class Project(phase1.Project):
         insertion = len(self.docker) + 3
         return [*command[:insertion], "-f", str(self.overlay), *command[insertion:]]
 
-    def reconcile_command(self, live, scope):
+    def reconcile_command(self, live, scope, settings=()):
         if live:
             return self.app("sync", args=("--phase2-reconcile", f"--{scope}"))
-        return self.app("sync", "--entrypoint", "/phase2/fixture-driver", args=(scope,))
+        options = [part for setting in settings for part in ("-e", setting)]
+        return self.app("sync", *options, "--entrypoint", "/phase2/fixture-driver", args=(scope,))
 
-    def reconcile(self, scope="full", expected=None, live=False):
-        result = subprocess.run(self.reconcile_command(live, scope), env=self.env,
-                                text=True, capture_output=True, timeout=180)
+    def reconcile(self, scope="full", expected=None, live=False, settings=(), timeout=180):
+        result = subprocess.run(self.reconcile_command(live, scope, settings), env=self.env,
+                                text=True, capture_output=True, timeout=timeout)
         if not result.stdout.strip():
             raise AssertionError(f"no ingestion report: {result.stderr}")
         report = json.loads(result.stdout.strip().splitlines()[-1])
@@ -375,6 +378,53 @@ def fixture_driver(docker, prefix, target):
     target.chmod(0o755)
 
 
+def prepare_benchmark(project, size):
+    sources = prepare(project, include_nul=True)
+    catalog = project.source / "catalog.xml"
+    entries = []
+    for rfc in range(10000, 10000 + size - len(sources)):
+        prefix = f"1. Synthetic RFC {rfc}\n\n".encode()
+        payload = prefix + b"   Repeated text for indexing.\n" * (8192 if rfc % 9 == 0 else 128)
+        for directory in ("https", "rsync"):
+            (project.source / directory / f"rfc{rfc}.txt").write_bytes(payload)
+        if rfc % 3 == 0:
+            (project.source / "https" / f"rfc{rfc}.xml").write_bytes(
+                f'<rfc number="{rfc}"><middle/></rfc>'.encode()
+            )
+        entries.append(catalog_entry(rfc, f"Benchmark {rfc}"))
+    catalog.write_text(catalog.read_text().replace("</rfc-index>", "".join(entries) + "</rfc-index>"))
+    (project.source / "mode").write_text("benchmark")
+
+
+def benchmark(args, docker, work, driver):
+    settings = ["RFC_PHASE2_FIXED_CLOCK=1", f"RFC_SYNC_HTTP_CONCURRENCY={args.http_concurrency}"]
+    if not args.unpaced:
+        settings.append("RFC_PHASE2_PACED=1")
+    runs = []
+    for size in args.benchmark:
+        for repeat in range(args.repeats):
+            with ExitStack() as cleanup:
+                project = Project(work / f"{work.name}-{size}-{repeat}", driver, args.image_prefix, docker, False)
+                cleanup.callback(project.close)
+                prepare_benchmark(project, size)
+                project.start()
+                project.migrate()
+                project.run("up", "-d", "--wait", "fixtures", timeout=35)
+                report = project.reconcile(settings=settings, timeout=max(180, 5 * size))
+                assert report["verified_txt"] == size and report["reused_txt"] == 0
+                assert report["metrics"]["https_requests"] == 2 * size + 2
+                project.verify_manifest(report)
+                runs.append({"size": size, "repeat": repeat, **report})
+    receipt = {"image_prefix": args.image_prefix, "paced": not args.unpaced,
+               "configured_https_concurrency": args.http_concurrency, "runs": runs,
+               "median_wall_us": {size: median(run["metrics"]["wall_us"] for run in runs if run["size"] == size)
+                                  for size in args.benchmark}}
+    if args.receipt:
+        args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")
+    print(json.dumps(receipt, sort_keys=True), flush=True)
+
+
+
 def main():
     if not __debug__:
         raise RuntimeError("Phase 2 requires enabled assertions")
@@ -382,7 +432,14 @@ def main():
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", default="rfc-phase2-regression")
     parser.add_argument("--live", action="store_true")
+    parser.add_argument("--benchmark", type=int, choices=(6, 96), nargs="+")
+    parser.add_argument("--repeats", type=int, choices=range(1, 6), default=3)
+    parser.add_argument("--http-concurrency", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--unpaced", action="store_true")
+    parser.add_argument("--receipt", type=Path)
     args = parser.parse_args()
+    if args.live and args.benchmark:
+        parser.error("the benchmark requires private fixtures")
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-phase2-", dir="/tmp") as root:
         work = Path(root)
@@ -391,6 +448,9 @@ def main():
             driver.touch()
         else:
             fixture_driver(docker, args.image_prefix, driver)
+        if args.benchmark:
+            benchmark(args, docker, work, driver)
+            return 0
         project = Project(work / f"{work.name}-candidate", driver, args.image_prefix, docker, args.live)
         try:
             if args.live:

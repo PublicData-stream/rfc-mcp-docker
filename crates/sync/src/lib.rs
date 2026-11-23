@@ -11,6 +11,7 @@ use tokio_postgres::{Client, Transaction};
 
 mod daemon;
 mod ingest;
+mod metrics;
 mod policy;
 mod publication;
 mod recovery;

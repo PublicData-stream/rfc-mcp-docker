@@ -1,5 +1,6 @@
 //! Fixed upstream destinations and bounded, private transfers.
 
+use crate::metrics::{Metrics, Stage};
 use reqwest::{Client, StatusCode, header};
 use rfc_core::RfcNumber;
 use rfc_storage::{blob::BlobWriter, postgres::Result};
@@ -85,6 +86,9 @@ pub(crate) struct Upstream {
     https_origin: &'static str,
     rsync_module: &'static str,
     paced: bool,
+    metrics: Metrics,
+    #[cfg(feature = "phase2-fixtures")]
+    fixture_clock: Option<i64>,
     next_request: time::Instant,
 }
 
@@ -95,13 +99,18 @@ impl Upstream {
 
     #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn fixture() -> Result<Self> {
-        Self::new(
+        let mut upstream = Self::new(
             "https://fixtures:8443",
             "rsync://fixtures:8873/rfc/",
             Some(reqwest::Certificate::from_pem(&std::fs::read(
                 "/phase2/ca.crt",
             )?)?),
-        )
+        )?;
+        upstream.paced = std::env::var("RFC_PHASE2_PACED").as_deref() == Ok("1");
+        if std::env::var("RFC_PHASE2_FIXED_CLOCK").as_deref() == Ok("1") {
+            upstream.fixture_clock = Some(1_790_000_000_000_000);
+        }
+        Ok(upstream)
     }
 
     fn new(
@@ -128,16 +137,31 @@ impl Upstream {
             https_origin,
             rsync_module,
             paced,
+            metrics: Metrics::default(),
+            #[cfg(feature = "phase2-fixtures")]
+            fixture_clock: None,
             next_request: time::Instant::now(),
         })
+    }
+
+    pub(crate) fn metrics(&self) -> Metrics {
+        self.metrics.clone()
     }
 
     pub(crate) async fn fetch(&mut self, source: Source) -> Result<Download> {
         if self.paced {
             time::sleep_until(self.next_request).await;
+        }
+        let _http = self.metrics.http_start(match source {
+            Source::Catalog => Stage::Catalog,
+            Source::Txt(_) => Stage::Txt,
+            Source::Xml(_) => Stage::Xml,
+        });
+        if self.paced {
             self.next_request = time::Instant::now() + Duration::from_secs(1);
         }
-        let observed_us = now_us()?;
+        let clock = self.capture_clock(source);
+        let observed_us = clock.map_or_else(now_us, Ok)?;
         let mut response = self
             .http
             .get(format!("{}{}", self.https_origin, source.path()))
@@ -186,6 +210,7 @@ impl Upstream {
             if chunk.len() > limit - bytes.len() {
                 return Err("HTTPS transfer exceeds byte limit".into());
             }
+            self.metrics.received(chunk.len());
             bytes.extend_from_slice(&chunk);
         }
         if bytes.is_empty() {
@@ -194,13 +219,29 @@ impl Upstream {
         Ok(Download::Captured(Capture {
             bytes,
             observed_us,
-            fetched_us: now_us()?,
+            fetched_us: clock.map_or_else(now_us, |us| Ok(us + 1))?,
             etag,
             last_modified,
         }))
     }
 
+    fn capture_clock(&mut self, _source: Source) -> Option<i64> {
+        #[cfg(feature = "phase2-fixtures")]
+        if let Some(base) = self.fixture_clock.as_mut() {
+            return Some(match _source {
+                Source::Catalog => {
+                    *base += 1;
+                    *base
+                }
+                Source::Txt(id) => 1_790_000_010_000_000 + i64::from(id.get()),
+                Source::Xml(id) => 1_790_000_020_000_000 + i64::from(id.get()),
+            });
+        }
+        None
+    }
+
     pub(crate) async fn stage(&self, ids: &[RfcNumber]) -> Result<RsyncBatch> {
+        let _timing = self.metrics.span(Stage::Rsync);
         if ids.is_empty() || ids.len() > BATCH {
             return Err("rsync batch count exceeds bounds".into());
         }
@@ -264,6 +305,7 @@ impl Upstream {
             return Err(format!("rsync batch failed ({status})").into());
         }
         let mut seen = BTreeSet::new();
+        let mut staged_bytes = 0;
         for entry in std::fs::read_dir(&incoming)? {
             let entry = entry?;
             let name = entry
@@ -273,6 +315,7 @@ impl Upstream {
             if !names.contains(&name) || !entry.file_type()?.is_file() {
                 return Err("unexpected or non-regular rsync input".into());
             }
+            staged_bytes += entry.metadata()?.len();
             seen.insert(name);
         }
         if let Some(missing) = names.difference(&seen).next() {
@@ -281,6 +324,7 @@ impl Upstream {
         if !status.success() {
             return Err(format!("rsync batch failed ({status})").into());
         }
+        self.metrics.staged(staged_bytes);
         Ok(RsyncBatch {
             _temp: temp,
             incoming,

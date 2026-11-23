@@ -8,6 +8,7 @@ import socketserver
 import ssl
 import subprocess
 import threading
+import time
 
 ROOT = Path("/fixture-source")
 
@@ -31,6 +32,11 @@ class Https(BaseHTTPRequestHandler):
 
     def do_GET(self):
         scenario = mode()
+        if scenario == "benchmark":
+            # Alternate long and short responses so ordering and overlap matter.
+            longer = self.path.endswith((".xml", "0.txt", "2.txt", "4.txt", "6.txt", "8.txt"))
+            time.sleep(1.20 if longer else 0.10)
+
         if self.path == "/rfc-index.xml":
             if scenario != "catalog-drift":
                 type(self).drift_captures = 0
@@ -84,6 +90,8 @@ class Https(BaseHTTPRequestHandler):
 
 class Rsync(socketserver.BaseRequestHandler):
     def handle(self):
+        if mode() == "benchmark":
+            time.sleep(0.20)
         with socket.create_connection(("127.0.0.1", 9873), 3) as upstream:
             upstream.settimeout(10)
             self.request.settimeout(10)

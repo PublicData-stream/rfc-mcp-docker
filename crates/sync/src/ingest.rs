@@ -1,5 +1,6 @@
 use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
+    metrics::{Record, Stage},
     policy::Registry,
     recovery::recover_before_ingestion,
     text::{self, TextIndex},
@@ -14,7 +15,7 @@ use rfc_storage::{
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const PARSER: &str = "rfc-txt-catalog-1";
@@ -68,6 +69,8 @@ struct Report {
     accepted_bytes: u64,
     diagnostics: Vec<String>,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<Record>,
 }
 
 impl Report {
@@ -96,6 +99,7 @@ impl Report {
             accepted_bytes: 0,
             diagnostics: Vec::new(),
             error: None,
+            metrics: None,
         }
     }
 
@@ -195,6 +199,8 @@ async fn run(
     job: Option<i64>,
     report: &mut Report,
 ) -> Result<(GenerationId, BlobDigest)> {
+    let started = Instant::now();
+    let metrics = upstream.metrics();
     let root = mirror_root();
     let store = BlobWriter::open(&root)?;
     recover_before_ingestion(writer, &store).await?;
@@ -223,6 +229,7 @@ async fn run(
         run.report
             .diagnostic(format!("failed to mark candidate failed: {error}"));
     }
+    run.report.metrics = Some(metrics.snapshot(started.elapsed()));
     result
 }
 
@@ -296,7 +303,10 @@ impl Run<'_> {
             let batch = self.upstream.stage(ids).await?;
             for &id in ids {
                 self.report.current_rfc = Some(id.get());
-                let bytes = batch.read(&self.store, id)?;
+                let bytes = {
+                    let _queue = self.upstream.metrics().span(Stage::Queue);
+                    batch.read(&self.store, id)?
+                };
                 self.store_document(
                     id,
                     &catalog.entries[&id],
@@ -316,6 +326,7 @@ impl Run<'_> {
         if end_digest != start_digest {
             return Err("RFC catalog changed during reconciliation".into());
         }
+        let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
         candidate
             .tx
@@ -418,11 +429,16 @@ impl Run<'_> {
     }
 
     async fn install(&self, source: Source, bytes: &[u8]) -> Result<BlobDigest> {
-        let durable = self.store.install(bytes, source.limit() as u64)?.blob();
+        let durable = {
+            let _install = self.upstream.metrics().span(Stage::Install);
+            self.store.install(bytes, source.limit() as u64)?.blob()
+        };
+        let _database = self.upstream.metrics().span(Stage::Database);
         self.writer.register_blob(durable).await
     }
 
     async fn store_catalog(&mut self, capture: &Capture, digest: BlobDigest) -> Result<BlobDigest> {
+        let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
         let observation = observe(&candidate, Source::Catalog, capture, digest).await?;
         candidate.commit().await?;
@@ -539,11 +555,16 @@ impl Run<'_> {
             }
             Some(capture)
         };
-        let mut indexed = text::index(bytes)?;
-        validate_ranges(bytes, &indexed)?;
+        let mut indexed = {
+            let _parse = self.upstream.metrics().span(Stage::Parse);
+            let indexed = text::index(bytes)?;
+            validate_ranges(bytes, &indexed)?;
+            indexed
+        };
         for (section, heading) in indexed.sections.iter_mut().zip(&indexed.headings) {
             section.heading = heading;
         }
+        let install = self.upstream.metrics().span(Stage::Install);
         let durable = self.store.install(bytes, source.limit() as u64)?.blob();
         if self.reader.read_range(
             durable.digest(),
@@ -553,7 +574,11 @@ impl Run<'_> {
         {
             return Err("canonical TXT differs after durable installation".into());
         }
-        self.writer.register_blob(durable).await?;
+        drop(install);
+        {
+            let _database = self.upstream.metrics().span(Stage::Database);
+            self.writer.register_blob(durable).await?;
+        }
         let optional = self.rfcxml(id).await?;
         let policy = if let Some(notices) = self.registry.pagination_notices(id, digest, bytes)? {
             indexed.notice_state = Coverage::Complete;
@@ -568,6 +593,7 @@ impl Run<'_> {
                 indexed.notice_state,
             )
         };
+        let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
         let txt = match (prior, fresh_txt.as_ref()) {
             (Some(prior), None) => prior.observation,
@@ -696,7 +722,11 @@ impl Run<'_> {
         match self.upstream.fetch(source).await {
             Ok(Download::Captured(capture)) => {
                 self.report.accept(capture.bytes.len())?;
-                match xml::references(&capture.bytes, id) {
+                let parsed = {
+                    let _parse = self.upstream.metrics().span(Stage::Parse);
+                    xml::references(&capture.bytes, id)
+                };
+                match parsed {
                     Ok(references) => result.references = Some(references),
                     Err(error) => {
                         self.report
