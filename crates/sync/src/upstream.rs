@@ -1,25 +1,30 @@
 //! Fixed upstream destinations and bounded, private transfers.
 
 use crate::{
-    config::{SyncConfig, scratch_stats},
-    metrics::{Metrics, Stage, StageLease},
-    pipeline::Shutdown,
+    config::Https,
+    metrics::{Metrics, Stage},
+};
+#[cfg(feature = "phase2-fixtures")]
+use crate::{
+    config::scratch_stats, legacy_config::SyncConfig, metrics::StageLease, shutdown::Shutdown,
 };
 use reqwest::{Client, StatusCode, header};
 use rfc_core::RfcNumber;
 use rfc_mcp_docker::control::jitter;
-use rfc_storage::{blob::BlobWriter, postgres::Result};
+#[cfg(feature = "phase2-fixtures")]
+use rfc_storage::blob::BlobWriter;
+use rfc_storage::postgres::Result;
+#[cfg(feature = "phase2-fixtures")]
+use std::{collections::BTreeSet, io::Read, process::Stdio};
 use std::{
-    collections::BTreeSet,
     future::{Future, poll_fn},
-    io::Read,
-    process::Stdio,
     sync::Arc,
     task::Poll,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(feature = "phase2-fixtures")]
+use tokio::process::Command;
 use tokio::{
-    process::Command,
     sync::{Mutex, Semaphore},
     time,
 };
@@ -28,14 +33,16 @@ pub(crate) const TXT_LIMIT: usize = 4 * 1024 * 1024;
 pub(crate) const CATALOG_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) const XML_LIMIT: usize = 8 * 1024 * 1024;
 const OFFICIAL_HTTPS: &str = "https://www.rfc-editor.org";
-const MAX_XML_RETRY_AFTER: Duration = Duration::from_secs(30);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub(crate) const OFFICIAL_RSYNC: &str = "rsync://rsync.rfc-editor.org/rfcs-text-only/";
 pub(crate) const MAX_CATALOG_ENTRIES: usize = 20_000;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Source {
     Catalog,
+    #[cfg(feature = "phase2-fixtures")]
     Txt(RfcNumber),
+    #[cfg(feature = "phase2-fixtures")]
     Xml(RfcNumber),
 }
 
@@ -43,7 +50,9 @@ impl Source {
     fn path(self) -> String {
         match self {
             Self::Catalog => "/rfc-index.xml".into(),
+            #[cfg(feature = "phase2-fixtures")]
             Self::Txt(id) => format!("/rfc/rfc{}.txt", id.get()),
+            #[cfg(feature = "phase2-fixtures")]
             Self::Xml(id) => format!("/rfc/rfc{}.xml", id.get()),
         }
     }
@@ -55,7 +64,9 @@ impl Source {
     pub(crate) fn kind(self) -> &'static str {
         match self {
             Self::Catalog => "catalog",
+            #[cfg(feature = "phase2-fixtures")]
             Self::Txt(_) => "txt",
+            #[cfg(feature = "phase2-fixtures")]
             Self::Xml(_) => "rfcxml",
         }
     }
@@ -63,7 +74,9 @@ impl Source {
     pub(crate) fn limit(self) -> usize {
         match self {
             Self::Catalog => CATALOG_LIMIT,
+            #[cfg(feature = "phase2-fixtures")]
             Self::Txt(_) => TXT_LIMIT,
+            #[cfg(feature = "phase2-fixtures")]
             Self::Xml(_) => XML_LIMIT,
         }
     }
@@ -71,6 +84,7 @@ impl Source {
     fn accepts(self, media_type: &str) -> bool {
         let media_type = media_type.split(';').next().unwrap_or("").trim();
         match self {
+            #[cfg(feature = "phase2-fixtures")]
             Self::Txt(_) => media_type.eq_ignore_ascii_case("text/plain"),
             _ => ["application/xml", "text/xml", "application/octet-stream"]
                 .iter()
@@ -90,9 +104,11 @@ pub(crate) struct Capture {
 
 pub(crate) enum Download {
     Captured(Capture),
+    #[cfg(feature = "phase2-fixtures")]
     Missing(MissingXml),
 }
 
+#[cfg(feature = "phase2-fixtures")]
 pub(crate) enum MissingXml {
     NotFound,
     Gone,
@@ -100,7 +116,7 @@ pub(crate) enum MissingXml {
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-pub(crate) enum XmlFailure {
+pub(crate) enum FetchAttempts {
     Exhausted(Error),
     Terminal(Error),
 }
@@ -145,7 +161,9 @@ impl FetchFailure {
 
 #[derive(Clone)]
 pub(crate) struct Upstream {
-    config: SyncConfig,
+    https: Https,
+    #[cfg(feature = "phase2-fixtures")]
+    legacy: Option<SyncConfig>,
     http: Client,
     https_origin: &'static str,
     rsync_module: &'static str,
@@ -159,20 +177,25 @@ pub(crate) struct Upstream {
 }
 
 impl Upstream {
-    pub(crate) fn official(config: SyncConfig) -> Result<Self> {
-        Self::new(config, OFFICIAL_HTTPS, OFFICIAL_RSYNC, None)
+    pub(crate) fn official(https: Https) -> Result<Self> {
+        Self::new(https, OFFICIAL_HTTPS, OFFICIAL_RSYNC, None)
+    }
+
+    #[cfg(feature = "phase6-fixtures")]
+    pub(crate) fn discovery_fixture(https: Https) -> Result<Self> {
+        Self::fixture_client(https)
     }
 
     #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn fixture(config: SyncConfig) -> Result<Self> {
-        let mut upstream = Self::new(
-            config,
-            "https://fixtures:8443",
-            "rsync://fixtures:8873/rfc/",
-            Some(reqwest::Certificate::from_pem(&std::fs::read(
-                "/phase2/ca.crt",
-            )?)?),
-        )?;
+        let legacy = config.ingestion.https;
+        let mut upstream = Self::fixture_client(Https {
+            max_in_flight_requests: legacy.max_in_flight_requests,
+            min_request_start_interval_ms: legacy.min_request_start_interval_ms,
+            request_timeout_seconds: legacy.request_timeout_seconds,
+            max_attempts: legacy.rfcxml_max_attempts,
+        })?;
+        upstream.legacy = Some(config);
         upstream.paced = std::env::var("RFC_PHASE2_PACED").as_deref() == Ok("1");
         if std::env::var("RFC_PHASE2_FIXED_CLOCK").as_deref() == Ok("1") {
             upstream.fixture_clock = Some(Arc::new(1_790_000_000_000_000.into()));
@@ -180,13 +203,24 @@ impl Upstream {
         Ok(upstream)
     }
 
+    #[cfg(feature = "phase2-fixtures")]
+    fn fixture_client(https: Https) -> Result<Self> {
+        Self::new(
+            https,
+            "https://fixtures:8443",
+            "rsync://fixtures:8873/rfc/",
+            Some(reqwest::Certificate::from_pem(&std::fs::read(
+                "/phase2/ca.crt",
+            )?)?),
+        )
+    }
+
     fn new(
-        config: SyncConfig,
+        https: Https,
         https_origin: &'static str,
         rsync_module: &'static str,
         ca: Option<reqwest::Certificate>,
     ) -> Result<Self> {
-        let https = config.ingestion.https;
         let timeout = Duration::from_secs(https.request_timeout_seconds);
         #[cfg(feature = "phase2-fixtures")]
         let timeout = if ca.is_some()
@@ -208,18 +242,19 @@ impl Upstream {
             .connect_timeout(Duration::from_secs(5))
             .timeout(timeout)
             .user_agent("rfc-mcp-docker-sync/0.0.0");
-        let paced = ca.is_none();
         if let Some(ca) = ca {
             builder = builder
                 .tls_built_in_root_certs(false)
                 .add_root_certificate(ca);
         }
         Ok(Self {
-            config,
+            https,
+            #[cfg(feature = "phase2-fixtures")]
+            legacy: None,
             http: builder.build()?,
             https_origin,
             rsync_module,
-            paced,
+            paced: true,
             metrics: Metrics::default(),
             #[cfg(feature = "phase2-fixtures")]
             fixture_clock: None,
@@ -228,12 +263,20 @@ impl Upstream {
         })
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn config(&self) -> &SyncConfig {
-        &self.config
+        self.legacy.as_ref().expect("legacy fixture upstream")
+    }
+
+    pub(crate) fn with_fresh_metrics(&self) -> Self {
+        Self {
+            metrics: Metrics::default(),
+            ..self.clone()
+        }
     }
 
     fn start_interval(&self) -> Duration {
-        Duration::from_millis(self.config.ingestion.https.min_request_start_interval_ms)
+        Duration::from_millis(self.https.min_request_start_interval_ms)
     }
 
     #[cfg(feature = "phase2-fixtures")]
@@ -255,6 +298,7 @@ impl Upstream {
         }
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) async fn fetch(&self, source: Source) -> Result<Download> {
         self.fetch_once(source, false)
             .await
@@ -263,22 +307,38 @@ impl Upstream {
             })
     }
 
+    pub(crate) async fn catalog(&self) -> Result<Capture> {
+        match self.fetch_with_retries(Source::Catalog).await {
+            Ok(Download::Captured(capture)) => Ok(capture),
+            #[cfg(feature = "phase2-fixtures")]
+            Ok(Download::Missing(_)) => Err("required catalog is unavailable".into()),
+            Err(FetchAttempts::Exhausted(error) | FetchAttempts::Terminal(error)) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) async fn fetch_xml(
         &self,
         id: RfcNumber,
-    ) -> std::result::Result<Download, XmlFailure> {
-        let source = Source::Xml(id);
-        let max_attempts = self.config.ingestion.https.rfcxml_max_attempts;
+    ) -> std::result::Result<Download, FetchAttempts> {
+        self.fetch_with_retries(Source::Xml(id)).await
+    }
+
+    async fn fetch_with_retries(
+        &self,
+        source: Source,
+    ) -> std::result::Result<Download, FetchAttempts> {
+        let max_attempts = self.https.max_attempts;
         let mut attempt = 1;
         loop {
             match self.fetch_once(source, attempt > 1).await {
                 Ok(download) => return Ok(download),
-                Err(FetchFailure::Terminal(error)) => return Err(XmlFailure::Terminal(error)),
+                Err(FetchFailure::Terminal(error)) => return Err(FetchAttempts::Terminal(error)),
                 Err(FetchFailure::Retryable { error, retry_after }) => {
                     if attempt >= max_attempts
-                        || retry_after.is_some_and(|delay| delay > MAX_XML_RETRY_AFTER)
+                        || retry_after.is_some_and(|delay| delay > MAX_RETRY_AFTER)
                     {
-                        return Err(XmlFailure::Exhausted(error));
+                        return Err(FetchAttempts::Exhausted(error));
                     }
                     time::sleep(jitter(Duration::from_secs(1 << (attempt - 1)))).await;
                     attempt += 1;
@@ -335,11 +395,13 @@ impl Upstream {
             .map_err(FetchFailure::terminal)?;
         drop(queue);
         if retry {
-            self.metrics.xml_retry();
+            self.metrics.retry();
         }
         let _http = self.metrics.http_start(match source {
             Source::Catalog => Stage::Catalog,
+            #[cfg(feature = "phase2-fixtures")]
             Source::Txt(_) => Stage::Txt,
+            #[cfg(feature = "phase2-fixtures")]
             Source::Xml(_) => Stage::Xml,
         });
         let response = self.http.execute(request);
@@ -359,30 +421,34 @@ impl Upstream {
         let status = response.status();
         if status != StatusCode::OK {
             let error = format!("{} unexpected HTTPS status {status}", source.kind());
+            #[cfg(feature = "phase2-fixtures")]
             if matches!(source, Source::Xml(_)) {
                 match status {
                     StatusCode::NOT_FOUND => return Ok(Download::Missing(MissingXml::NotFound)),
                     StatusCode::GONE => return Ok(Download::Missing(MissingXml::Gone)),
-                    StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
-                        let retry_after = retry_after(response.headers(), SystemTime::now());
-                        if let Some(delay) = retry_after {
-                            self.delay_starts(delay).await;
-                        }
-                        return Err(FetchFailure::Retryable {
-                            error: error.into(),
-                            retry_after,
-                        });
-                    }
-                    StatusCode::INTERNAL_SERVER_ERROR
-                    | StatusCode::BAD_GATEWAY
-                    | StatusCode::GATEWAY_TIMEOUT => {
-                        return Err(FetchFailure::Retryable {
-                            error: error.into(),
-                            retry_after: None,
-                        });
-                    }
-                    _ => {}
+                    _ => (),
                 }
+            }
+            match status {
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                    let retry_after = retry_after(response.headers(), SystemTime::now());
+                    if let Some(delay) = retry_after {
+                        self.delay_starts(delay).await;
+                    }
+                    return Err(FetchFailure::Retryable {
+                        error: error.into(),
+                        retry_after,
+                    });
+                }
+                StatusCode::INTERNAL_SERVER_ERROR
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::GATEWAY_TIMEOUT => {
+                    return Err(FetchFailure::Retryable {
+                        error: error.into(),
+                        retry_after: None,
+                    });
+                }
+                _ => (),
             }
             return Err(FetchFailure::terminal(error));
         }
@@ -449,13 +515,16 @@ impl Upstream {
         if let Some(base) = self.fixture_clock.as_ref() {
             return Some(match _source {
                 Source::Catalog => 1 + base.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                #[cfg(feature = "phase2-fixtures")]
                 Source::Txt(id) => 1_790_000_010_000_000 + i64::from(id.get()),
+                #[cfg(feature = "phase2-fixtures")]
                 Source::Xml(id) => 1_790_000_020_000_000 + i64::from(id.get()),
             });
         }
         None
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn rsync_observed_us(&self) -> Result<i64> {
         #[cfg(feature = "phase2-fixtures")]
         if self.fixture_clock.is_some() {
@@ -464,9 +533,10 @@ impl Upstream {
         now_us()
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) async fn stage(&self, ids: &[RfcNumber], shutdown: &Shutdown) -> Result<RsyncBatch> {
         let _timing = self.metrics.span(Stage::Rsync);
-        let rsync = self.config.ingestion.rsync;
+        let rsync = self.config().ingestion.rsync;
         if ids.is_empty() || ids.len() > rsync.batch_size {
             return Err("rsync batch count exceeds bounds".into());
         }
@@ -575,6 +645,7 @@ impl Upstream {
     }
 }
 
+#[cfg(feature = "phase2-fixtures")]
 fn scratch_used() -> Option<u64> {
     let stats = scratch_stats()?;
     stats
@@ -637,6 +708,7 @@ impl Drop for ProcessGroup {
     }
 }
 
+#[cfg(feature = "phase2-fixtures")]
 pub(crate) struct RsyncBatch {
     temp: tempfile::TempDir,
     incoming: std::path::PathBuf,
@@ -644,6 +716,7 @@ pub(crate) struct RsyncBatch {
     _lease: StageLease,
 }
 
+#[cfg(feature = "phase2-fixtures")]
 impl RsyncBatch {
     pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<Vec<u8>> {
         let name = filename(id);
@@ -658,6 +731,7 @@ impl RsyncBatch {
     }
 }
 
+#[cfg(feature = "phase2-fixtures")]
 pub(crate) fn read_staged(
     store: &BlobWriter,
     directory: &std::path::Path,

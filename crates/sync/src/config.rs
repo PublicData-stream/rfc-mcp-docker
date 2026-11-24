@@ -1,9 +1,8 @@
-//! Versioned ingestion settings and startup resource checks.
+//! Versioned discovery settings and startup resource checks.
 
 use crate::{
-    bulk,
     parse::DOCUMENT_BYTES,
-    upstream::{TXT_LIMIT, XML_LIMIT},
+    upstream::{CATALOG_LIMIT, TXT_LIMIT, XML_LIMIT},
 };
 use rfc_storage::postgres::Result;
 use serde::{Deserialize, Serialize};
@@ -15,79 +14,83 @@ use std::{
 };
 
 const CONFIG_FILE: &str = "RFC_SYNC_CONFIG_FILE";
-const LEGACY_HTTP: &str = "RFC_SYNC_HTTP_CONCURRENCY";
-const LEGACY_PARSE: &str = "RFC_SYNC_PARSE_CONCURRENCY";
-const CONFIG_BYTES: u64 = 16 * 1024;
+pub(crate) const CONFIG_BYTES: u64 = 16 * 1024;
 const MIB: u64 = 1024 * 1024;
+const MEMORY_LIMIT: u64 = 2048 * MIB;
 const SCRATCH_LIMIT: u64 = 512 * MIB;
-const MEMORY_LIMIT: u64 = 2 * 1024 * MIB;
-const ACCEPTED_LIMIT: u64 = 4 * 1024 * MIB;
+const SCRATCH_REQUIRED: u64 = 8 * MIB;
 const MIN_HTTPS_INTERVAL_MS: u64 = 1000;
-const MAX_RSYNC_BATCH: usize = 32;
-const MAX_PENDING_DOCUMENTS: usize = 3;
-pub(crate) const RAW_PER_DOCUMENT: usize = 2 * TXT_LIMIT + XML_LIMIT;
+const RAW_PER_DOCUMENT: u64 = (2 * TXT_LIMIT + XML_LIMIT) as u64;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SyncConfig {
     schema_version: u32,
     #[serde(default)]
-    pub(crate) ingestion: Ingestion,
+    pub ingestion: Ingestion,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Ingestion {
+    pub target_bootstrap_seconds: u64,
+    pub max_accepted_bytes: u64,
+    pub discovery: Discovery,
+    pub https: Https,
+    pub pipeline: Pipeline,
+    pub revalidation: Revalidation,
+    pub database: Database,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct Ingestion {
-    pub(crate) txt_provenance: TxtProvenance,
-    pub(crate) https: Https,
-    pub(crate) rsync: Rsync,
-    pub(crate) pipeline: Pipeline,
-    pub(crate) max_accepted_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TxtProvenance {
-    DualSource,
-    RsyncBootstrap,
+pub(crate) struct Discovery {
+    pub inventory_timeout_seconds: u64,
+    pub full_reconcile_interval_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Https {
-    pub(crate) max_in_flight_requests: usize,
-    pub(crate) min_request_start_interval_ms: u64,
-    pub(crate) request_timeout_seconds: u64,
-    pub(crate) rfcxml_max_attempts: u32,
+    pub max_in_flight_requests: usize,
+    pub min_request_start_interval_ms: u64,
+    pub request_timeout_seconds: u64,
+    pub max_attempts: u32,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct Rsync {
-    pub(crate) mode: RsyncMode,
-    pub(crate) batch_size: usize,
-    pub(crate) transfer_timeout_seconds: u64,
-    pub(crate) bulk_transfer_timeout_seconds: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RsyncMode {
-    Batched,
-    PersistentBulk,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Pipeline {
-    pub(crate) max_pending_documents: usize,
-    pub(crate) parser_workers: usize,
+    pub txt_queue_items: u64,
+    pub xml_queue_items: u64,
+    pub result_queue_items: u64,
+    pub max_active_documents: u64,
+    pub parser_workers: u64,
+    pub raw_payload_budget_bytes: u64,
+    pub parse_budget_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Revalidation {
+    pub max_rsync_sessions: u64,
+    pub batch_size: u64,
+    pub session_timeout_seconds: u64,
+    pub interval_seconds: u64,
+    pub max_attempts: usize,
+    pub retry_backoff_seconds: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Database {
+    pub batch_size: u64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             ingestion: Ingestion::default(),
         }
     }
@@ -96,11 +99,22 @@ impl Default for SyncConfig {
 impl Default for Ingestion {
     fn default() -> Self {
         Self {
-            txt_provenance: TxtProvenance::DualSource,
+            target_bootstrap_seconds: 900,
+            max_accepted_bytes: 4096 * MIB,
+            discovery: Discovery::default(),
             https: Https::default(),
-            rsync: Rsync::default(),
             pipeline: Pipeline::default(),
-            max_accepted_bytes: ACCEPTED_LIMIT,
+            revalidation: Revalidation::default(),
+            database: Database::default(),
+        }
+    }
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Self {
+            inventory_timeout_seconds: 120,
+            full_reconcile_interval_seconds: 86_400,
         }
     }
 }
@@ -111,18 +125,7 @@ impl Default for Https {
             max_in_flight_requests: 2,
             min_request_start_interval_ms: MIN_HTTPS_INTERVAL_MS,
             request_timeout_seconds: 30,
-            rfcxml_max_attempts: 3,
-        }
-    }
-}
-
-impl Default for Rsync {
-    fn default() -> Self {
-        Self {
-            mode: RsyncMode::Batched,
-            batch_size: MAX_RSYNC_BATCH,
-            transfer_timeout_seconds: 120,
-            bulk_transfer_timeout_seconds: 900,
+            max_attempts: 3,
         }
     }
 }
@@ -130,9 +133,33 @@ impl Default for Rsync {
 impl Default for Pipeline {
     fn default() -> Self {
         Self {
-            max_pending_documents: MAX_PENDING_DOCUMENTS,
-            parser_workers: 1,
+            txt_queue_items: 64,
+            xml_queue_items: 64,
+            result_queue_items: 32,
+            max_active_documents: 3,
+            parser_workers: 2,
+            raw_payload_budget_bytes: 48 * MIB,
+            parse_budget_bytes: 384 * MIB,
         }
+    }
+}
+
+impl Default for Revalidation {
+    fn default() -> Self {
+        Self {
+            max_rsync_sessions: 1,
+            batch_size: 512,
+            session_timeout_seconds: 120,
+            interval_seconds: 86_400,
+            max_attempts: 3,
+            retry_backoff_seconds: vec![5, 30],
+        }
+    }
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self { batch_size: 32 }
     }
 }
 
@@ -141,6 +168,10 @@ struct Summary {
     source: &'static str,
     #[serde(flatten)]
     config: SyncConfig,
+    phase: &'static str,
+    publication_gate: &'static str,
+    pending_consumers: [&'static str; 3],
+    informational: [&'static str; 1],
     resources: Resources,
 }
 
@@ -152,12 +183,13 @@ struct Resources {
     memory_available_bytes: u64,
     cgroup_memory_limit_bytes: Option<u64>,
     physical_memory_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bulk_filesystem: Option<bulk::Capacity>,
 }
 
-/// Validates the same settings the daemon uses without opening its runtime services.
 pub fn check_config() -> Result<()> {
+    #[cfg(feature = "phase6-fixtures")]
+    if crate::daemon::legacy_fixtures() {
+        return crate::legacy_config::check_config();
+    }
     println!("{}", serde_json::to_string(&SyncConfig::load_summary()?)?);
     Ok(())
 }
@@ -168,26 +200,16 @@ impl SyncConfig {
     }
 
     fn load_summary() -> Result<Summary> {
-        let path = env::var_os(CONFIG_FILE);
-        let http = env::var_os(LEGACY_HTTP);
-        let parse = env::var_os(LEGACY_PARSE);
-        let (config, source) = if let Some(path) = path {
-            if http.is_some() || parse.is_some() {
+        for name in ["RFC_SYNC_HTTP_CONCURRENCY", "RFC_SYNC_PARSE_CONCURRENCY"] {
+            if env::var_os(name).is_some() {
                 return Err(
-                    "ingestion config file conflicts with legacy concurrency variables".into(),
+                    format!("{name} was removed; migrate to the schema v2 ingestion TOML").into(),
                 );
             }
-            (Self::from_file(Path::new(&path))?, "file")
-        } else {
-            let mut config = Self::default();
-            let from_env = http.is_some() || parse.is_some();
-            if let Some(value) = http {
-                config.ingestion.https.max_in_flight_requests = legacy(LEGACY_HTTP, &value)?;
-            }
-            if let Some(value) = parse {
-                config.ingestion.pipeline.parser_workers = legacy(LEGACY_PARSE, &value)?;
-            }
-            (config, if from_env { "legacy_env" } else { "defaults" })
+        }
+        let (config, source) = match env::var_os(CONFIG_FILE) {
+            Some(path) => (Self::from_toml(&config_text(Path::new(&path))?)?, "file"),
+            None => (Self::default(), "defaults"),
         };
         config.validate()?;
         let scratch = scratch_stats().ok_or("cannot inspect ingestion scratch filesystem")?;
@@ -195,126 +217,186 @@ impl SyncConfig {
             .f_bavail
             .checked_mul(scratch.f_frsize)
             .ok_or("ingestion scratch capacity overflows")?;
-        let mut resources =
+        let resources =
             config.resources(scratch_available, physical_memory()?, cgroup_memory()?)?;
-        if config.ingestion.rsync.mode == RsyncMode::PersistentBulk {
-            resources.bulk_filesystem = Some(bulk::preflight()?);
-        }
         Ok(Summary {
             source,
             config,
+            phase: "discovery",
+            publication_gate: crate::discovery::PUBLICATION_GATE,
+            pending_consumers: [
+                "ingestion.pipeline",
+                "ingestion.revalidation",
+                "ingestion.database",
+            ],
+            informational: ["ingestion.target_bootstrap_seconds"],
             resources,
         })
     }
 
-    fn from_file(path: &Path) -> Result<Self> {
-        if path.as_os_str().is_empty() {
-            return Err("RFC_SYNC_CONFIG_FILE must be nonempty".into());
-        }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|_| "cannot open ingestion config file")?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| "cannot inspect ingestion config file")?;
-        if !metadata.is_file() {
-            return Err("ingestion config must be a regular file".into());
-        }
-        let mut bytes = Vec::new();
-        file.take(CONFIG_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "cannot read ingestion config file")?;
-        if bytes.len() as u64 > CONFIG_BYTES {
-            return Err("ingestion config exceeds 16 KiB".into());
-        }
-        Self::from_toml(std::str::from_utf8(&bytes).map_err(|_| "ingestion config must be UTF-8")?)
-    }
-
     fn from_toml(input: &str) -> Result<Self> {
-        // TOML diagnostics can quote operator data, including unknown keys.
-        toml::from_str(input).map_err(|error| match error.span() {
-            Some(span) => format!("invalid ingestion TOML at byte {}", span.start).into(),
-            None => "invalid ingestion TOML".into(),
-        })
+        // The bounded file may contain secrets in unsolicited keys. Never quote it.
+        let table: toml::Table = toml::from_str(input).map_err(toml_error)?;
+        match table
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+        {
+            Some(1) => return Err(migration_hint()),
+            Some(2) => (),
+            _ => return Err("ingestion schema_version must be 2".into()),
+        }
+        if let Some(ingestion) = table.get("ingestion").and_then(toml::Value::as_table) {
+            if ["txt_provenance", "rsync"]
+                .iter()
+                .any(|key| ingestion.contains_key(*key))
+            {
+                return Err(migration_hint());
+            }
+            for (section, replaced) in [
+                ("https", "rfcxml_max_attempts"),
+                ("pipeline", "max_pending_documents"),
+            ] {
+                if ingestion
+                    .get(section)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|section| section.contains_key(replaced))
+                {
+                    return Err(migration_hint());
+                }
+            }
+        }
+        table.try_into().map_err(toml_error)
     }
 
     fn validate(&self) -> Result<()> {
-        let Ingestion {
-            txt_provenance,
-            https,
-            rsync,
-            pipeline,
-            max_accepted_bytes,
-        } = self.ingestion;
-        if self.schema_version != 1 {
-            return Err("ingestion schema_version must be 1".into());
+        let i = &self.ingestion;
+        let p = &i.pipeline;
+        let r = &i.revalidation;
+        for (key, value, min, max) in [
+            (
+                "target_bootstrap_seconds",
+                i.target_bootstrap_seconds,
+                1,
+                43_200,
+            ),
+            ("max_accepted_bytes", i.max_accepted_bytes, 1, 4096 * MIB),
+            (
+                "inventory_timeout_seconds",
+                i.discovery.inventory_timeout_seconds,
+                5,
+                120,
+            ),
+            (
+                "full_reconcile_interval_seconds",
+                i.discovery.full_reconcile_interval_seconds,
+                3600,
+                604_800,
+            ),
+            (
+                "max_in_flight_requests",
+                i.https.max_in_flight_requests as u64,
+                1,
+                2,
+            ),
+            (
+                "min_request_start_interval_ms",
+                i.https.min_request_start_interval_ms,
+                MIN_HTTPS_INTERVAL_MS,
+                60_000,
+            ),
+            (
+                "request_timeout_seconds",
+                i.https.request_timeout_seconds,
+                5,
+                30,
+            ),
+            ("https.max_attempts", u64::from(i.https.max_attempts), 1, 3),
+            ("max_active_documents", p.max_active_documents, 1, 3),
+            ("parser_workers", p.parser_workers, 1, 2),
+            ("txt_queue_items", p.txt_queue_items, 1, 64),
+            ("xml_queue_items", p.xml_queue_items, 1, 64),
+            ("result_queue_items", p.result_queue_items, 1, 32),
+            (
+                "raw_payload_budget_bytes",
+                p.raw_payload_budget_bytes,
+                1,
+                48 * MIB,
+            ),
+            ("parse_budget_bytes", p.parse_budget_bytes, 1, 384 * MIB),
+            ("max_rsync_sessions", r.max_rsync_sessions, 1, 1),
+            ("revalidation.batch_size", r.batch_size, 1, 512),
+            ("session_timeout_seconds", r.session_timeout_seconds, 5, 120),
+            (
+                "revalidation.interval_seconds",
+                r.interval_seconds,
+                3600,
+                604_800,
+            ),
+            ("revalidation.max_attempts", r.max_attempts as u64, 1, 3),
+            ("database.batch_size", i.database.batch_size, 1, 32),
+        ] {
+            if !(min..=max).contains(&value) {
+                return Err(format!("{key} must be {min} through {max}").into());
+            }
         }
-        if !(1..=2).contains(&https.max_in_flight_requests) {
-            return Err("max_in_flight_requests must be 1 or 2".into());
-        }
-        if !(MIN_HTTPS_INTERVAL_MS..=60_000).contains(&https.min_request_start_interval_ms) {
-            return Err("min_request_start_interval_ms must be 1000 through 60000".into());
-        }
-        if !(5..=30).contains(&https.request_timeout_seconds) {
-            return Err("request_timeout_seconds must be 5 through 30".into());
-        }
-        if !(1..=3).contains(&https.rfcxml_max_attempts) {
-            return Err("rfcxml_max_attempts must be 1 through 3".into());
-        }
-        if !(1..=MAX_RSYNC_BATCH).contains(&rsync.batch_size) {
-            return Err("batch_size must be 1 through 32".into());
-        }
-        if !(30..=120).contains(&rsync.transfer_timeout_seconds) {
-            return Err("transfer_timeout_seconds must be 30 through 120".into());
-        }
-        if !(30..=900).contains(&rsync.bulk_transfer_timeout_seconds) {
-            return Err("bulk_transfer_timeout_seconds must be 30 through 900".into());
-        }
-        if txt_provenance == TxtProvenance::RsyncBootstrap
-            && rsync.mode != RsyncMode::PersistentBulk
+        if (i.https.max_in_flight_requests as u64).max(p.parser_workers) > p.max_active_documents
+            || p.txt_queue_items
+                .min(p.xml_queue_items)
+                .min(p.result_queue_items)
+                < p.max_active_documents
         {
-            return Err("rsync_bootstrap requires persistent_bulk rsync mode".into());
+            return Err(
+                "HTTPS/parser concurrency and queue capacity must fit the active document window"
+                    .into(),
+            );
         }
-        if !(1..=MAX_PENDING_DOCUMENTS).contains(&pipeline.max_pending_documents) {
-            return Err("max_pending_documents must be 1 through 3".into());
-        }
-        if !(1..=2).contains(&pipeline.parser_workers) {
-            return Err("parser_workers must be 1 or 2".into());
-        }
-        if https.max_in_flight_requests > pipeline.max_pending_documents
-            || pipeline.parser_workers > pipeline.max_pending_documents
+        if p.max_active_documents
+            .checked_mul(RAW_PER_DOCUMENT)
+            .is_none_or(|bytes| bytes > p.raw_payload_budget_bytes)
+            || p.max_active_documents
+                .checked_mul(DOCUMENT_BYTES as u64)
+                .is_none_or(|bytes| bytes > p.parse_budget_bytes)
         {
-            return Err("HTTPS and parser concurrency must fit max_pending_documents".into());
+            return Err("raw and parse budgets must cover the active document window".into());
         }
-        if !(1..=ACCEPTED_LIMIT).contains(&max_accepted_bytes) {
-            return Err("max_accepted_bytes must be 1 through 4294967296".into());
+        if r.retry_backoff_seconds.len() != r.max_attempts - 1
+            || r.retry_backoff_seconds
+                .iter()
+                .any(|value| !(1..=120).contains(value))
+            || !r.retry_backoff_seconds.is_sorted_by(|a, b| a < b)
+        {
+            return Err(
+                "revalidation requires one increasing backoff of 1 through 120 seconds per retry"
+                    .into(),
+            );
         }
         Ok(())
     }
 
     fn resources(&self, scratch: u64, physical: u64, cgroup: Option<u64>) -> Result<Resources> {
-        let batch_size = match self.ingestion.rsync.mode {
-            RsyncMode::Batched => self.ingestion.rsync.batch_size as u64,
-            RsyncMode::PersistentBulk => 0,
-        };
-        let scratch_required = batch_size
-            .checked_mul(TXT_LIMIT as u64)
-            .and_then(|bytes| bytes.checked_add(8 * MIB))
-            .ok_or("ingestion scratch reservation overflows")?;
-        let memory_required = (self.ingestion.pipeline.max_pending_documents as u64)
-            .checked_mul((RAW_PER_DOCUMENT + DOCUMENT_BYTES) as u64)
-            .and_then(|bytes| bytes.checked_add(scratch_required))
-            .and_then(|bytes| bytes.checked_add(512 * MIB))
+        let p = &self.ingestion.pipeline;
+        // Include the existing base working reserve, two catalog bodies, inventory
+        // output, and compact descriptors outside the active payload window.
+        let descriptors = p
+            .txt_queue_items
+            .checked_add(p.xml_queue_items)
+            .and_then(|count| count.checked_add(p.result_queue_items))
+            .and_then(|count| count.checked_mul(512));
+        let memory_required = descriptors
+            .and_then(|bytes| {
+                bytes.checked_add(512 * MIB + SCRATCH_REQUIRED + 2 * CATALOG_LIMIT as u64)
+            })
+            .and_then(|bytes| bytes.checked_add(crate::inventory::OUTPUT_RESERVATION))
+            .and_then(|bytes| bytes.checked_add(p.raw_payload_budget_bytes))
+            .and_then(|bytes| bytes.checked_add(p.parse_budget_bytes))
             .ok_or("ingestion memory reservation overflows")?;
         let scratch_available = scratch.min(SCRATCH_LIMIT);
         let memory_available = physical
             .min(MEMORY_LIMIT)
             .min(cgroup.unwrap_or(MEMORY_LIMIT));
-        if scratch_required > scratch_available {
+        if SCRATCH_REQUIRED > scratch_available {
             return Err(format!(
-                "ingestion scratch needs {scratch_required} bytes, available {scratch_available}"
+                "ingestion scratch needs {SCRATCH_REQUIRED} bytes, available {scratch_available}"
             )
             .into());
         }
@@ -325,23 +407,50 @@ impl SyncConfig {
             .into());
         }
         Ok(Resources {
-            scratch_required_bytes: scratch_required,
+            scratch_required_bytes: SCRATCH_REQUIRED,
             scratch_available_bytes: scratch_available,
             memory_required_bytes: memory_required,
             memory_available_bytes: memory_available,
             cgroup_memory_limit_bytes: cgroup,
             physical_memory_bytes: physical,
-            bulk_filesystem: None,
         })
     }
 }
 
-fn legacy(name: &str, value: &std::ffi::OsStr) -> Result<usize> {
-    match value.to_str() {
-        Some("1") => Ok(1),
-        Some("2") => Ok(2),
-        _ => Err(format!("{name} must be 1 or 2").into()),
+fn migration_hint() -> Box<dyn std::error::Error + Send + Sync> {
+    "legacy ingestion configuration; migrate to schema v2 and remove TXT provenance and rsync acquisition settings (see deploy/ingestion.toml.example)".into()
+}
+
+fn toml_error(error: toml::de::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    match error.span() {
+        Some(span) => format!("invalid ingestion TOML at byte {}", span.start).into(),
+        None => "invalid ingestion TOML".into(),
     }
+}
+
+pub(crate) fn config_text(path: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        return Err("RFC_SYNC_CONFIG_FILE must be nonempty".into());
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "cannot open ingestion config file")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "cannot inspect ingestion config file")?;
+    if !metadata.is_file() {
+        return Err("ingestion config must be a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cannot read ingestion config file")?;
+    if bytes.len() as u64 > CONFIG_BYTES {
+        return Err("ingestion config exceeds 16 KiB".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "ingestion config must be UTF-8".into())
 }
 
 pub(crate) fn scratch_stats() -> Option<libc::statvfs> {
@@ -352,7 +461,7 @@ pub(crate) fn scratch_stats() -> Option<libc::statvfs> {
     Some(unsafe { stats.assume_init() })
 }
 
-fn physical_memory() -> Result<u64> {
+pub(crate) fn physical_memory() -> Result<u64> {
     let info = fs::read_to_string("/proc/meminfo").map_err(|_| "cannot inspect physical memory")?;
     let kib = info
         .lines()
@@ -364,7 +473,7 @@ fn physical_memory() -> Result<u64> {
         .ok_or_else(|| "physical memory size overflows".into())
 }
 
-fn cgroup_memory() -> Result<Option<u64>> {
+pub(crate) fn cgroup_memory() -> Result<Option<u64>> {
     let membership =
         fs::read_to_string("/proc/self/cgroup").map_err(|_| "cannot inspect cgroup membership")?;
     let Some(cgroup) = membership
@@ -376,7 +485,7 @@ fn cgroup_memory() -> Result<Option<u64>> {
     cgroup_limit(Path::new("/sys/fs/cgroup"), Path::new(cgroup))
 }
 
-fn cgroup_limit(root: &Path, cgroup: &Path) -> Result<Option<u64>> {
+pub(crate) fn cgroup_limit(root: &Path, cgroup: &Path) -> Result<Option<u64>> {
     if cgroup
         .components()
         .any(|part| !matches!(part, Component::Normal(_)))
@@ -407,109 +516,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn example_and_omitted_settings_match_defaults() {
-        for input in [
-            include_str!("../../../deploy/ingestion.toml.example"),
-            "schema_version = 1",
-            "schema_version = 1\n[ingestion.https]\n[ingestion.rsync]\n[ingestion.pipeline]\n",
-        ] {
-            let config = SyncConfig::from_toml(input).unwrap();
-            config.validate().unwrap();
-            assert_eq!(config, SyncConfig::default());
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_documents_and_settings() {
-        for input in [
-            "",
-            "schema_version =",
-            "schema_version = 2",
-            "schema_version = 1\nschema_version = 1",
-            "schema_version = 1\nurl = 'sentinel'",
-            "schema_version = 1\n[ingestion]\ntxt_provenance = 'rsync_authoritative'",
-            "schema_version = 1\n[ingestion.rsync]\ncommand = 'sentinel'",
-            "schema_version = 1\n[ingestion.pipeline]\nmax_pending_documents = 1",
-            "schema_version = 1\n[ingestion.pipeline]\nparser_workers = 0",
-            "schema_version = 1\n[ingestion.https]\nmax_in_flight_requests = -1",
-            "schema_version = 1\n[ingestion.https]\nmin_request_start_interval_ms = 999",
-            "schema_version = 1\n[ingestion.https]\nrequest_timeout_seconds = 31",
-            "schema_version = 1\n[ingestion.https]\nrfcxml_max_attempts = 0",
-            "schema_version = 1\n[ingestion.https]\nrfcxml_max_attempts = 4",
-            "schema_version = 1\n[ingestion.rsync]\nbatch_size = 33",
-            "schema_version = 1\n[ingestion.rsync]\ntransfer_timeout_seconds = 29",
-            "schema_version = 1\n[ingestion]\nmax_accepted_bytes = 4294967297",
-            "schema_version = 1\n[ingestion]\nmax_accepted_bytes = 18446744073709551616",
-        ] {
-            let error = SyncConfig::from_toml(input)
-                .and_then(|config| config.validate())
-                .unwrap_err();
-            assert!(!error.to_string().contains("sentinel"));
-        }
-    }
-
-    #[test]
-    fn rejects_nonregular_and_oversized_files() {
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
-        assert!(SyncConfig::from_file(dir.path()).is_err());
-        let file = dir.path().join("config.toml");
-        fs::write(&file, vec![b' '; CONFIG_BYTES as usize + 1]).unwrap();
+    fn deployment_example_matches_defaults() {
+        let config =
+            SyncConfig::from_toml(include_str!("../../../deploy/ingestion.toml.example")).unwrap();
+        assert_eq!(config, SyncConfig::default());
+        assert_eq!(config, SyncConfig::from_toml("schema_version = 2").unwrap());
+        config.validate().unwrap();
         assert!(
-            SyncConfig::from_file(&file)
-                .unwrap_err()
-                .to_string()
-                .contains("16 KiB")
+            config
+                .resources(SCRATCH_LIMIT, MEMORY_LIMIT, Some(MEMORY_LIMIT))
+                .is_ok()
         );
-        fs::write(&file, [0xff]).unwrap();
         assert!(
-            SyncConfig::from_file(&file)
-                .unwrap_err()
-                .to_string()
-                .contains("UTF-8")
-        );
-    }
-
-    #[test]
-    fn validates_scratch_and_cgroup_capacity() {
-        let default = SyncConfig::default();
-        let resources = default
-            .resources(SCRATCH_LIMIT, MEMORY_LIMIT, None)
-            .unwrap();
-        assert_eq!(resources.scratch_required_bytes, 136 * MIB);
-        assert_eq!(resources.memory_required_bytes, 1080 * MIB);
-        assert!(default.resources(135 * MIB, MEMORY_LIMIT, None).is_err());
-        assert!(
-            default
-                .resources(SCRATCH_LIMIT, MEMORY_LIMIT, Some(1024 * MIB))
+            config
+                .resources(SCRATCH_REQUIRED - 1, MEMORY_LIMIT, None)
                 .is_err()
         );
-
-        let small = SyncConfig::from_toml("schema_version = 1\n[ingestion.https]\nmax_in_flight_requests = 1\n[ingestion.rsync]\nbatch_size = 1\n[ingestion.pipeline]\nmax_pending_documents = 1").unwrap();
-        small.validate().unwrap();
-        let resources = small
-            .resources(16 * MIB, MEMORY_LIMIT, Some(768 * MIB))
-            .unwrap();
-        assert_eq!(resources.memory_available_bytes, 768 * MIB);
-        assert_eq!(resources.memory_required_bytes, 668 * MIB);
+        assert!(
+            config
+                .resources(SCRATCH_LIMIT, MEMORY_LIMIT, Some(768 * MIB))
+                .is_err()
+        );
     }
 
     #[test]
-    fn uses_tightest_visible_cgroup_ancestor() {
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
-        fs::create_dir_all(dir.path().join("slice/container")).unwrap();
-        fs::write(dir.path().join("slice/memory.max"), "805306368\n").unwrap();
-        let leaf = dir.path().join("slice/container/memory.max");
-        fs::write(&leaf, "max\n").unwrap();
-        assert_eq!(
-            cgroup_limit(dir.path(), Path::new("slice/container")).unwrap(),
-            Some(768 * MIB)
+    fn recognizes_migration_errors_without_echoing_configuration() {
+        let legacy = include_str!("../../../fixtures/synthetic/ingestion-v1.toml");
+        for input in [
+            legacy,
+            "schema_version = 2\n[ingestion]\ntxt_provenance = 'secret'",
+            "schema_version = 2\n[ingestion.rsync]\nmode = 'secret'",
+        ] {
+            let error = SyncConfig::from_toml(input).unwrap_err().to_string();
+            assert!(error.contains("migrate to schema v2"));
+            assert!(!error.contains("secret"));
+        }
+        for invalid in [
+            "schema_version = 3",
+            "schema_version = 2\n[ingestion.discovery]\nfeed_format = 'atom'",
+            "schema_version = 2\n[ingestion.revalidation]\nchecksum_choice = 'none'",
+            "schema_version = 2\n[ingestion.https]\nurl = 'secret'",
+            "schema_version = 2\n[ingestion.https]\nmax_in_flight_requests = -1",
+        ] {
+            assert!(
+                !SyncConfig::from_toml(invalid)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("secret")
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_capacity_coupling_and_retry_budget() {
+        for invalid in [
+            "[ingestion.https]\nmin_request_start_interval_ms = 999",
+            "[ingestion.pipeline]\nmax_active_documents = 1",
+            "[ingestion.pipeline]\nresult_queue_items = 2",
+            "[ingestion.pipeline]\nraw_payload_budget_bytes = 50331647",
+            "[ingestion.pipeline]\nparse_budget_bytes = 402653183",
+            "[ingestion.revalidation]\nmax_rsync_sessions = 2",
+            "[ingestion.revalidation]\nmax_attempts = 2",
+            "[ingestion.revalidation]\nretry_backoff_seconds = [30,5]",
+            "[ingestion.database]\nbatch_size = 33",
+        ] {
+            assert!(
+                SyncConfig::from_toml(&format!("schema_version = 2\n{invalid}"))
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let small = SyncConfig::from_toml("schema_version = 2\n[ingestion.https]\nmax_in_flight_requests = 1\n[ingestion.pipeline]\nmax_active_documents = 1\nparser_workers = 1\nraw_payload_budget_bytes = 16777216\nparse_budget_bytes = 134217728\n[ingestion.revalidation]\nmax_attempts = 1\nretry_backoff_seconds = []").unwrap();
+        small.validate().unwrap();
+        assert!(
+            small
+                .resources(16 * MIB, MEMORY_LIMIT, Some(768 * MIB))
+                .is_ok()
         );
-        fs::write(&leaf, "536870912\n").unwrap();
-        assert_eq!(
-            cgroup_limit(dir.path(), Path::new("slice/container")).unwrap(),
-            Some(512 * MIB)
-        );
-        fs::write(leaf, "invalid").unwrap();
-        assert!(cgroup_limit(dir.path(), Path::new("slice/container")).is_err());
     }
 }

@@ -362,7 +362,7 @@ def exercise(project):
     hold.touch()
     project.run("up", "-d", "--wait", "--wait-timeout", "30", "fixtures", "control-probe")
     config = project.directory / "ingestion.toml"
-    valid = (phase2.REPO / "deploy/ingestion.toml.example").read_bytes()
+    valid = (phase2.REPO / "fixtures/synthetic/ingestion-v1.toml").read_bytes()
     invalid = b"schema_version = 2\n"
     config.write_bytes(invalid)
     container_path = "/etc/rfc-mcp/ingestion.toml"
@@ -384,7 +384,7 @@ def exercise(project):
         return database, mirror, project.capture("logs", "--no-color", "fixtures")
 
     previous = preflight_snapshot()
-    binary = ("--entrypoint", "/usr/local/bin/rfc-mcp-docker-sync")
+    binary = ("--entrypoint", "/phase6/sync")
     for options, args in (((), ()),
                           (binary, ("--phase2-reconcile", "--sample")),
                           (binary, ("--check-config",))):

@@ -2,13 +2,26 @@
 
 The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It requires a qualified Linux Docker host, an existing HTTPS reverse proxy, and a dedicated Docker ingress network shared with that proxy. Follow the [deployment prerequisites](deployment-prerequisites.md).
 
+## HTTPS-first Phase 1
+
+Keep production on the existing schema 9 release. Phase 1 is a discovery
+milestone for disposable qualification. It creates no candidate and gates
+`--phase3-publish`. Use the [v2 TOML example](../deploy/ingestion.toml.example)
+with the Phase 1 Sync image and its required read-only file mount. The
+production Compose layout and Sync resource limits apply to the fixture.
+Run the local preflight and discovery checks with the disposable database
+and mirror. [Discovery and v1 migration](ingestion.md#sync-configuration)
+
+The remaining procedures cover the qualified schema 9 release. Run them
+from its checkout with the matching images and v1 configuration.
+
 ## Provision
 
 1. Use the three qualified service image references in a private copy of [the environment example](../deploy/compose.env.example). For a registry release, use the three published index digests and verify the host's CPU baseline. For a local build, build the `serve`, `sync`, and `feed` Dockerfile targets and set their tags in that file. [GHCR release and digest verification](ghcr-release.md)
 2. Create the mirror and PostgreSQL backing directories. Choose nonoverlapping IPv4 subnets. Put only serve and the existing proxy on the dedicated ingress bridge. Give the proxy a separate frontend network and assign the fixed backend addresses from the environment file.
 3. Copy [the PostgreSQL access policy](../deploy/pg_hba.conf.example) and update its two private subnets if needed. Supply a database certificate with DNS SAN `postgres`, its private key, and the issuing CA. Use independent passwords for PostgreSQL bootstrap, `rfc_serve`, and `rfc_sync`.
 4. Generate three distinct 48-byte raw keys under a private umask. Make separate per-service copies of each pairwise key. Set the cursor and notification keys for serve to UID 10001, the sync copies to UID 10002, and the feed copy to UID 10003. PostgreSQL private material belongs to UID 70. Set secret files to mode 0400 and give the designated container UID access using the host’s actual UID mapping. Verify ownership inside the containers because Compose mounts the backing files directly.
-5. Copy [the ingestion example](../deploy/ingestion.toml.example) to the host file named by `RFC_SYNC_CONFIG_HOST_FILE`. Use a regular file readable by Sync's container UID 10002 under the host's rootless or rootful mapping. Mode `0444` is suitable for the example, which has no credentials. On an upgrade, carry any old `RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_PARSE_CONCURRENCY` values over to the TOML equivalents and remove those environment settings from custom Compose overrides. [Ingestion settings](ingestion.md#sync-configuration)
+5. Copy [the schema 9 ingestion example](../fixtures/synthetic/ingestion-v1.toml) to the host file named by `RFC_SYNC_CONFIG_HOST_FILE`. Use a regular file readable by Sync's container UID 10002 under the host's rootless or rootful mapping. Mode `0444` is suitable for the example, which has no credentials. On an upgrade, carry any old `RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_PARSE_CONCURRENCY` values over to the TOML equivalents and remove those environment settings from custom Compose overrides. [Schema 9 collector](ingestion.md#schema-9-release-pipeline)
 
 ```sh
 docker network create --internal --subnet 172.30.70.0/28 rfc-public-ingress

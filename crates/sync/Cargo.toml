@@ -20,13 +20,13 @@ serde.workspace = true
 serde_json.workspace = true
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }
 tokio = { workspace = true, features = ["process", "rt-multi-thread", "signal", "sync"] }
-tempfile = "3"
+tempfile = { version = "3", optional = true }
 libc.workspace = true
 roxmltree = "0.21"
 
 [features]
 phase1-fixtures = []
-phase2-fixtures = []
+phase2-fixtures = ["dep:tempfile"]
 phase3-fixtures = ["phase2-fixtures", "rfc-storage/phase3-fixtures"]
 phase6-fixtures = ["phase3-fixtures"]
 

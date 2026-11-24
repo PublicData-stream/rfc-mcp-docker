@@ -118,6 +118,18 @@ impl BlobReader {
         regular(&self.root, &relative_path(digest))
     }
 
+    /// Rehashes a canonical original without modifying or syncing the mirror.
+    pub fn verify_blob(&self, digest: BlobDigest, byte_length: i64) -> io::Result<()> {
+        verify_contents(
+            self.open_blob(digest)?,
+            DurableBlob {
+                digest,
+                byte_length,
+            },
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn generation_fence(&self, generation: GenerationId) -> io::Result<File> {
         generation_fence(
             &self.root,
@@ -546,23 +558,7 @@ impl BlobWriter {
 
     fn verify_existing(&self, blob: DurableBlob) -> io::Result<()> {
         let file = regular(&self.root, &relative_path(blob.digest))?;
-        let meta = file.metadata()?;
-        use std::os::unix::fs::MetadataExt;
-        if meta.len() != blob.byte_length as u64 || meta.mode() & 0o222 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected canonical blob size or mode",
-            ));
-        }
-        let mut reader = (&file).take(blob.byte_length as u64 + 1);
-        let (digest, length) = hash_stream(&mut reader, &mut io::sink(), blob.byte_length)?;
-        if (digest, length) != (blob.digest, blob.byte_length) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "canonical blob digest mismatch",
-            ));
-        }
-        file.sync_all()
+        verify_contents(file, blob)?.sync_all()
     }
 
     fn quarantine(
@@ -597,6 +593,26 @@ impl BlobWriter {
         fs::fsync(&self.staging)?;
         Ok(())
     }
+}
+
+fn verify_contents(file: File, blob: DurableBlob) -> io::Result<File> {
+    let meta = file.metadata()?;
+    use std::os::unix::fs::MetadataExt;
+    if meta.len() != blob.byte_length as u64 || meta.mode() & 0o222 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected canonical blob size or mode",
+        ));
+    }
+    let mut reader = (&file).take(blob.byte_length as u64 + 1);
+    let (digest, length) = hash_stream(&mut reader, &mut io::sink(), blob.byte_length)?;
+    if (digest, length) != (blob.digest, blob.byte_length) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "canonical blob digest mismatch",
+        ));
+    }
+    Ok(file)
 }
 
 fn hash_stream(

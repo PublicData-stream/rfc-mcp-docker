@@ -63,6 +63,16 @@ same-schema configuration procedure.
 [Upgrade and strict rollback](../deployment.md#upgrade-existing-volumes) ·
 [Backup and restore](../publication.md#backup-and-restore)
 
+## Phase 1 rollout
+
+The Phase 1 binary accepts schema v2 and runs discovery through the daemon
+and manual reconciliation commands. Discovery reports a sealed selection
+without creating a candidate or a durable catalog observation. It can
+read historical evidence on PostgreSQL schema 9. The existing release
+continues to supply production ingestion while HTTPS acquisition and the
+audit gate are developed. Phase 1 retains sequence-checked rollback to
+an already retained generation. [Phase 1 configuration and discovery](../ingestion.md)
+
 ## Cold-start timing
 
 Keep the [cold-start timing contract](0009-cold-rfc-bootstrap.md#timing-contract)

@@ -1,6 +1,6 @@
 # Phase 6 control plane
 
-Run one feed process, one sync daemon, and one serve process per Compose deployment. Coordinate the [schema migration and application restart](deployment.md#initialize-or-upgrade) in one maintenance window. The sync and feed binaries start their daemons with no arguments. The existing storage, fixture, promotion, recovery, and garbage-collection commands remain available. The [Phase 6 Compose overlay](../scripts/phase6/compose.yml) is an offline test configuration. See [production Compose deployment](deployment.md) for runtime wiring.
+Run one feed process, one sync daemon, and one serve process per Compose deployment. Coordinate the [schema migration and application restart](deployment.md#initialize-or-upgrade) in one maintenance window. The sync and feed binaries start their daemons with no arguments. Storage, rollback, recovery, and garbage-collection commands remain available. The [Phase 6 Compose overlay](../scripts/phase6/compose.yml) is an offline test configuration. See [production Compose deployment](deployment.md) for runtime wiring.
 
 ## Private listeners and credentials
 
@@ -23,6 +23,17 @@ Choose a new key ID and generate a fresh key. Install it as the active key on th
 ## Reconciliation and publication
 
 Feed polls the official publication feed every 15 minutes plus jitter. Conditional validators advance only after its hints are acknowledged. The RFC publication identifier determines the observation fingerprint and event ID, so a replay, a switch between feed formats, or a restart can repeat the same hint safely. A feed hint acknowledges durable acceptance, which can refer to an existing job. Inspect `rfc.control_events.job_id`, the event status, and `rfc.sync_jobs.state` to see whether work has completed. A failed job is terminal after two retries. Later scheduled work can still reconcile independently.
+
+With HTTPS-first Phase 1, startup, scheduled work, and Feed hints run the
+same full discovery. A completed job records `outcome = 'discovery_complete'`.
+Hints whose digests have yet to match an eligible catalog ID or mirror
+entry defer the job within the existing retry budget. Feed bursts coalesce
+into one pending job and newly queued Feed work waits one second before
+being claimed. The incumbent remains readable and new publication is
+gated. Previously queued publication notifications can still be delivered.
+[Phase 1 discovery](ingestion.md#run-discovery)
+
+The following publication behavior applies to the deployed schema 9 release.
 
 Sync performs full reconciliation at startup and daily and checks the official catalog digest hourly. A changed catalog or a new feed event can also queue a full reconciliation. One running job and one pending rerun bound concurrency. PostgreSQL advisory key `-3` owns the daemon and `-4` serializes short queue transactions. The existing mirror and PostgreSQL corpus locks still fence ingestion, maintenance, and promotion. The job retains its candidate and expected publication sequence across a daemon crash. A verified full run commits a new publication with its provenance, even when the corpus content is unchanged. Under a promotion error, the previous active generation remains readable. A failed job can leave its ready candidate for inspection or disposal with `--phase3-discard`.
 

@@ -767,7 +767,7 @@ blob references. [Migration inventory](../migrations/) ·
 [Storage schema check](../crates/storage/src/postgres.rs)
 
 [Production Compose](../compose.yml) requires a read-only Sync config file
-mount. The [bulk overlay](../deploy/compose.bulk-rsync.yml) adds a private
+mount. The [schema 9 bulk overlay](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/deploy/compose.bulk-rsync.yml) adds a private
 writable staging bind to Sync. The [runtime image targets](../Dockerfile)
 use the default Rust features. The `phase6-fixture` target builds separate
 Sync and Feed binaries with fixture features. Sync's fixture features
@@ -923,3 +923,76 @@ done
 cargo fetch --locked --offline
 scripts/phase0/check-rust.sh
 ```
+
+## HTTPS-first RFC synchronization Phase 1
+
+The Sync runtime accepts ingestion TOML schema 2 and runs shared
+discovery for manual reconciliation, daemon startup, scheduled work,
+and Feed hints. It keeps PostgreSQL schema 9 and the incumbent
+publication. A sealed selection can supply the later HTTPS queues.
+New candidate publication stays gated. [Configuration and discovery](ingestion.md) ·
+[Rollout decision](decisions/0010-https-first-rfc-synchronization.md#phase-1-rollout)
+
+Discovery uses the original opening and ending HTTPS catalog captures,
+a bounded list-only inventory from packaged rsync 3.5.2, and streamed
+BLAKE3 verification of selected canonical TXT. The Feed control
+payload retains its existing event identity and digest. Audit and
+publication evidence are delivered in later phases.
+
+### Verification on 2026-11-24
+
+- The offline Rust gate passed, including the MCP wire probe. All-feature
+  Clippy and tests passed. The separate Phase 2 and Phase 3 fixture-feature
+  Clippy passes also passed.
+- The Phase 0 Compose runtime probes passed serially on the rootful and
+  rootless engines. They exercised rsync, TLS verification, PostgreSQL
+  authorization, and the Landlock and seccomp restrictions. The checked
+  images were built on rootless Docker and copied to the rootful engine.
+- The disposable minikube test passed on Kubernetes 1.37.0 with the
+  rootless Docker driver and containerd. The stock Sync image ran as UID
+  10002 and rejected a write to its ConfigMap. The mounted file supplied
+  schema 2, and `--check-config` observed a 2 GiB cgroup limit and
+  512 MiB scratch. The profile and its temporary files were removed.
+  Rootful image building and the first minikube start encountered a
+  missing default `docker0` bridge. The rootless setup resolved both.
+- The private discovery suite passed on both Compose engines. Manual and
+  daemon reports sealed the same cold selection. Completed cold and warm
+  runs recorded two catalog HTTPS starts with minimum spacing above
+  one second and zero HTTPS TXT or RFCXML requests. Tests covered missing
+  sources, Feed hints before catalog and mirror, duplicate hints, a
+  frozen startup snapshot, catalog drift, malformed inventory, deadline
+  and SIGTERM cleanup, and corrupt canonical TXT. The same-size,
+  same-mtime change left the inventory digest unchanged and the
+  separate checksum dry run detected the changed bytes.
+- The populated fixture kept its candidate count, active sequence, source
+  observations, and outbox through discovery. The stock CLI rejected
+  promotion of an old ready candidate. The incumbent stayed ready and
+  served exact RFC 2119 bytes. Explicit rollback then reactivated the
+  retained generation and served the same bytes at the next sequence.
+  The initial rootless probe collided with the daemon's fixed IP when
+  testing invalid config. Executing the extra process inside the daemon
+  container resolved it. The first rootful run timed out polling for the
+  rsync child. The isolated rerun passed with a fixture-side signal.
+- The targeted Phase 7 config-only probes passed on both engines.
+  They verified v2 defaults and migration errors, denied undersized
+  resources, and confirmed the mandatory Sync-only read-only bind in
+  the production Compose configuration and a one-shot container.
+  A broader rootless Phase 7 attempt timed out in the historical
+  fixture digest helper. The broader rootful attempt passed its
+  isolated preflight before reaching a stale v1 assertion, which
+  was corrected along with the targeted probe.
+
+All RFC requests in these checks used private fixtures. The production
+upstream inventory and the cold-start timing target remain to be
+qualified in the later phases.
+
+To repeat the targeted Compose checks with matching local test images,
+set `RFC_E2E_PRELOADED=1` and use their common image prefix.
+
+```sh
+python3 -B scripts/phase0/integration.py --context rootless --project "$prefix" --skip-build
+python3 -B scripts/https-discovery/integration.py --context rootless --image-prefix "$prefix"
+python3 -B scripts/phase7/integration.py --config-only --context rootless --image-prefix "$prefix"
+```
+
+Run the same commands with context `default` on a rootful engine.

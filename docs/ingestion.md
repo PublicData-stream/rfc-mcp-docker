@@ -1,46 +1,104 @@
-# Phase 2 candidate ingestion
+# RFC discovery and candidate ingestion
 
-Provision the mirror and PostgreSQL 19 roles using the [storage instructions](storage.md). Run the sync image as UID 10002 in Docker Compose with the writable mirror, the scoped sync credentials, and outbound access to RFC Editor over HTTPS and rsync. Compose gives sync a private 512 MiB tmpfs at `/tmp`, a 2 GiB memory limit, and two CPUs. Size the host for the sync cgroup, including its tmpfs use. [Disposable Compose live profile](../scripts/phase2/live.yml)
+The HTTPS-first Phase 1 build performs discovery on demand and through the
+Sync daemon. Both paths use the same source policy under the corpus lock.
+The existing schema 9 release continues to supply production ingestion
+until required HTTPS TXT and audit evidence can gate new publications.
+[HTTPS-first design](decisions/0010-https-first-rfc-synchronization.md)
 
-Use these commands in a Compose project configured with the sync service.
+## Sync configuration
+
+Use the [schema v2 TOML example](../deploy/ingestion.toml.example). Compose
+requires the host file named by `RFC_SYNC_CONFIG_HOST_FILE` and mounts it
+read-only for Sync at `RFC_SYNC_CONFIG_FILE`. The file must be regular UTF-8
+and at most 16 KiB. Standalone Sync uses safe defaults when the file path is
+unset. A configured path must resolve to a readable file. Validation precedes
+database connections, source requests, and queue changes. Feed retains its
+own format and cadence. [Control and Feed](control.md)
+
+| Active setting | Default | Range |
+| --- | ---: | ---: |
+| `ingestion.max_accepted_bytes` | 4294967296 | 1–4294967296 |
+| `ingestion.discovery.inventory_timeout_seconds` | 120 | 5–120 |
+| `ingestion.discovery.full_reconcile_interval_seconds` | 86400 | 3600–604800 |
+| `ingestion.https.max_in_flight_requests` | 2 | 1–2 |
+| `ingestion.https.min_request_start_interval_ms` | 1000 | 1000–60000 |
+| `ingestion.https.request_timeout_seconds` | 30 | 5–30 |
+| `ingestion.https.max_attempts` | 3 | 1–3 |
+
+The accepted-byte limit covers both catalog captures and local canonical
+TXT rehashes. The ten-minute discovery deadline applies independently.
+Transient catalog fetch errors use up to three total attempts. A valid
+`Retry-After` from a 429 or 503 delays subsequent Sync HTTPS starts. Delays
+above 30 seconds end the immediate retry and remain in effect for the
+daemon's later catalog work.
+
+The remaining tables in the example reserve and validate capacity for
+subsequent phases. Defaults are the initial upper limits for queue sizes,
+active documents, workers, payload and parse budgets, sessions, timeouts,
+and batch sizes. The queue sizes and budgets must cover the active window
+at 16 MiB raw and 128 MiB parse bytes per document. The documented 900-second
+target is informational. Set one increasing backoff of 1–120 seconds per
+rsync retry. For one total attempt, set `retry_backoff_seconds = []`.
+Revalidation cadence accepts 3600–604800 seconds.
+
+Run `rfc-mcp-docker-sync --check-config` for the effective settings, the
+publication gate, and the list of settings awaiting runtime consumers. Its
+JSON includes the 8 MiB scratch reservation and the memory estimate, which
+includes workspace capacity, two catalog bodies, inventory buffers, raw and
+parse budgets, and compact queue descriptors. Available scratch and memory
+are capped at 512 MiB and 2 GiB and tightened by the observed filesystem,
+host, and cgroup limits. Sync uses its startup snapshot until restart.
+
+### Translate v1 settings
+
+Start with the v2 example. Preserve explicit values for `max_accepted_bytes`,
+`max_in_flight_requests`, `min_request_start_interval_ms`,
+`request_timeout_seconds`, and `parser_workers` within the v2 bounds.
+Rename `rfcxml_max_attempts` to `max_attempts` and
+`max_pending_documents` to `max_active_documents`. Set
+`RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_PARSE_CONCURRENCY` values in
+their TOML equivalents and remove both old environment variables. Remove
+`txt_provenance`, `[ingestion.rsync]`, and the legacy bulk overlay.
+Choose inventory and future audit timeouts from their individual v2 fields.
+Keep the v1 file and its matched images for the existing deployment.
+
+## Run discovery
+
+Use a disposable project with the private upstream fixture for qualification.
+The existing CLI names select full or sample discovery.
 
 ~~~sh
 docker compose run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --full
 docker compose run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --sample
 ~~~
 
-Full mode reconciles the expected TXT set from the RFC Editor catalog. Sample mode uses RFCs 2119, 8174, and 9110 and records its restricted scope. A missing expected TXT, a lost previously accepted RFC, a byte disagreement, or catalog drift fails the run. The JSON report identifies the failed input when available and includes a generation ID, digest, counts, and coverage warnings. For a disagreement, sync saves both originals and their digests in /mirror/quarantine. Only sync can read that directory. An abrupt interruption can leave a building generation and durable blobs for Phase 3 recovery.
+Discovery selects the complete expected TXT set from the official opening
+catalog. Sample runs select RFCs 2119, 8174, and 9110. The fixed TXT rsync
+module supplies root-level availability through a bounded listing. Source
+sizes and times are hints. Sync rehashes selected incumbent originals before
+reporting them as potential reuse inputs for later audit. A newly expected
+TXT that has yet to appear on the mirror defers discovery. Loss of an
+already accepted required RFC, a malformed inventory, a corrupt canonical
+blob, and unequal opening and ending catalog bytes fail discovery.
 
-The collector bounds requests, disk staging, and accepted input. HTTPS requires the RFC Editor hostname and native trust roots. The collector rejects redirects and encoded bodies. Rsync uses catalog-derived filenames and transfers into a fresh private directory. A previous verified TXT observation is eligible for reuse when the staged bytes and the canonical blob match its digest.
+The terminal JSON gives the state, scope, active publication sequence,
+catalog observations, inventory digest and counts, and selection identity
+when sealed. `discovery_deferred` and `discovery_failed` return nonzero from
+the manual command. A successful discovery leaves candidates, the active
+pointer, source observations, and the outbox as they were. Explicit
+publication is gated. Existing retained rollback remains available.
+[Deployment](deployment.md)
 
-## Sync configuration
+## Schema 9 release pipeline
 
-Production Compose mounts the [ingestion TOML](../deploy/ingestion.toml.example) read-only for Sync, including one-shot commands. For direct invocations, `RFC_SYNC_CONFIG_FILE` selects the file. Each file requires `schema_version = 1`. Omitted settings use the defaults below. The file must be regular UTF-8 and at most 16 KiB. Sync rejects unknown keys and invalid settings before connecting or enqueuing work.
-
-| Key | Default | Range |
-| --- | ---: | ---: |
-| `ingestion.https.max_in_flight_requests` | 2 | 1–2 |
-| `ingestion.https.min_request_start_interval_ms` | 1000 | 1000–60000 |
-| `ingestion.https.request_timeout_seconds` | 30 | 5–30 |
-| `ingestion.https.rfcxml_max_attempts` | 3 | 1–3 |
-| `ingestion.rsync.mode` | `batched` | `batched`, `persistent_bulk` |
-| `ingestion.rsync.batch_size` | 32 | 1–32 |
-| `ingestion.rsync.transfer_timeout_seconds` | 120 | 30–120 |
-| `ingestion.rsync.bulk_transfer_timeout_seconds` | 900 | 30–900 |
-| `ingestion.pipeline.max_pending_documents` | 3 | 1–3 |
-| `ingestion.pipeline.parser_workers` | 1 | 1–2 |
-| `ingestion.max_accepted_bytes` | 4294967296 | 1–4294967296 |
-| `ingestion.txt_provenance` | `dual_source` | `dual_source`, `rsync_bootstrap` |
-
-The pending-document window must fit both concurrency settings. The HTTPS request timeout includes the fixed five-second connect timeout. The rsync timeouts apply to one batch or one bulk session, each with a fixed 30-second inactivity timeout. The accepted-byte cap is cumulative across the two catalog captures, accepted TXT and captured RFCXML. The 12-hour run deadline applies independently.
-
-Run `rfc-mcp-docker-sync --check-config` to see the effective settings and resource reservations as JSON. The check uses the same startup validation without contacting PostgreSQL or upstream. Sync reserves 8 MiB for scratch and another 4 MiB per batch entry in batched mode. Its RAM estimate includes that scratch, 144 MiB per pending document, and 512 MiB of working memory. The 512 MiB scratch and 2 GiB RAM envelope is tightened by available space on `/tmp`, physical memory, and visible cgroup v2 memory limits. Run the check inside the target container to measure its limits. Sync uses the validated snapshot until restart.
-
-When `RFC_SYNC_CONFIG_FILE` is unset, `RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_PARSE_CONCURRENCY` are accepted for compatibility. Both accept `1` or `2`. Setting either alongside `RFC_SYNC_CONFIG_FILE` fails validation. [Compose provisioning and preflight](deployment.md#provision)
+The following sections describe the deployed schema 9 collector and its
+historical qualification. Use the corresponding release checkout for its
+configuration and runtime commands.
 
 ## Pipeline and recovery
 
-Bulk mode runs one rsync session for the selected RFCs. It keeps full and sample working trees on a separate capped filesystem. Sync checks the rsync receipt and the complete inventory before admitting TXT files. Subsequent sessions use the existing files as checksum-verified transfer bases. A failed or interrupted session can leave some files updated. A retry must finish a fresh rsync session and validate the whole selection before using those bytes. [Bulk mount provisioning](deployment.md#bulk-rsync-staging)
+Bulk mode runs one rsync session for the selected RFCs. It keeps full and sample working trees on a separate capped filesystem. Sync checks the rsync receipt and the complete inventory before admitting TXT files. Subsequent sessions use the existing files as checksum-verified transfer bases. A failed or interrupted session can leave some files updated. A retry must finish a fresh rsync session and validate the whole selection before using those bytes. [Schema 9 bulk mount provisioning](deployment.md#bulk-rsync-staging)
 
 ```mermaid
 flowchart LR

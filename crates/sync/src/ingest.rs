@@ -1,17 +1,19 @@
 use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
     checkpoint::{self, Context, Kind, SavedSources},
-    config::{RsyncMode, SyncConfig, TxtProvenance},
+    discovery::{INDEX, PARSER, SAMPLE, Scope},
+    legacy_config::{RsyncMode, SyncConfig, TxtProvenance},
     metrics::{Metrics, Record, Stage},
     pipeline::{
-        Event, Pipeline, Prepared, PreparedXml, PriorTxt, Selection, Shutdown, StagedTxt,
-        TxtEvidence, TxtVerification, WorkId,
+        Event, Pipeline, Prepared, PreparedXml, PriorTxt, Selection, StagedTxt, TxtEvidence,
+        TxtVerification, WorkId,
     },
     policy::Registry,
     recovery::recover_before_ingestion,
     register_blob,
+    shutdown::Shutdown,
     text::TextReference,
-    upstream::{self, Capture, Download, MissingXml, Source, Upstream, XmlFailure},
+    upstream::{self, Capture, Download, FetchAttempts, MissingXml, Source, Upstream},
     xml,
 };
 use rfc_core::{BlobDigest, ByteRange, Coverage, GenerationId, Relation, RelationKind, RfcNumber};
@@ -27,31 +29,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PARSER: &str = "rfc-txt-catalog-1";
-const INDEX: &str = "rfc-original-bytes-pg19-1";
 const FAMILIES: [&str; 4] = [
     "all_references",
     "classified_references",
     "updates",
     "obsoletes",
 ];
-const SAMPLE: [i32; 3] = [2119, 8174, 9110];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    Full,
-    Sample,
-}
-
-impl Scope {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Sample => "sample",
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum TxtPolicy {
     Strict,
@@ -178,16 +161,6 @@ fn bounded_error(error: impl std::fmt::Display) -> String {
     error.to_string().chars().take(512).collect()
 }
 
-/// Reconciles a candidate using the official upstream endpoints.
-pub async fn reconcile(scope: Scope) -> Result<()> {
-    execute(
-        Upstream::official(SyncConfig::load()?),
-        Registry::load(),
-        scope,
-    )
-    .await
-}
-
 /// Fixture endpoints are compiled only into the dedicated test build.
 #[cfg(feature = "phase2-fixtures")]
 pub async fn reconcile_fixture(scope: Scope) -> Result<()> {
@@ -248,6 +221,7 @@ async fn execute(
     result.map(|_| ())
 }
 
+#[cfg(feature = "phase6-fixtures")]
 pub(crate) async fn ingest_locked(
     writer: &mut Writer,
     upstream: Result<Upstream>,
@@ -1201,11 +1175,11 @@ impl Run<'_> {
             }
             PreparedXml::Failed(failure) => {
                 let error = match failure {
-                    XmlFailure::Exhausted(error) => {
+                    FetchAttempts::Exhausted(error) => {
                         self.report.rfcxml.retries_exhausted += 1;
                         error
                     }
-                    XmlFailure::Terminal(error) => {
+                    FetchAttempts::Terminal(error) => {
                         self.report.rfcxml.terminal_failure += 1;
                         error
                     }

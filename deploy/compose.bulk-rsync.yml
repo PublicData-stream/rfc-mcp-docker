@@ -1,8 +1,0 @@
-services:
-  rfc-mcp-docker-sync:
-    volumes:
-      - type: bind
-        source: ${RFC_SYNC_RSYNC_STAGE_DIR:?Set RFC_SYNC_RSYNC_STAGE_DIR}
-        target: /rfc-rsync-txt
-        bind:
-          create_host_path: false

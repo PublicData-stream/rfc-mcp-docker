@@ -1,9 +1,9 @@
 //! Supervised, persistent rsync staging for one sealed catalog selection.
 
 use crate::{
-    ingest::Scope,
+    discovery::Scope,
     metrics::{Stage, StageLease},
-    pipeline::Shutdown,
+    shutdown::Shutdown,
     upstream::{MAX_CATALOG_ENTRIES, ProcessGroup, TXT_LIMIT, Upstream, filename, read_staged},
 };
 use rfc_core::RfcNumber;

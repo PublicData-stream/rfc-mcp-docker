@@ -2,7 +2,8 @@
 
 use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
 use rfc_mcp_docker_sync::{
-    Maintenance, Scope, maintain, promote, reconcile_fixture, reconcile_fixture_with_reviews,
+    Maintenance, Scope, maintain, promote_fixture as promote, reconcile_fixture,
+    reconcile_fixture_with_reviews,
 };
 use rfc_storage::{
     blob::{BlobReader, BlobWriter},

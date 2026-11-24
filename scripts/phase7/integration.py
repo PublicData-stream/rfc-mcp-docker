@@ -124,11 +124,37 @@ class Deployment:
     def admin(self, path):
         return self.capture("exec", "-T", SERVE, "wget", "-qO-", "http://127.0.0.1:8781" + path)
 
+    def check_config_mount(self):
+        project = json.loads(self.capture("--profile", "tools", "config", "--format", "json"))
+        for service, spec in project["services"].items():
+            mounts = [volume for volume in spec.get("volumes", []) if volume["target"] == INGESTION_PATH]
+            path = (spec.get("environment") or {}).get("RFC_SYNC_CONFIG_FILE")
+            if service == SYNC:
+                mount, = mounts
+                assert mount["type"] == "bind" and mount["source"] == str(self.ingestion)
+                assert mount["read_only"] and not mount["bind"]["create_host_path"]
+                assert path == INGESTION_PATH
+            else:
+                assert not mounts and path is None
+        missing = dict(self.env)
+        del missing["RFC_SYNC_CONFIG_HOST_FILE"]
+        phase1.failed(self.command("config", "--quiet"), missing, "Set RFC_SYNC_CONFIG_HOST_FILE")
+        report = json.loads(self.capture(
+            "run", "--rm", "--no-deps", "-T", "--entrypoint", "/bin/sh", SYNC, "-ec",
+            """test -r "$RFC_SYNC_CONFIG_FILE"
+awk -v path="$RFC_SYNC_CONFIG_FILE" '$5 == path && $6 ~ /(^|,)ro(,|$)/ { found = 1 }
+END { exit !found }' /proc/self/mountinfo
+exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
+            timeout=60,
+        ))
+        assert report["source"] == "file" and report["schema_version"] == 2
+        assert report["publication_gate"] == "https_txt_audit_pending"
+        assert report["resources"]["cgroup_memory_limit_bytes"] == 2 * 1024**3
+        assert report["resources"]["scratch_available_bytes"] == 512 * 1024**2
+        print("Production Compose requires a Sync-only read-only v2 config mount", flush=True)
+
     def provision(self):
-        base = [*self.docker, "compose", "-f", str(ROOT / "compose.yml"), "config", "--quiet"]
-        phase5.run(base, env=self.env)
-        summary = json.loads(self.capture("run", "--rm", "--no-deps", SYNC, "--check-config", timeout=40))
-        assert summary["source"] == "file" and summary["schema_version"] == 1
+        self.check_config_mount()
         self.run("--profile", "tools", "run", "--rm", "--no-deps", "volume-admin")
         self.run("up", "-d", "--wait", "postgres", timeout=90)
         assert self.sql("-c", "SHOW data_directory") == "/var/lib/postgresql/19/docker"
@@ -179,26 +205,29 @@ class Deployment:
         defaults = probe()
         assert defaults["source"] == "defaults"
         assert defaults["ingestion"] == probe(*file_options)["ingestion"]
-        legacy = probe("-e", "RFC_SYNC_HTTP_CONCURRENCY=1", "-e", "RFC_SYNC_PARSE_CONCURRENCY=2")
-        assert legacy["source"] == "legacy_env"
-        assert legacy["ingestion"]["https"]["max_in_flight_requests"] == 1
-        assert legacy["ingestion"]["pipeline"]["parser_workers"] == 2
-        probe(*file_options, "-e", "RFC_SYNC_HTTP_CONCURRENCY=1", expected="conflicts with legacy")
-        probe(*file_options, "-e", "RFC_SYNC_PARSE_CONCURRENCY=1", expected="conflicts with legacy")
+        assert defaults["schema_version"] == 2 and defaults["phase"] == "discovery"
+        assert defaults["publication_gate"] == "https_txt_audit_pending"
+        assert set(defaults["pending_consumers"]) == {
+            "ingestion.pipeline", "ingestion.revalidation", "ingestion.database",
+        }
+        for name in ("RFC_SYNC_HTTP_CONCURRENCY", "RFC_SYNC_PARSE_CONCURRENCY"):
+            probe("-e", f"{name}=1", expected=f"{name} was removed")
+            probe(*file_options, "-e", f"{name}=1", expected=f"{name} was removed")
         probe(*file_options, args=("--check-config", "--full"), expected="expected --version, --check-config")
         probe("-e", f"RFC_SYNC_CONFIG_FILE={INGESTION_PATH}", expected="cannot open ingestion config")
         probe("-e", "RFC_SYNC_CONFIG_FILE=", expected="must be nonempty")
         probe(memory="768m", expected="ingestion memory needs")
-        probe(scratch="128m", expected="ingestion scratch needs")
+        probe(scratch="4m", expected="ingestion scratch needs")
 
         small = self.work / "small-ingestion.toml"
-        small.write_text("""schema_version = 1
+        small.write_text("""schema_version = 2
 [ingestion.https]
 max_in_flight_requests = 1
-[ingestion.rsync]
-batch_size = 1
 [ingestion.pipeline]
-max_pending_documents = 1
+max_active_documents = 1
+parser_workers = 1
+raw_payload_budget_bytes = 16777216
+parse_budget_bytes = 134217728
 """)
         small_options = ("-e", f"RFC_SYNC_CONFIG_FILE={INGESTION_PATH}",
                          "-v", f"{small}:{INGESTION_PATH}:ro")
@@ -210,14 +239,15 @@ max_pending_documents = 1
         assert resources["scratch_available_bytes"] == 16 * 1024**2
         for body, expected in (
             (b"schema_version =", "invalid ingestion TOML"),
-            (b"schema_version = 2", "schema_version must be 1"),
-            (b"schema_version = 1\n[ingestion]\nunknown = true", "invalid ingestion TOML"),
-            (b"schema_version = 1\n[ingestion.https]\nurl = 'https://invalid.example'", "invalid ingestion TOML"),
-            (b"schema_version = 1\n[ingestion.rsync]\npath = '/mirror/blobs'", "invalid ingestion TOML"),
-            (b"schema_version = 1\n[ingestion.https]\nmax_in_flight_requests = 0", "must be 1 or 2"),
-            (b"schema_version = 1\n[ingestion.https]\nmin_request_start_interval_ms = 999", "1000 through 60000"),
-            (b"schema_version = 1\n[ingestion]\nmax_accepted_bytes = 4294967297", "1 through 4294967296"),
-            (b"schema_version = 1\n[ingestion.pipeline]\nmax_pending_documents = 1", "must fit max_pending_documents"),
+            (b"schema_version = 1", "migrate to schema v2"),
+            (b"schema_version = 3", "schema_version must be 2"),
+            (b"schema_version = 2\n[ingestion]\nunknown = true", "invalid ingestion TOML"),
+            (b"schema_version = 2\n[ingestion.https]\nurl = 'https://invalid.example'", "invalid ingestion TOML"),
+            (b"schema_version = 2\n[ingestion.rsync]\npath = '/mirror/blobs'", "migrate to schema v2"),
+            (b"schema_version = 2\n[ingestion.https]\nmax_in_flight_requests = 0", "1 through 2"),
+            (b"schema_version = 2\n[ingestion.https]\nmin_request_start_interval_ms = 999", "1000 through 60000"),
+            (b"schema_version = 2\n[ingestion]\nmax_accepted_bytes = 4294967297", "1 through 4294967296"),
+            (b"schema_version = 2\n[ingestion.pipeline]\nmax_active_documents = 1", "must fit the active document window"),
             (b"#" + b"x" * (16 * 1024), "exceeds 16 KiB"),
             (b"\xff", "must be UTF-8"),
         ):
@@ -409,12 +439,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", default="rfc-phase7-final")
+    parser.add_argument("--config-only", action="store_true",
+                        help="exercise preflight and the production config mount without seeding a corpus")
     args = parser.parse_args()
     if not __debug__:
         raise RuntimeError("Phase 7 requires assertions")
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-phase7-", dir="/tmp") as directory:
         work = Path(directory)
+        if args.config_only:
+            seed = phase1.Project(work / "config-fixture", work / "unused", args.image_prefix, docker, work.name)
+            seed.key = secrets.token_bytes(48)
+            deployment = Deployment(work, seed, args.image_prefix)
+            try:
+                deployment.check_config()
+                deployment.check_config_mount()
+            finally:
+                deployment.close()
+            return
         phase5.phase3.fixture_driver(docker, args.image_prefix, work / "publication-driver")
         seed = phase5.Project(work / work.name, work / "publication-driver", args.image_prefix, docker)
         seed.env.update(PHASE5_DIR=str(work), PHASE5_SCRIPTS=str(PHASE5), PHASE5_PROXY_IP="")

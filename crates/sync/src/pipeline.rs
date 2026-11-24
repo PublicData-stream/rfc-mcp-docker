@@ -3,11 +3,12 @@
 use crate::{
     bulk,
     checkpoint::{Kind, Saved, SavedSources},
-    config::{RAW_PER_DOCUMENT, RsyncMode},
-    ingest::Scope,
+    discovery::Scope,
+    legacy_config::{RAW_PER_DOCUMENT, RsyncMode},
     metrics::{Metrics, Stage},
     parse::{Budget, BudgetExceeded, DOCUMENT_BYTES, OwnedText},
-    upstream::{Capture, Download, MissingXml, RsyncBatch, Source, Upstream, XmlFailure},
+    shutdown::Shutdown,
+    upstream::{Capture, Download, FetchAttempts, MissingXml, RsyncBatch, Source, Upstream},
     xml::{self, XmlReferences},
 };
 use rfc_core::{BlobDigest, GenerationId, RfcNumber};
@@ -17,47 +18,9 @@ use rfc_storage::{
 };
 use std::{collections::VecDeque, io::Read, sync::Arc, time::Instant};
 use tokio::{
-    sync::{Semaphore, mpsc, oneshot, watch},
+    sync::{Semaphore, mpsc, oneshot},
     task::{self, JoinSet},
 };
-
-#[derive(Clone)]
-pub(crate) struct Shutdown(watch::Sender<bool>);
-
-impl Shutdown {
-    pub(crate) fn new() -> Self {
-        Self(watch::channel(false).0)
-    }
-
-    pub(crate) fn stop(&self) {
-        self.0.send_replace(true);
-    }
-
-    pub(crate) fn check(&self) -> Result<()> {
-        if *self.0.borrow() {
-            Err("reconciliation cancelled".into())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(crate) async fn cancelled(&self) {
-        let _ = self.0.subscribe().wait_for(|cancelled| *cancelled).await;
-    }
-
-    pub(crate) async fn until<T>(
-        &self,
-        deadline: tokio::time::Instant,
-        work: impl Future<Output = Result<T>>,
-    ) -> Result<T> {
-        tokio::select! {
-            biased;
-            _ = self.cancelled() => Err("reconciliation cancelled".into()),
-            _ = tokio::time::sleep_until(deadline) => Err("reconciliation deadline exceeded".into()),
-            result = work => result,
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct PriorTxt {
@@ -98,7 +61,7 @@ pub(crate) enum PreparedXml {
     Reused(Saved, XmlReferences),
     Malformed(Capture, Box<dyn std::error::Error + Send + Sync>),
     Missing(MissingXml),
-    Failed(XmlFailure),
+    Failed(FetchAttempts),
 }
 
 pub(crate) enum TxtEvidence {
@@ -164,7 +127,7 @@ pub(crate) struct Pipeline {
 }
 
 enum XmlInput {
-    Upstream(std::result::Result<Download, XmlFailure>),
+    Upstream(std::result::Result<Download, FetchAttempts>),
     Saved(Saved, Vec<u8>),
 }
 

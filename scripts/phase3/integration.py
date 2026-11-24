@@ -63,12 +63,10 @@ class Project(phase2.Project):
         return None if error else json.loads(output)
 
     def activate(self, generation, expected, verb="publish", **options):
-        flag = f"--phase3-{verb}"
-        args = (flag, str(generation), "--expect-sequence", str(expected))
-        if options:
-            return self.invoke("sync", verb, generation, expected, **options)
-        actual = phase1.capture(self.app("sync", "-T", args=args), env=self.env)
-        assert json.loads(actual) == {"generation_id": str(generation), "publication_sequence": str(expected + 1)}
+        actual = self.invoke("sync", verb, generation, expected, **options)
+        if not options:
+            assert int(actual) == expected + 1
+        return actual
 
     def maintain(self, verb, *args):
         command = self.app("sync", "-T", args=(f"--phase3-{verb}", *map(str, args)))

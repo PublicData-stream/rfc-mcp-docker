@@ -1,5 +1,7 @@
 use rfc_core::GenerationId;
 use rfc_mcp_docker::{ProbeResult, https_probe};
+#[cfg(feature = "phase6-fixtures")]
+use rfc_mcp_docker_sync::legacy_fixtures;
 use rfc_mcp_docker_sync::{
     Maintenance, Scope, Writer, check_config, maintain, promote, reconcile, run_daemon,
 };
@@ -32,7 +34,7 @@ async fn main() -> ProbeResult {
                 _ => return Err("reconciliation requires --full or --sample".into()),
             };
             #[cfg(feature = "phase6-fixtures")]
-            if std::env::var("RFC_PHASE6_FIXTURES").as_deref() == Ok("1") {
+            if legacy_fixtures() {
                 return rfc_mcp_docker_sync::reconcile_fixture(scope).await;
             }
             reconcile(scope).await
@@ -43,8 +45,9 @@ async fn main() -> ProbeResult {
         {
             let generation =
                 GenerationId::new(generation.parse()?).ok_or("invalid generation ID")?;
-            let sequence =
-                promote(generation, sequence.parse()?, option == "--phase3-rollback").await?;
+            let expected = sequence.parse()?;
+            let rollback = option == "--phase3-rollback";
+            let sequence = promote_selected(generation, expected, rollback).await?;
             println!(
                 "{{\"generation_id\":\"{}\",\"publication_sequence\":\"{sequence}\"}}",
                 generation.get()
@@ -65,4 +68,16 @@ async fn main() -> ProbeResult {
                 .into(),
         ),
     }
+}
+
+async fn promote_selected(
+    generation: GenerationId,
+    expected: i64,
+    rollback: bool,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "phase6-fixtures")]
+    if legacy_fixtures() {
+        return rfc_mcp_docker_sync::promote_fixture(generation, expected, rollback).await;
+    }
+    promote(generation, expected, rollback).await
 }

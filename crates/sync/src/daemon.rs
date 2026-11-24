@@ -1,13 +1,7 @@
-use crate::{
-    Scope, Writer,
-    config::SyncConfig,
-    ingest::ingest_locked,
-    pipeline::Shutdown,
-    policy::Registry,
-    publication::promote_locked,
-    upstream::{Download, Source, Upstream},
-    xml,
-};
+use crate::{Scope, Writer, config::SyncConfig, discovery, shutdown::Shutdown, upstream::Upstream};
+#[cfg(feature = "phase6-fixtures")]
+use crate::{ingest::ingest_locked, legacy_config, policy::Registry, publication::promote_locked};
+#[cfg(feature = "phase6-fixtures")]
 use rfc_core::GenerationId;
 use rfc_mcp_docker::control::{
     self, Client, Command, GenerationCommitted, Keys, Link, Outcome, Rejection, SyncRequested,
@@ -23,7 +17,6 @@ use tokio_postgres::Transaction;
 
 const HEARTBEAT: Duration = Duration::from_secs(2);
 const LOOP_TICK: Duration = Duration::from_secs(1);
-const DAILY: Duration = Duration::from_secs(86400);
 const HOURLY: Duration = Duration::from_secs(3600);
 
 struct Schedule {
@@ -33,9 +26,9 @@ struct Schedule {
 }
 
 impl Schedule {
-    fn new() -> Result<Self> {
+    fn new(daily: Duration) -> Result<Self> {
         #[cfg(feature = "phase6-fixtures")]
-        if fixtures() {
+        if legacy_fixtures() || env::var("RFC_DISCOVERY_FIXTURES").as_deref() == Ok("1") {
             let setting = |name, default| -> Result<Duration> {
                 let seconds = env::var(name)
                     .ok()
@@ -48,13 +41,13 @@ impl Schedule {
                 Ok(Duration::from_secs(seconds))
             };
             return Ok(Self {
-                daily: setting("RFC_PHASE6_DAILY_SECS", 3600)?,
+                daily: setting("RFC_PHASE6_DAILY_SECS", daily.as_secs())?,
                 hourly: setting("RFC_PHASE6_HOURLY_SECS", 3600)?,
                 outbox_retry: Duration::from_secs(2),
             });
         }
         Ok(Self {
-            daily: DAILY,
+            daily,
             hourly: HOURLY,
             outbox_retry: Duration::from_secs(30),
         })
@@ -62,20 +55,64 @@ impl Schedule {
 }
 
 #[cfg(feature = "phase6-fixtures")]
-fn fixtures() -> bool {
+pub fn legacy_fixtures() -> bool {
     env::var("RFC_PHASE6_FIXTURES").as_deref() == Ok("1")
+        && env::var("RFC_DISCOVERY_FIXTURES").as_deref() != Ok("1")
 }
 
-fn upstream(config: SyncConfig) -> Result<Upstream> {
+enum Engine {
+    Discovery {
+        config: SyncConfig,
+        upstream: Box<Upstream>,
+    },
     #[cfg(feature = "phase6-fixtures")]
-    if fixtures() {
-        return Upstream::fixture(config);
+    Legacy(legacy_config::SyncConfig),
+}
+
+impl Engine {
+    fn load() -> Result<Self> {
+        #[cfg(feature = "phase6-fixtures")]
+        if legacy_fixtures() {
+            return Ok(Self::Legacy(legacy_config::SyncConfig::load()?));
+        }
+        let config = SyncConfig::load()?;
+        let upstream = discovery::upstream(&config)?;
+        Ok(Self::Discovery {
+            config,
+            upstream: Box::new(upstream),
+        })
     }
-    Upstream::official(config)
+
+    fn daily(&self) -> Duration {
+        match self {
+            Self::Discovery { config, .. } => {
+                Duration::from_secs(config.ingestion.discovery.full_reconcile_interval_seconds)
+            }
+            #[cfg(feature = "phase6-fixtures")]
+            Self::Legacy(_) => Duration::from_secs(3600),
+        }
+    }
+
+    async fn catalog_changed(&self) -> Result<bool> {
+        match self {
+            Self::Discovery { config, upstream } => {
+                catalog_changed(upstream, config.ingestion.max_accepted_bytes).await
+            }
+            #[cfg(feature = "phase6-fixtures")]
+            Self::Legacy(config) => {
+                catalog_changed(
+                    &Upstream::fixture(*config)?,
+                    config.ingestion.max_accepted_bytes,
+                )
+                .await
+            }
+        }
+    }
 }
 
 pub async fn run_daemon() -> Result<()> {
-    let config = SyncConfig::load()?;
+    let engine = Engine::load()?;
+    let schedule = Schedule::new(engine.daily())?;
     let listen = control::address(&env::var("RFC_SYNC_CONTROL_BIND")?)?;
     let notify = control::address(&env::var("RFC_SYNC_SERVE_ADDR")?)?;
     let feed_keys = Keys::load(Link::FeedSync)?;
@@ -94,13 +131,19 @@ pub async fn run_daemon() -> Result<()> {
     }
     enqueue(&mut leader, None, true).await?;
     let listener = TcpListener::bind(listen).await?;
-    let schedule = Schedule::new()?;
     let notify = Client::new(notify, Link::SyncServe, notify_keys);
     let outbox_retry = schedule.outbox_retry;
     let shutdown = Shutdown::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let stopping = async {
+        tokio::select! {
+            _ = term.recv() => (),
+            _ = interrupt.recv() => (),
+        }
+    };
     let worker_shutdown = shutdown.clone();
-    let mut worker = tokio::spawn(async move { worker(config, &schedule, &worker_shutdown).await });
+    let mut worker = tokio::spawn(async move { worker(engine, &schedule, &worker_shutdown).await });
     let services = async {
         tokio::try_join!(
             control::serve(listener, Link::FeedSync, feed_keys, accept),
@@ -116,7 +159,7 @@ pub async fn run_daemon() -> Result<()> {
             shutdown.stop();
             result.and(worker.await?)
         }
-        _ = term.recv() => {
+        _ = stopping => {
             shutdown.stop();
             worker.await?
         }
@@ -211,6 +254,12 @@ async fn enqueue(
             .try_get(0)?,
     };
     if let Some(id) = trigger {
+        if !coalesced {
+            tx.execute(
+                "UPDATE rfc.sync_jobs SET next_attempt_at = clock_timestamp() + interval '1 second' WHERE id = $1",
+                &[&job],
+            ).await?;
+        }
         let status = if coalesced { "coalesced" } else { "accepted" };
         tx.execute(
             "UPDATE rfc.control_events SET status = $2, job_id = $3 WHERE id = $1::text::uuid",
@@ -247,12 +296,16 @@ async fn claim(writer: &mut Writer) -> Result<NextJob> {
             NextJob::Waiting
         }
     } else if let Some(row) = tx
-        .query_opt("SELECT id FROM rfc.sync_jobs WHERE state = 'pending'", &[])
+        .query_opt("SELECT id, next_attempt_at <= clock_timestamp() FROM rfc.sync_jobs WHERE state = 'pending'", &[])
         .await?
     {
-        let id: i64 = row.try_get(0)?;
-        tx.execute("UPDATE rfc.sync_jobs SET state = 'running', started_at = clock_timestamp() WHERE id = $1", &[&id]).await?;
-        NextJob::Ready(id)
+        if row.try_get::<_, bool>(1)? {
+            let id: i64 = row.try_get(0)?;
+            tx.execute("UPDATE rfc.sync_jobs SET state = 'running', started_at = clock_timestamp() WHERE id = $1", &[&id]).await?;
+            NextJob::Ready(id)
+        } else {
+            NextJob::Waiting
+        }
     } else {
         NextJob::Idle
     };
@@ -260,16 +313,28 @@ async fn claim(writer: &mut Writer) -> Result<NextJob> {
     Ok(job)
 }
 
-pub(crate) async fn finish_job(tx: &Transaction<'_>, job: i64, success: bool) -> Result<()> {
+#[cfg(feature = "phase3-fixtures")]
+pub(crate) async fn finish_published_job(tx: &Transaction<'_>, job: i64) -> Result<()> {
     lock_queue(tx).await?;
-    complete(tx, job, success).await
+    complete(tx, job, JobStatus::Published).await
 }
 
-async fn complete(tx: &Transaction<'_>, job: i64, success: bool) -> Result<()> {
-    let (state, outcome, event_status) = if success {
-        ("succeeded", "published", "completed")
-    } else {
-        ("failed", "reconciliation_failed", "failed")
+#[derive(Clone, Copy)]
+enum JobStatus {
+    Discovered,
+    Deferred,
+    Failed,
+    #[cfg(feature = "phase3-fixtures")]
+    Published,
+}
+
+async fn complete(tx: &Transaction<'_>, job: i64, status: JobStatus) -> Result<()> {
+    let (state, outcome, event_status) = match status {
+        JobStatus::Discovered => ("succeeded", "discovery_complete", "completed"),
+        JobStatus::Deferred => ("failed", "discovery_deferred", "failed"),
+        JobStatus::Failed => ("failed", "reconciliation_failed", "failed"),
+        #[cfg(feature = "phase3-fixtures")]
+        JobStatus::Published => ("succeeded", "published", "completed"),
     };
     if tx
         .execute(
@@ -289,7 +354,7 @@ async fn complete(tx: &Transaction<'_>, job: i64, success: bool) -> Result<()> {
     Ok(())
 }
 
-async fn schedule_retry(writer: &mut Writer, job: i64) -> Result<()> {
+async fn schedule_retry(writer: &mut Writer, job: i64, status: JobStatus) -> Result<()> {
     let tx = writer.client.transaction().await?;
     tx.batch_execute("SET LOCAL synchronous_commit = on")
         .await?;
@@ -302,7 +367,7 @@ async fn schedule_retry(writer: &mut Writer, job: i64) -> Result<()> {
         .await?
         .try_get(0)?;
     if retries >= 2 {
-        complete(&tx, job, false).await?;
+        complete(&tx, job, status).await?;
     } else {
         let delay = if retries == 0 { 30_i32 } else { 120_i32 };
         tx.execute(
@@ -315,7 +380,12 @@ async fn schedule_retry(writer: &mut Writer, job: i64) -> Result<()> {
     Ok(())
 }
 
-async fn reconcile(job: i64, config: SyncConfig, shutdown: &Shutdown) -> Result<()> {
+#[cfg(feature = "phase6-fixtures")]
+async fn reconcile_legacy(
+    job: i64,
+    config: legacy_config::SyncConfig,
+    shutdown: &Shutdown,
+) -> Result<()> {
     let mut writer = Writer::connect().await?;
     let _corpus = writer.acquire_coordinator().await?;
     let row = writer.client.query_one(
@@ -334,14 +404,14 @@ async fn reconcile(job: i64, config: SyncConfig, shutdown: &Shutdown) -> Result<
             let tx = writer.client.transaction().await?;
             tx.batch_execute("SET LOCAL synchronous_commit = on")
                 .await?;
-            finish_job(&tx, job, true).await?;
+            finish_published_job(&tx, job).await?;
             tx.commit().await?;
             return Ok(());
         }
         _ => {
             let (id, _) = ingest_locked(
                 &mut writer,
-                upstream(config),
+                Upstream::fixture(config),
                 Registry::load(),
                 Scope::Full,
                 Some(job),
@@ -377,11 +447,10 @@ async fn reconcile(job: i64, config: SyncConfig, shutdown: &Shutdown) -> Result<
     result.map(|_| ())
 }
 
-async fn catalog_changed(config: SyncConfig) -> Result<bool> {
+async fn catalog_changed(upstream: &Upstream, accepted_bytes: u64) -> Result<bool> {
     // Use a short-lived session so the advisory lock is released on return.
     let writer = Writer::connect().await?;
     let _corpus = writer.acquire_coordinator().await?;
-    let upstream = upstream(config)?;
     upstream.after_fence().await;
     let stored: Option<String> = writer.client.query_opt(
         "SELECT encode(o.raw_digest, 'hex')
@@ -389,18 +458,19 @@ async fn catalog_changed(config: SyncConfig) -> Result<bool> {
          JOIN rfc.source_observations o ON o.identity = i.catalog_after WHERE a.singleton",
         &[],
     ).await?.map(|row| row.try_get(0)).transpose()?;
-    let Download::Captured(capture) = upstream.fetch(Source::Catalog).await? else {
-        return Err("catalog is unavailable".into());
-    };
+    let capture = upstream.catalog().await?;
+    if capture.bytes.len() as u64 > accepted_bytes {
+        return Err("catalog probe exceeds accepted byte limit".into());
+    }
     let digest = rfc_core::BlobDigest::hash(&capture.bytes).to_string();
     if stored.as_ref() == Some(&digest) {
         return Ok(false);
     }
-    xml::catalog(&capture.bytes)?;
+    tokio::task::spawn_blocking(move || discovery::parse_catalog(&capture.bytes)).await??;
     Ok(true)
 }
 
-async fn worker(config: SyncConfig, schedule: &Schedule, shutdown: &Shutdown) -> Result<()> {
+async fn worker(engine: Engine, schedule: &Schedule, shutdown: &Shutdown) -> Result<()> {
     let mut writer = Writer::connect().await?;
     let mut daily = Instant::now() + jitter(schedule.daily);
     let mut hourly = Instant::now() + jitter(schedule.hourly);
@@ -410,11 +480,12 @@ async fn worker(config: SyncConfig, schedule: &Schedule, shutdown: &Shutdown) ->
         }
         match claim(&mut writer).await {
             Ok(NextJob::Ready(job)) => {
-                if reconcile(job, config, shutdown).await.is_err() && shutdown.check().is_ok() {
-                    eprintln!("reconciliation job {job} encountered an error");
-                    if schedule_retry(&mut writer, job).await.is_err() {
-                        sleep(LOOP_TICK).await;
-                    }
+                let result = process_job(&engine, &mut writer, job, shutdown).await;
+                if let Some(status) = result
+                    && shutdown.check().is_ok()
+                    && schedule_retry(&mut writer, job, status).await.is_err()
+                {
+                    sleep(LOOP_TICK).await;
                 }
             }
             Ok(NextJob::Idle) if Instant::now() >= hourly => {
@@ -422,7 +493,7 @@ async fn worker(config: SyncConfig, schedule: &Schedule, shutdown: &Shutdown) ->
                 let changed = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
-                    result = catalog_changed(config) => result,
+                    result = async { timeout(Duration::from_secs(600), engine.catalog_changed()).await? } => result,
                 };
                 match changed {
                     Ok(true) if enqueue(&mut writer, None, false).await.is_err() => {
@@ -444,6 +515,49 @@ async fn worker(config: SyncConfig, schedule: &Schedule, shutdown: &Shutdown) ->
         }
     }
     Ok(())
+}
+
+async fn process_job(
+    engine: &Engine,
+    writer: &mut Writer,
+    job: i64,
+    shutdown: &Shutdown,
+) -> Option<JobStatus> {
+    match engine {
+        Engine::Discovery { config, upstream } => {
+            let outcome =
+                discovery::execute(Scope::Full, Some(job), config, upstream, shutdown).await;
+            match outcome {
+                Ok(discovery::Outcome::Complete) => {
+                    let finished: Result<()> = async {
+                        let tx = writer.client.transaction().await?;
+                        tx.batch_execute("SET LOCAL synchronous_commit = on")
+                            .await?;
+                        lock_queue(&tx).await?;
+                        complete(&tx, job, JobStatus::Discovered).await?;
+                        tx.commit().await?;
+                        Ok(())
+                    }
+                    .await;
+                    if finished.is_err() {
+                        eprintln!("could not acknowledge discovery job {job}");
+                        return Some(JobStatus::Failed);
+                    }
+                    None
+                }
+                Ok(discovery::Outcome::Deferred) => Some(JobStatus::Deferred),
+                Err(_) => Some(JobStatus::Failed),
+            }
+        }
+        #[cfg(feature = "phase6-fixtures")]
+        Engine::Legacy(config) => match reconcile_legacy(job, *config, shutdown).await {
+            Ok(()) => None,
+            Err(_) => {
+                eprintln!("reconciliation job {job} encountered an error");
+                Some(JobStatus::Failed)
+            }
+        },
+    }
 }
 
 async fn dispatch(mut client: Client, base_retry: Duration) -> Result<()> {

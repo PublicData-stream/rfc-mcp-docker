@@ -1,4 +1,6 @@
-use crate::{Writer, daemon::finish_job};
+use crate::Writer;
+#[cfg(feature = "phase3-fixtures")]
+use crate::daemon::finish_published_job;
 use rfc_core::{BlobDigest, GenerationId};
 use rfc_storage::{
     blob::BlobWriter,
@@ -7,6 +9,24 @@ use rfc_storage::{
 
 /// Promote a verified full candidate or roll back to a retained generation.
 pub async fn promote(generation: GenerationId, expected: i64, rollback: bool) -> Result<i64> {
+    if !rollback {
+        return Err(
+            "publication is gated until HTTPS TXT and required audits are available".into(),
+        );
+    }
+    promote_explicit(generation, expected, true).await
+}
+
+#[cfg(feature = "phase2-fixtures")]
+pub async fn promote_fixture(
+    generation: GenerationId,
+    expected: i64,
+    rollback: bool,
+) -> Result<i64> {
+    promote_explicit(generation, expected, rollback).await
+}
+
+async fn promote_explicit(generation: GenerationId, expected: i64, rollback: bool) -> Result<i64> {
     if expected < 0 {
         return Err("publication sequence must be nonnegative".into());
     }
@@ -20,7 +40,7 @@ pub(crate) async fn promote_locked(
     generation: GenerationId,
     expected: i64,
     rollback: bool,
-    job: Option<i64>,
+    _job: Option<i64>,
 ) -> Result<i64> {
     let mirror = BlobWriter::open(&mirror_root())?;
     let id = i64::try_from(generation.get())?;
@@ -92,8 +112,9 @@ pub(crate) async fn promote_locked(
         )
         .await?
         .try_get(0)?;
-    if let Some(job) = job {
-        finish_job(&tx, job, true).await?;
+    #[cfg(feature = "phase3-fixtures")]
+    if let Some(job) = _job {
+        finish_published_job(&tx, job).await?;
     }
     rfc_storage::fixture_boundary("before_publication_commit");
     tx.commit().await?;

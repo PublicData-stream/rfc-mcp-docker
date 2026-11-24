@@ -442,7 +442,7 @@ def assert_pipeline_bounds(report, *, http_limit, paced=False):
 
 def exercise_config(project, baseline):
     config = project.directory / "ingestion.toml"
-    config.write_bytes((REPO / "deploy/ingestion.toml.example").read_bytes())
+    config.write_bytes((REPO / "fixtures/synthetic/ingestion-v1.toml").read_bytes())
     options = ("-v", f"{config}:/phase2/ingestion.toml:ro")
     settings = ("RFC_SYNC_CONFIG_FILE=/phase2/ingestion.toml", "RFC_PHASE2_FIXED_CLOCK=1")
     default_file = project.reconcile(scope="sample", settings=settings, options=options)
@@ -997,15 +997,22 @@ def exercise_bulk(project):
         assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "0"
 
 
-def activate(project, generation, expected, *, rollback=False, error=None):
-    operation = "--phase3-rollback" if rollback else "--phase3-publish"
-    command = project.app("sync", "-T", args=(operation, str(generation), "--expect-sequence", str(expected)))
+def activate(project, generation, expected, *, rollback=False, error=None, historical=False):
+    operation = "rollback" if rollback else "publish"
+    if historical:
+        command = project.app("sync", "-T", args=(
+            f"--phase3-{operation}", str(generation), "--expect-sequence", str(expected),
+        ))
+    else:
+        command = project.app("sync", "-T", "--entrypoint", "/phase2/fixture-driver",
+                              args=(operation, str(generation), str(expected)))
     result = subprocess.run(command, env=project.env, text=True, capture_output=True, timeout=90)
     if error:
         assert result.returncode != 0 and error in result.stderr, result
     else:
         assert result.returncode == 0, result
-        assert json.loads(result.stdout)["publication_sequence"] == str(expected + 1)
+        sequence = json.loads(result.stdout)["publication_sequence"] if historical else result.stdout
+        assert int(sequence) == expected + 1
 
 
 def exercise_bootstrap(project):
@@ -1014,7 +1021,8 @@ def exercise_bootstrap(project):
     with capped_stage(project) as mountpoint:
         settings = ("RFC_SYNC_CONFIG_FILE=/phase2/bulk.toml", "RFC_PHASE2_FIXED_CLOCK=1")
         options = bulk_options(project, mountpoint, bootstrap=True)
-        check = project.app("sync", *options, "-e", settings[0], args=("--check-config",))
+        check = project.app("sync", *options, "-e", settings[0], "--entrypoint", "/phase2/fixture-driver",
+                            args=("check-config",))
         config = json.loads(phase1.capture(check, env=project.env))
         assert config["resources"]["bulk_filesystem"]["inodes"] <= 512
         project.start()
@@ -1157,9 +1165,9 @@ def exercise_provenance_upgrade(project, old_prefix, old_driver, old_schema, rea
     project.env.update(PHASE1_IMAGE_PREFIX=old_prefix, PHASE2_DRIVER=str(old_driver))
     try:
         first = project.reconcile()
-        activate(project, first["generation_id"], 0)
+        activate(project, first["generation_id"], 0, historical=True)
         second = project.reconcile()
-        activate(project, second["generation_id"], 1)
+        activate(project, second["generation_id"], 1, historical=True)
     finally:
         project.env.update(current)
     query = ("SELECT encode(identity, 'hex'), source_url, observed_at, fetched_at, https_verification "
@@ -1417,22 +1425,9 @@ def main():
                 assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
                 if code != 0:
                     return 1
-                assert report["verified_txt"] == 3
-                assert re.fullmatch("[0-9a-f]{64}", report["manifest_digest"])
-                observations = json.loads(project.sql("""
-                    SELECT json_agg(json_build_object(
-                        'rfc', d.rfc_id, 'url', o.source_url, 'fetched_at', o.fetched_at,
-                        'digest', encode(o.raw_digest,'hex'), 'length', v.byte_length,
-                        'notice_policy', v.notice_policy, 'section_state', v.section_state,
-                        'https_verification', o.https_verification
-                    ) ORDER BY d.rfc_id)
-                    FROM rfc.generation_documents d
-                    JOIN rfc.source_observations o ON o.identity=d.txt_observation
-                    JOIN rfc.document_versions v ON v.identity=d.document_version
-                """))
-                assert [entry["rfc"] for entry in observations] == [2119, 8174, 9110]
-                assert all(entry["https_verification"] == "verified" for entry in observations)
-                print(json.dumps({"txt_observations": observations}, sort_keys=True), flush=True)
+                assert report["state"] == "discovery_complete" and report["expected_txt"] == 3
+                assert re.fullmatch("[0-9a-f]{64}", report["selection_id"])
+                assert project.sql("SELECT count(*) FROM rfc.generations") == "0"
             elif args.bulk:
                 exercise_bulk(project)
             elif args.bulk_bootstrap:

@@ -9,12 +9,16 @@ use std::{
 #[derive(Clone, Copy)]
 pub(crate) enum Stage {
     Catalog,
+    #[cfg(feature = "phase2-fixtures")]
     Txt,
+    #[cfg(feature = "phase2-fixtures")]
     Xml,
     Rsync,
     Parse,
+    #[cfg(feature = "phase2-fixtures")]
     Install,
     Database,
+    #[cfg(feature = "phase2-fixtures")]
     Validation,
     Queue,
 }
@@ -85,6 +89,7 @@ pub(crate) struct Record {
     active: u64,
     #[serde(skip)]
     parsing: u64,
+    #[cfg(feature = "phase2-fixtures")]
     #[serde(skip)]
     staging: u64,
     #[serde(skip)]
@@ -125,6 +130,7 @@ impl Metrics {
         span
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn parse_start(&self) -> Span {
         let mut span = self.span(Stage::Parse);
         span.parser = true;
@@ -138,6 +144,7 @@ impl Metrics {
         self.0.lock().unwrap().received_bytes += bytes as u64;
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn stage_start(&self) -> StageLease {
         let mut record = self.0.lock().unwrap();
         record.staging += 1;
@@ -145,6 +152,7 @@ impl Metrics {
         StageLease(self.clone())
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn staged(
         &self,
         bytes: u64,
@@ -166,16 +174,19 @@ impl Metrics {
         }
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn out_of_order(&self) {
         self.0.lock().unwrap().out_of_order += 1;
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn admitted(&self, entries: usize) {
         let mut record = self.0.lock().unwrap();
         record.progress.admitted = entries;
         record.admitted_peak = record.admitted_peak.max(entries as u64);
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn xml_reserved(&self, entries: usize, raw_bytes: usize) {
         let mut record = self.0.lock().unwrap();
         record.progress.xml_reserved = entries;
@@ -183,10 +194,11 @@ impl Metrics {
         record.raw_reserved_peak = record.raw_reserved_peak.max(raw_bytes as u64);
     }
 
-    pub(crate) fn xml_retry(&self) {
+    pub(crate) fn retry(&self) {
         self.0.lock().unwrap().retries += 1;
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn selected(&self, count: usize) {
         let mut record = self.0.lock().unwrap();
         record.progress.selected = count;
@@ -194,12 +206,14 @@ impl Metrics {
         record.progress.xml_remaining = count;
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn txt_completed(&self) {
         let mut record = self.0.lock().unwrap();
         record.progress.txt_completed += 1;
         record.progress.txt_remaining -= 1;
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn xml_completed(&self, admitted: usize) {
         let mut record = self.0.lock().unwrap();
         record.progress.xml_completed += 1;
@@ -208,10 +222,12 @@ impl Metrics {
         record.progress.admitted = admitted;
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn progress(&self) -> Progress {
         self.0.lock().unwrap().progress
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn queue_wait(&self, elapsed: Duration) {
         let mut record = self.0.lock().unwrap();
         record.queue.calls += 1;
@@ -240,8 +256,10 @@ impl Metrics {
     }
 }
 
+#[cfg(feature = "phase2-fixtures")]
 pub(crate) struct StageLease(Metrics);
 
+#[cfg(feature = "phase2-fixtures")]
 impl Drop for StageLease {
     fn drop(&mut self) {
         self.0.0.lock().unwrap().staging -= 1;
@@ -267,12 +285,16 @@ impl Drop for Span {
         }
         let timing = match self.stage {
             Stage::Catalog => &mut record.catalog,
+            #[cfg(feature = "phase2-fixtures")]
             Stage::Txt => &mut record.txt,
+            #[cfg(feature = "phase2-fixtures")]
             Stage::Xml => &mut record.rfcxml,
             Stage::Rsync => &mut record.rsync,
             Stage::Parse => &mut record.parse,
+            #[cfg(feature = "phase2-fixtures")]
             Stage::Install => &mut record.install,
             Stage::Database => &mut record.database,
+            #[cfg(feature = "phase2-fixtures")]
             Stage::Validation => &mut record.validation,
             Stage::Queue => &mut record.queue,
         };

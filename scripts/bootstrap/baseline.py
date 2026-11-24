@@ -342,7 +342,8 @@ def initialize_stack(project, stages, mark, *, preflight):
     if preflight:
         with duration(stages, "sync_config_preflight"):
             config = json.loads(phase1.capture(
-                project.app("sync", "-T", args=("--check-config",)), env=project.env))
+                project.app("sync", "-T", "--entrypoint", "/phase6/sync", args=("--check-config",)),
+                env=project.env))
     empty = project.publication_snapshot()
     assert empty["sequence"] == 0 and empty["latest_generation"] is None and empty["job_count"] == 0, empty
     assert empty["outbox_count"] == 0

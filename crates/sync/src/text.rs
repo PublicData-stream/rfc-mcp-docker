@@ -64,7 +64,7 @@ pub(crate) fn index(bytes: &[u8]) -> Result<TextIndex<'_>> {
         bytes,
         &Budget {
             bytes: crate::parse::DOCUMENT_BYTES,
-            shutdown: &crate::pipeline::Shutdown::new(),
+            shutdown: &crate::shutdown::Shutdown::new(),
         },
     )
 }

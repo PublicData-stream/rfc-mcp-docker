@@ -1,0 +1,27 @@
+schema_version = 1
+
+[ingestion]
+max_accepted_bytes = 4294967296
+# Set to "rsync_bootstrap" with persistent_bulk only if you accept rsync-only
+# TXT evidence for the first full publication.
+txt_provenance = "dual_source"
+
+[ingestion.https]
+max_in_flight_requests = 2
+# Applies to catalog, TXT verification and RFCXML. The minimum is 1000 ms.
+min_request_start_interval_ms = 1000
+request_timeout_seconds = 30
+rfcxml_max_attempts = 3
+
+[ingestion.rsync]
+mode = "batched"
+batch_size = 32
+transfer_timeout_seconds = 120
+bulk_transfer_timeout_seconds = 900
+
+[ingestion.pipeline]
+max_pending_documents = 3
+parser_workers = 1
+
+# For strict single-slot operation, keep dual_source and batched, set
+# max_in_flight_requests and max_pending_documents to 1, and leave parser_workers at 1.

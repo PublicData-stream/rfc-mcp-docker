@@ -9,29 +9,48 @@ use rfc_storage::{
 use std::os::fd::OwnedFd;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
+#[cfg(feature = "phase2-fixtures")]
 mod bulk;
+#[cfg(feature = "phase2-fixtures")]
 mod checkpoint;
 mod config;
 mod daemon;
+mod discovery;
+#[cfg(feature = "phase2-fixtures")]
 mod ingest;
+mod inventory;
+#[cfg(feature = "phase2-fixtures")]
+mod legacy_config;
 mod metrics;
 mod parse;
+#[cfg(feature = "phase2-fixtures")]
 mod pipeline;
+#[cfg(feature = "phase2-fixtures")]
 mod policy;
 mod publication;
 mod recovery;
+mod shutdown;
+#[cfg(any(test, feature = "phase2-fixtures"))]
 mod text;
 mod upstream;
 mod xml;
 
 pub use config::check_config;
+#[cfg(feature = "phase6-fixtures")]
+#[doc(hidden)]
+pub use daemon::legacy_fixtures;
 pub use daemon::run_daemon;
+pub use discovery::{Scope, reconcile};
 #[cfg(feature = "phase2-fixtures")]
 pub use ingest::reconcile_fixture;
 #[cfg(feature = "phase3-fixtures")]
 pub use ingest::reconcile_fixture_with_reviews;
-pub use ingest::{Scope, reconcile};
+#[cfg(feature = "phase2-fixtures")]
+#[doc(hidden)]
+pub use legacy_config::check_config as check_legacy_fixture_config;
 pub use publication::promote;
+#[cfg(feature = "phase2-fixtures")]
+pub use publication::promote_fixture;
 pub use recovery::{Maintenance, maintain};
 pub use xml::validate_feed;
 
@@ -81,6 +100,7 @@ impl Writer {
         Ok(fence)
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     async fn start_ingestion(
         &mut self,
         parser: &str,
@@ -110,6 +130,7 @@ impl Writer {
         GenerationId::new(id).ok_or_else(|| "invalid candidate ID".into())
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     async fn batch(&mut self, id: GenerationId) -> Result<Candidate<'_>> {
         Ok(Candidate {
             id,
@@ -117,6 +138,7 @@ impl Writer {
         })
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     async fn fail(&self, id: GenerationId) -> Result<()> {
         self.client
             .execute(
@@ -557,6 +579,7 @@ impl Candidate<'_> {
         Ok((self.id, digest))
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     async fn commit(self) -> Result<()> {
         Ok(self.tx.commit().await?)
     }
