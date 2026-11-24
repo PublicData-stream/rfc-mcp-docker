@@ -552,3 +552,38 @@ Schema 8 binds new dual-source TXT matches to separate HTTPS and rsync observati
 - The rootful destructive restore rehearsal passed after creating the required evidence directory under `/tmp`. It verified both readable generations, the active pointer at sequence 2, canonical blobs, pinned MCP reads and the restored runtime role boundaries.
 
 Verification used disposable Compose projects and private upstream fixtures. Logs and native image receipts are under `/tmp/rfc-phase5-checks`. Official full-corpus startup through publication and readiness remains unmeasured.
+
+## Dual-queue bootstrap implementation Phase 6
+
+Sync reports aggregate progress every 60 seconds during an active generation. The terminal candidate report and the confirmed daemon publication record share the job and generation IDs. The operator workflow uses `--check-config`, then either starts the daemon or explicitly promotes a candidate created with `--phase2-reconcile --full`. [Fresh-stack runbook](deployment.md#initialize-fresh-volumes) · [Reconciliation progress](ingestion.md#reconciliation-progress)
+
+### Reproduce the private cold-start trials
+
+Use the preloaded images and Python prerequisites from the Phase 0 baseline above. Use a host that permits the disposable ext4 loop mount and disk sampling for the test mirror under `/tmp`. Supply the preloaded image prefix and a new evidence directory.
+
+```sh
+python3 -B scripts/bootstrap/baseline.py --phase6 --context default \
+    --image-prefix "$IMAGE_PREFIX" --evidence /tmp/rfc-bootstrap-phase6
+```
+
+The runner creates two independent cold six-RFC stacks using the same bulk configuration, synthetic source contents and fixed source capture times. It checks the daemon job and authenticated delivery. On the manual stack, the private fixture driver calls the shared manual engine, and the Sync CLI performs the explicit sequence-fenced promotion. The runner checks sequence zero and an empty outbox after reconciliation, then the pending notification and serving readiness after promotion. The final comparison verifies identical manifest bytes, including relations and coverage. A separate strict TXT disagreement exercises the failure and retry path.
+
+### Observed on 2026-11-24
+
+The final cold trials ran on an 18-CPU amd64 KVM host with 34.2 GiB RAM, rootful Docker Engine 29.10.0, Compose 5.8.0, and cgroup v2 on Linux `7.0.0-44-generic`. A native image bundle was built from the Phase 6 Sync source, then the same images were used on rootful and rootless Docker. The cold fixtures used preloaded images and PostgreSQL 19.0.
+
+| Six-RFC workflow | Ingestion wall (s) | T0 to published and `/ready` (s) | T0 to byte-exact MCP `get` (s) |
+| --- | ---: | ---: | ---: |
+| Daemon | 9.794 | 40.564 | 40.602 |
+| Manual candidate and explicit promotion | 9.798 | 22.867 | 22.906 |
+
+Both published the same manifest and original bytes at sequence 1, using eight HTTPS starts at least one second apart. Each recorded three XML captures, two 404s, one 410, 27,435 transferred TXT payload bytes, and 32,113 accepted bytes. The admitted-document and XML window peaks were three. The receipts include sampled disk allocations for PostgreSQL, the mirror, and staging, along with Sync and service memory peaks. An initial trial exposed Serve's expected inability to sample private mirror directories. The final trials sampled the same disposable mirror from the host and recorded no disk sampling errors.
+
+The daemon job finished without retries and its authenticated notification was observed at 40.687 s after one attempt. The manual trial reached `ready` at sequence zero with an empty outbox and `/ready` still returning 503. Explicit promotion created one pending outbox entry and Serve read the newly active generation. The strict disagreement was observed at 19.879 s with a failed generation, a retry scheduled, no outbox entry, sequence zero and `/ready` returning 503. The two final success timings are single fixture observations taken while other rootless probes ran. Full-corpus timing and the 900-second gate remain Phase 8 work.
+
+### Offline verification
+
+- `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, and `cargo clippy` and `cargo test` with `--workspace --all-targets --all-features --frozen` passed on Rust 1.100.0. Rust artifacts were under `/tmp/rust/target`.
+- The preloaded Phase 0 Compose probes passed on both Docker engines. Rootless Phase 1 storage, Phase 2 ingestion, Phase 6 daemon and control, and Phase 7 production isolation passed. The standalone rootful Phase 6 `--bulk-bootstrap` probe passed, including the job, generation and publication-log assertions. The original timed runner also passed its six-RFC strict fixture and disagreement control.
+- The first rootless Phase 3 run failed an assertion on the result of terminating a fixture reader's PostgreSQL session. The same suite passed on rootful Docker, including candidate-only sample rejection, publication, reader and GC fencing, restore, and checkpoint recovery.
+- The native image receipt, exact probe invocations, logs and final timing receipts are under `/tmp/rfc-phase6-checks.JLVfUB8l`. The bundle was built from the working tree before the Sync commit was signed, so its revision field names the parent. The `cold-final/` timing receipts record the signed Sync commit and the same image IDs.

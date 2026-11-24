@@ -78,6 +78,12 @@ After the first publication, `rsync_bootstrap` requires an HTTPS comparison for 
 
 The rsync metrics report session count, transferred file count, checksum hits and maximum validated inventory bytes. On a warm bulk run the validated inventory includes files whose content rsync confirmed without transferring.
 
+### Reconciliation progress
+
+Sync emits an aggregate `ingestion_progress` record every 60 seconds during an active generation. The generation ID connects these records to the terminal candidate report. Daemon runs also include the job ID, which links a candidate to the separate `publication` record. A `ready` result means the candidate was committed. A successful `publication` records the expected and committed sequences. A failed promotion reports the failed attempt while the database remains the source of truth for candidate state and commit outcome.
+
+TXT completion counts durably sealed TXT. XML completion counts committed membership with a classified XML outcome, including recorded unavailability and errors. Remaining counts describe unfinished selected work. Queue counts describe admitted documents and reserved XML slots, with high-water marks in the terminal metrics. On failure, the counts retain the point where work stopped. The report separates HTTPS body bytes read, logical TXT bytes in successfully transferred rsync files, validated rsync inventory size, and accepted input bytes. CPU and memory peaks are process or container measurements. The timing fixture additionally samples disk allocations for the mirror, PostgreSQL and bulk staging.
+
 ### Interrupted reconciliation
 
 ```mermaid

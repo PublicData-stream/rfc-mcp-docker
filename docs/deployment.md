@@ -13,12 +13,7 @@ The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It
 ```sh
 docker network create --internal --subnet 172.30.70.0/28 rfc-public-ingress
 docker compose --env-file /path/to/rfc.env config --quiet
-docker compose --env-file /path/to/rfc.env run --rm --no-deps rfc-mcp-docker-sync --check-config
-docker compose --env-file /path/to/rfc.env --profile tools run --rm --no-deps volume-admin
-docker compose --env-file /path/to/rfc.env up -d --wait postgres
 ```
-
-The volume operation adjusts only the backing directories themselves. PostgreSQL owns `/var/lib/postgresql` and expects its data in `/var/lib/postgresql/19/docker`. Verify with `SHOW data_directory`. The role-and-subnet HBA rules require TLS and SCRAM for runtime clients. Use the administrator’s local peer-authenticated socket for setup.
 
 Set `RFC_NOTIFY_DYNAMIC_RANGE` and `RFC_CONTROL_DYNAMIC_RANGE` to ranges within their corresponding private subnets and outside the fixed listener addresses. This reserves the listener addresses during concurrent startup and recreation. An omitted range uses the full subnet for compatibility with existing environment files. For a qualified upgrade, add the ranges to the private environment file and recreate the affected Compose networks after draining the application services. Preserve the bind-backed mirror and database directories.
 
@@ -35,22 +30,48 @@ docker compose -f compose.yml -f deploy/compose.bulk-rsync.yml --env-file /path/
 
 ## Initialize or upgrade
 
-For a new cluster, run the roles script and set the two role passwords interactively to match their provisioned files. For upgrades, start with existing roles. Back up the database and mirror as described in the [publication runbook](publication.md) before changing schema or images.
+### Initialize fresh volumes
 
-For schema 9, close public ingress, drain Feed and Sync, and stop Serve. Take a matched database and mirror backup and retain the previous image references. Run the owner migrations, start the schema 9 images, and verify the active sequence, retained snapshots, `/ready` and a pinned MCP read before reopening ingress. Stop Sync and set `txt_provenance = "dual_source"` to turn off rsync-only trust while staying on schema 9. To return to schema 7 binaries, restore the matched pre-upgrade backup into fresh volumes and verify it with the previous images. The restored instance resumes at the backup's publication sequence.
+Use the same project and environment file throughout. Include the bulk rsync overlay in every command if that profile is configured. Begin the cold-start clock immediately before `volume-admin`. It adjusts only the backing directory roots. PostgreSQL owns `/var/lib/postgresql` and initializes data in `/var/lib/postgresql/19/docker`. The role-and-subnet HBA rules require TLS and SCRAM for runtime connections.
+
+Run the database setup over the PostgreSQL container's local peer-authenticated socket. At each `\password` prompt, enter the password provisioned for that runtime role. The PostgreSQL bootstrap credentials stay with PostgreSQL.
 
 ```sh
-docker compose --env-file /path/to/rfc.env exec postgres psql -X -U postgres -d rfc -f /migrations/roles.sql
-docker compose --env-file /path/to/rfc.env exec postgres psql -X -U postgres -d rfc -c '\password rfc_serve'
-docker compose --env-file /path/to/rfc.env exec postgres psql -X -U postgres -d rfc -c '\password rfc_sync'
-docker compose --env-file /path/to/rfc.env exec postgres psql -X -U postgres -d rfc -f /migrations/bootstrap.sql
-docker compose --env-file /path/to/rfc.env exec postgres psql -X -U postgres -d rfc -f /migrations/migrate.sql
-docker compose --env-file /path/to/rfc.env run --rm --no-deps rfc-mcp-docker-sync --phase1-check-storage
-docker compose --env-file /path/to/rfc.env run --rm --no-deps rfc-mcp-docker-serve --phase1-check-storage
-docker compose --env-file /path/to/rfc.env up -d --wait
+export RFC_ENV_FILE=/path/to/rfc.env
+compose() { docker compose --env-file "$RFC_ENV_FILE" "$@"; }
+# For bulk rsync, add -f compose.yml -f deploy/compose.bulk-rsync.yml to compose().
+compose --profile tools run --rm --no-deps volume-admin
+compose up -d --wait postgres
+compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -c 'SHOW data_directory'
+compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/roles.sql
+compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -c '\password rfc_serve'
+compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -c '\password rfc_sync'
+compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/bootstrap.sql
+compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/migrate.sql
+compose run --rm --no-deps rfc-mcp-docker-sync --phase1-check-storage
+compose run --rm --no-deps rfc-mcp-docker-serve --phase1-check-storage
+compose run --rm --no-deps rfc-mcp-docker-sync --check-config
+compose up -d --wait rfc-mcp-docker-serve
 ```
 
-Peer authentication runs as the PostgreSQL container UID. Sync schedules the first publication and retries notifications independently. Feed waits for sync to start and uses its authenticated retry path. Serve container health uses `/live`. The loopback-only `/ready` requires a readable generation and the ripgrep sandbox. Check `/ready` and `rfc_mcp_rg_available` from inside serve before exposing the public route.
+### First publication
+
+For automatic publication, run `compose up -d rfc-mcp-docker-sync`. Startup queues a full reconciliation. Sync validates the candidate, publishes it against expected sequence `0`, and independently retries the authenticated notification. Start Feed after the bootstrap checks with `compose up -d rfc-mcp-docker-feed`.
+
+For operator-controlled publication, leave Sync and Feed stopped while running the two one-shot commands. Use the `generation_id` from the successful `ready` report as `GENERATION`.
+
+```sh
+compose run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --full
+compose run --rm --no-deps rfc-mcp-docker-sync --phase3-publish "$GENERATION" --expect-sequence 0
+```
+
+The manual candidate leaves the active pointer at sequence `0` until the explicit promotion. Confirm the pending outbox row and verify serving for sequence `1` before starting the daemon. It dispatches the pending notification and can enqueue another reconciliation at startup.
+
+Use the [operating checks](#operate-and-recover) to match the active PostgreSQL generation and sequence `1` with a successful loopback `/ready` and a `get` for RFC 2119 over the configured HTTPS proxy. Send the full Streamable HTTP `2026-07-28` metadata from the [MCP request example](mcp.md) and set `arguments.format` to `base64`. Check the result's `generation_id`, `publication_sequence`, and original byte range and content against the expected RFC. This read completes the cold-start timing. For automatic publication also confirm that the outbox row for the same generation and sequence reached `delivered`. Serve container health uses `/live`, so verify `/ready` and `rfc_mcp_rg_available` before opening ingress to readers.
+
+### Upgrade existing volumes
+
+For schema 9, close public ingress, drain Feed and Sync, and stop Serve. Take a matched database and mirror backup and retain the previous image references. Keep the existing roles and role passwords. Run the owner migrations, start the schema 9 images, and verify the active sequence, retained snapshots, `/ready` and a pinned MCP read before reopening ingress. Stop Sync and set `txt_provenance = "dual_source"` to turn off rsync-only trust while staying on schema 9. To return to schema 7 binaries, restore the matched pre-upgrade backup into fresh volumes and verify it with the previous images. The restored instance resumes at the backup's publication sequence. [Publication and recovery](publication.md)
 
 ## Proxy and network boundaries
 
@@ -73,6 +94,8 @@ docker compose --env-file "$RFC_ENV_FILE" exec -T rfc-mcp-docker-serve \
 docker compose --env-file "$RFC_ENV_FILE" exec -T postgres psql -X -U postgres -d rfc \
     -c 'SELECT generation_id, publication_sequence FROM rfc.active_generation' \
     -c 'SELECT id, state, outcome FROM rfc.sync_jobs ORDER BY id DESC LIMIT 10' \
+    -c 'SELECT o.generation_id, o.publication_sequence, o.delivery_state, o.attempts
+        FROM rfc.notification_outbox o JOIN rfc.active_generation a USING (generation_id, publication_sequence)' \
     -c 'SELECT delivery_state, count(*) FROM rfc.notification_outbox GROUP BY delivery_state'
 ```
 

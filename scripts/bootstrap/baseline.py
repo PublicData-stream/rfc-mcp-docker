@@ -4,7 +4,7 @@
 import argparse
 import base64
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 from statistics import median
 import subprocess
 import sys
@@ -30,6 +31,10 @@ SERVICES = ("postgres", "serve", "sync", "feed")
 PUBLICATION_SQL = """SELECT json_build_object(
     'active', a.generation_id, 'sequence', a.publication_sequence,
     'job_count', (SELECT count(*) FROM rfc.sync_jobs),
+    'outbox_count', (SELECT count(*) FROM rfc.notification_outbox),
+    'latest_generation', (SELECT json_build_object('id', id, 'state', state,
+        'created_at', created_at, 'published_at', published_at, 'manifest', encode(manifest_digest, 'hex'))
+        FROM rfc.generations ORDER BY id DESC LIMIT 1),
     'job', (SELECT json_build_object(
         'id', j.id, 'state', j.state, 'outcome', j.outcome, 'retries', j.retries,
         'generation', j.generation_id, 'queued_at', j.created_at,
@@ -96,9 +101,10 @@ class Project(phase6.Project):
     def publication_snapshot(self):
         return json.loads(self.sql(PUBLICATION_SQL))
 
-    def resources(self):
+    def resources(self, mode):
         data = {}
-        for service in SERVICES:
+        services = SERVICES if mode == "baseline" else ("postgres", "serve", "sync")
+        for service in services[:2] if mode == "bulk-manual" else services:
             output = self.capture("exec", "-T", service, "sh", "-ec",
                                   "cd /sys/fs/cgroup; cat cpu.max memory.max memory.peak; "
                                   "awk '$1 == \"usage_usec\" { print $2 }' cpu.stat")
@@ -117,24 +123,38 @@ class Project(phase6.Project):
 class DiskSamples:
     """Sample allocated blocks independently of publication and readiness polling."""
 
-    def __init__(self, project, measurements):
+    def __init__(self, project, measurements, mode):
         self.project = project
         self.measurements = measurements
+        self.mode = mode
         self.done = Event()
         self.thread = Thread(target=self.sample_periodically)
 
     def sample(self):
-        for service, name, path in (("postgres", "pgdata", "/var/lib/postgresql"),
-                                    ("sync", "mirror", "/mirror")):
+        commands = {
+            "pgdata": self.project.command("exec", "-T", "postgres", "du", "-sk", "/var/lib/postgresql"),
+            "mirror": self.project.command("exec", "-T", "sync", "du", "-sk", "/mirror"),
+        }
+        if self.mode != "baseline":
+            # The manual run has no Sync daemon, and Serve cannot traverse private mirror directories.
+            commands["mirror"] = ["sudo", "-n", "du", "-sk", "--", str(self.project.directory / "mirror")]
+        for name, command in commands.items():
             try:
-                raw = self.project.capture("exec", "-T", service, "du", "-sk", path,
-                                           timeout=5, stderr=subprocess.PIPE)
-            except subprocess.SubprocessError as error:
-                self.measurements["sampling_errors"][name] = str(error)
-                continue
-            peak = self.measurements["peak_allocated_bytes"]
-            peak[name] = max(peak.get(name, 0), int(raw.split()[0]) * 1024)
-            self.measurements["samples"][name] += 1
+                raw = phase1.capture(command, env=self.project.env, timeout=5, stderr=subprocess.PIPE)
+                self.record(name, int(raw.split()[0]) * 1024)
+            except (IndexError, OSError, ValueError, subprocess.SubprocessError) as error:
+                diagnostic = getattr(error, "stderr", None)
+                self.measurements["sampling_errors"][name] = diagnostic.strip() if isinstance(diagnostic, str) else str(error)
+        if hasattr(self.project, "stage_mount"):
+            try:
+                self.record("bulk_stage", shutil.disk_usage(self.project.stage_mount).used)
+            except OSError as error:
+                self.measurements["sampling_errors"]["bulk_stage"] = str(error)
+
+    def record(self, name, allocated):
+        peak = self.measurements["peak_allocated_bytes"]
+        peak[name] = max(peak.get(name, 0), allocated)
+        self.measurements["samples"][name] += 1
 
     def sample_periodically(self):
         while not self.done.wait(5):
@@ -163,21 +183,26 @@ def fixture_inventory(project):
     return inventory.hexdigest(), texts
 
 
-def verify_publication(project, active, texts, report):
+def verify_publication(project, active, texts, report, *, manual, bulk):
     generation = int(active["active"])
-    assert active["job_count"] == 1 and active["job"]["expected_sequence"] == 0, active
-    assert active["job"]["generation"] == generation and active["job"]["state"] == "succeeded", active
-    assert active["job"]["outcome"] == "published" and active["outbox"]["generation"] == generation, active
-    assert active["job"]["manifest"] == report["manifest_digest"], active
+    if manual:
+        assert active["job_count"] == 0 and active["outbox"]["state"] == "pending", active
+    else:
+        assert active["job_count"] == 1 and active["job"]["expected_sequence"] == 0, active
+        assert active["job"]["generation"] == generation and active["job"]["state"] == "succeeded", active
+        assert active["job"]["outcome"] == "published" and active["outbox"]["state"] == "delivered", active
+    assert active["outbox_count"] == 1 and active["outbox"]["generation"] == generation, active
+    assert active["latest_generation"]["manifest"] == report["manifest_digest"], active
     rows = json.loads(project.sql(f"""
         SELECT json_agg(json_build_array(g.rfc_id, encode(d.txt_digest, 'hex'), d.sealed,
-            o.https_verification, o.raw_digest = d.txt_digest) ORDER BY g.rfc_id)
+            o.https_verification, o.raw_digest = d.txt_digest, o.source_transport) ORDER BY g.rfc_id)
         FROM rfc.generation_documents g JOIN rfc.document_versions d ON d.identity = g.document_version
         JOIN rfc.source_observations o ON o.identity = g.txt_observation WHERE g.generation_id = {generation}
     """))
     assert [row[0] for row in rows] == sorted(texts), rows
-    for rfc, digest, sealed, verification, same_digest in rows:
-        assert sealed and verification == "verified" and same_digest, (rfc, digest)
+    for rfc, digest, sealed, verification, same_digest, transport in rows:
+        expected = ("unverified", "rsync") if bulk else ("verified", "https")
+        assert sealed and same_digest and (verification, transport) == expected, (rfc, digest)
         assert project.canonical(digest).read_bytes() == texts[rfc], rfc
     verified = json.loads(project.capture("exec", "-T", "serve", "/phase2/fixture-driver", "verify-restore"))
     assert verified["manifests"] == {str(generation): report["manifest_digest"]}, verified
@@ -190,15 +215,22 @@ def collect_logs(project, evidence):
         raw = project.capture("logs", "--timestamps", "--no-color", "--no-log-prefix", service)
         (evidence / f"{service}.log").write_text(raw + "\n")
         logs[service] = raw
-    reports = []
+    reports, events = [], []
     for line in logs["sync"].splitlines():
         timestamp, _, message = line.partition(" ")
         if message.startswith('{"scope":'):
             reports.append({"log_timestamp": timestamp, **json.loads(message)})
+        elif message.startswith("{"):
+            events.append({"log_timestamp": timestamp, **json.loads(message)})
+    manual_report = evidence / "manual-sync.json"
+    if manual_report.exists():
+        reports.append(json.loads(manual_report.read_text()))
+        events.extend(json.loads(line) for line in (evidence / "manual-sync.stderr").read_text().splitlines()
+                      if line.startswith("{"))
     counts = Counter(XML_RESPONSE.findall(logs["fixtures"]))
     http_errors = sum(count for status, count in counts.items() if status not in {"200", "404", "410"})
     xml_calls = sum(report.get("metrics", {}).get("rfcxml", {}).get("calls", 0) for report in reports)
-    return reports, {
+    return reports, events, {
         "200": counts["200"], "404": counts["404"], "410": counts["410"],
         "http_errors": http_errors,
         "without_logged_response": max(0, xml_calls - sum(counts.values())),
@@ -207,7 +239,35 @@ def collect_logs(project, evidence):
     }
 
 
+def prepare_manual_candidate(project, evidence, mark):
+    with subprocess.Popen(project.operation("sync", "full"), env=project.env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        try:
+            phase6.wait(lambda: process.poll() is not None or
+                        (project.publication_snapshot()["latest_generation"] or {}).get("state") == "building")
+            assert process.poll() is None, "manual reconciliation ended before observing building"
+            mark("first_building")
+            stdout, stderr = process.communicate(timeout=90)
+        finally:
+            if process.poll() is None:
+                process.kill()
+    (evidence / "manual-sync.stderr").write_text(stderr)
+    (evidence / "manual-sync.json").write_text(stdout)
+    report = json.loads(stdout)
+    assert process.returncode == 0 and report["state"] == "ready", (report, stderr)
+    generation = int(report["generation_id"])
+    state = project.publication_snapshot()
+    assert state["latest_generation"]["state"] == "ready" and state["latest_generation"]["id"] == generation, state
+    assert state["sequence"] == 0 and state["active"] is None and state["outbox_count"] == 0, state
+    assert state["job_count"] == 0 and "503" in project.admin("/ready").stderr, state
+    mark("candidate_ready_observed")
+    return generation
+
+
 def run_workflow(project, receipt, texts, failure, evidence):
+    mode = receipt["mode"]
+    manual = mode == "bulk-manual"
+    bulk = mode in {"bulk-manual", "bulk-daemon"}
     stages, milestones = receipt["workflow_seconds"], receipt["milestones"]
     receipt["t0_utc"] = utc_now()
     t0 = time.monotonic()
@@ -224,7 +284,14 @@ def run_workflow(project, receipt, texts, failure, evidence):
     ):
         with duration(stages, name):
             action()
-    assert project.publication() == 0
+    if mode != "baseline":
+        with duration(stages, "sync_config_preflight"):
+            receipt["effective_config"] = json.loads(phase1.capture(
+                project.app("sync", "-T", args=("--check-config",)), env=project.env))
+    empty = project.publication_snapshot()
+    assert empty["sequence"] == 0 and empty["latest_generation"] is None and empty["job_count"] == 0, empty
+    assert empty["outbox_count"] == 0
+    mark("empty_observed")
     with duration(stages, "upstream_serve_and_proxy_start"):
         project.run("up", "-d", "--wait", "fixtures", timeout=35)
         client = project.start_mcp()
@@ -232,11 +299,18 @@ def run_workflow(project, receipt, texts, failure, evidence):
         schema = next(tool["outputSchema"] for tool in json.loads(phase5.TOOL_SCHEMA.read_bytes())
                       if tool["name"] == "get")
         client.schemas["get"] = phase5.Draft202012Validator(schema)
-    with duration(stages, "sync_and_feed_start"):
-        project.run("up", "-d", "--no-deps", "sync", "feed", timeout=45)
-
     disk = receipt["disk"] = {"peak_allocated_bytes": {}, "samples": Counter(), "sampling_errors": {}}
-    with DiskSamples(project, disk):
+    with DiskSamples(project, disk, mode):
+        if manual:
+            with duration(stages, "manual_reconciliation"):
+                generation = prepare_manual_candidate(project, evidence, mark)
+            with duration(stages, "manual_publication"):
+                project.activate(generation, 0)
+        else:
+            services = ("sync", "feed") if mode == "baseline" else ("sync",)
+            with duration(stages, "sync_and_feed_start" if mode == "baseline" else "sync_start"):
+                project.run("up", "-d", "--no-deps", *services, timeout=45)
+
         def check():
             state = project.publication_snapshot()
             receipt["database"] = state
@@ -247,17 +321,19 @@ def run_workflow(project, receipt, texts, failure, evidence):
                 raise AssertionError(f"unexpected first-publication retry: {job}")
             if job.get("generation_state") == "building" and "first_building" not in milestones:
                 mark("first_building")
+            if manual:
+                return state["active"] == generation and state["latest_generation"]["state"] == "published"
             return state["active"] is not None and job.get("generation_state") == "published"
 
         phase6.wait(check, seconds=max(120, len(texts) * 5))
         active = receipt["database"]
         if failure:
             mark("first_failed_attempt")
-            assert active["sequence"] == 0 and active["active"] is None and active["outbox"] is None, active
+            assert active["sequence"] == 0 and active["active"] is None and active["outbox_count"] == 0, active
             assert "503" in project.admin("/ready").stderr
         else:
             mark("published_observed")
-            assert active["sequence"] == 1 and active["job"]["scope"] == "full", active
+            assert active["sequence"] == 1 and (manual or active["job"]["scope"] == "full"), active
             phase6.wait(lambda: project.admin("/ready").returncode == 0)
             mark("ready_observed")
             original, _ = client.call("get", id=2119, format="base64")
@@ -272,12 +348,13 @@ def run_workflow(project, receipt, texts, failure, evidence):
                 receipt["database"] = project.publication_snapshot()
                 return (receipt["database"]["outbox"] or {}).get("state") == "delivered"
 
-            phase6.wait(delivered, seconds=35)
-            mark("notification_observed")
+            if not manual:
+                phase6.wait(delivered, seconds=35)
+                mark("notification_observed")
 
-    receipt["cgroups"] = project.resources()
-    reports, statuses = collect_logs(project, evidence)
-    receipt.update(collector_reports=reports, rfcxml=statuses)
+    receipt["cgroups"] = project.resources(mode)
+    reports, events, statuses = collect_logs(project, evidence)
+    receipt.update(collector_reports=reports, sync_events=events, rfcxml=statuses)
     assert len(reports) == 1, reports
     report = reports[0]
     metrics = report["metrics"]
@@ -286,53 +363,110 @@ def run_workflow(project, receipt, texts, failure, evidence):
     assert metrics["rsync_files"] >= 1 and metrics["peak_rss_bytes"] > 0, metrics
     if failure:
         assert report["state"] == "failed" and "rsync and HTTPS TXT disagree" in report["error"], report
+        if mode != "baseline":
+            assert active["job"]["state"] == "running" and active["job"]["next_attempt_at"], active
+            assert report["job_id"] == str(active["job"]["id"]), report
+            assert report["generation_id"] == str(active["job"]["generation"]), report
+            assert not any(event.get("event") == "publication" for event in events), events
         receipt["status"] = "expected_failure"
     else:
-        assert report["state"] == "ready" and int(report["generation_id"]) == active["active"], report
-        assert report["expected_txt"] == report["verified_txt"] == metrics["rsync_files"] == len(texts)
+        assert report["state"] == "ready" and report["scope"] == "full", report
+        assert int(report["generation_id"]) == active["active"], report
+        assert report["expected_txt"] == metrics["rsync_files"] == len(texts)
+        assert report["verified_txt"] == (0 if bulk else len(texts))
+        assert report["rsync_only_txt"] == (len(texts) if bulk else 0)
         assert report["reused_txt"] == 0 and metrics["rsync_payload_bytes"] == sum(map(len, texts.values()))
-        assert metrics["https_requests"] == 2 * len(texts) + 2 and metrics["minimum_start_spacing_us"] >= 1_000_000
+        assert metrics["https_requests"] == len(texts) * (1 if bulk else 2) + 2
+        assert metrics["minimum_start_spacing_us"] >= 1_000_000
         assert statuses["200"] > 0 and statuses["404"] > 0 and statuses["410"] == 1, statuses
         assert sum(statuses[status] for status in ("200", "404", "410")) == len(texts), statuses
         assert not any(statuses[key] for key in ("http_errors", "without_logged_response", "fetch_errors", "parse_errors"))
-        receipt["storage_verification"] = verify_publication(project, receipt["database"], texts, report)
+        receipt["storage_verification"] = verify_publication(
+            project, receipt["database"], texts, report, manual=manual, bulk=bulk)
+        if bulk:
+            verify_bulk_progress(receipt, report, texts, manual)
+            generation = int(active["active"])
+            manifest_hex = project.sql(f"SELECT encode(manifest_bytes, 'hex') FROM rfc.generations WHERE id = {generation}")
+            (evidence / "manifest.json").write_bytes(bytes.fromhex(manifest_hex))
         receipt["status"] = "published_and_ready"
 
 
-def trial(args, docker, driver, work, size, repeat, failure=False):
-    label = "txt-mismatch" if failure else f"{size}-rfc-{repeat}"
+def verify_bulk_progress(receipt, report, texts, manual):
+    count = len(texts)
+    generation = report["generation_id"]
+    job = None if manual else str(receipt["database"]["job"]["id"])
+    assert report.get("job_id") == job
+    assert "first_building" in receipt["milestones"], receipt["milestones"]
+    metrics = report["metrics"]
+    assert metrics["validation"]["calls"] == 1, metrics
+    assert metrics["rsync_transferred_payload_bytes"] == sum(map(len, texts.values())), metrics
+    assert metrics["progress"] == {
+        "selected": count, "txt_completed": count, "xml_completed": count,
+        "txt_remaining": 0, "xml_remaining": 0, "admitted": 0, "xml_reserved": 0,
+    }, report
+    events = receipt["sync_events"]
+    progress = [event for event in events if event.get("event") == "ingestion_progress"]
+    assert any(event["progress"]["xml_remaining"] > 0 for event in progress), events
+    for event in progress:
+        assert event["state"] == "building" and event["job_id"] == job and event["generation_id"] == generation
+        snapshot = event["progress"]
+        assert snapshot["selected"] in {0, count}
+        for source in ("txt", "xml"):
+            assert snapshot[f"{source}_completed"] + snapshot[f"{source}_remaining"] == snapshot["selected"]
+        assert snapshot["admitted"] <= metrics["admitted_peak"]
+        assert snapshot["xml_reserved"] <= metrics["xml_window_peak"]
+    publications = [event for event in events if event.get("event") == "publication"]
+    if manual:
+        assert not publications, publications
+        return
+    published, = publications
+    assert published["state"] == "published" and published["generation_id"] == generation and published["job_id"] == job
+    assert published["expected_publication_sequence"] == "0" and published["publication_sequence"] == "1"
+    assert report["log_timestamp"] <= published["log_timestamp"], (report, published)
+    receipt["milestones"]["candidate_ready_logged"] = {"utc": report["log_timestamp"]}
+    receipt["milestones"]["publication_committed_logged"] = {"utc": published["log_timestamp"]}
+
+
+def trial(args, docker, driver, work, size, repeat, failure=False, mode="baseline"):
+    label = mode if mode != "baseline" else ("txt-mismatch" if failure else f"{size}-rfc-{repeat}")
     evidence = args.evidence / label
     evidence.mkdir()
-    receipt = {"status": "error", "size": size, "repeat": repeat, "failure_probe": failure,
+    receipt = {"status": "error", "mode": mode, "size": size, "repeat": repeat, "failure_probe": failure,
                "setup_seconds": {}, "workflow_seconds": {}, "milestones": {}}
     directory = work / label
     directory.mkdir()
     project = None
+    staging = ExitStack()
     try:
         for service in ("sync", "feed"):
             os.link(work / service, directory / service)
         project = Project(directory / f"{work.name}-{label}", driver, args.image_prefix,
                           docker, receipt["setup_seconds"])
         project.preprovision(size, directory)
+        if mode in {"bulk-daemon", "bulk-manual"}:
+            with duration(receipt["setup_seconds"], "bulk_stage_provisioning"):
+                project.stage_mount = staging.enter_context(phase2.capped_stage(project))
+                project.use_bulk_bootstrap(project.stage_mount)
         if failure:
             path = project.source / "https/rfc100.txt"
             path.write_bytes(path.read_bytes() + b"\nfixture disagreement\n")
         receipt["fixture_sha256"], texts = fixture_inventory(project)
         assert len(texts) == size
         run_workflow(project, receipt, texts, failure, evidence)
-    except (AssertionError, KeyError, OSError, ValueError, subprocess.SubprocessError) as error:
+    except (AssertionError, KeyError, OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError) as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
         if project:
             try:
-                receipt["collector_reports"], receipt["rfcxml"] = collect_logs(project, evidence)
+                receipt["collector_reports"], receipt["sync_events"], receipt["rfcxml"] = collect_logs(project, evidence)
             except (OSError, ValueError, subprocess.SubprocessError) as log_error:
                 receipt["log_error"] = str(log_error)
     finally:
-        if project:
-            try:
-                project.close()
-            except subprocess.SubprocessError as cleanup_error:
-                receipt.update(status="error", cleanup_error=str(cleanup_error))
+        try:
+            with staging:
+                if project:
+                    project.close()
+        except subprocess.SubprocessError as cleanup_error:
+            receipt.update(status="error", cleanup_error=str(cleanup_error))
         (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     t1 = receipt["milestones"].get("t1_mcp_read", {}).get("seconds")
     print(f"{label}: {receipt['status']} T1={t1} {receipt.get('error', '')}", flush=True)
@@ -346,13 +480,18 @@ def main():
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--sizes", type=int, choices=(6, 96), nargs="+", default=(6, 96))
-    parser.add_argument("--repeats", type=int, choices=range(1, 6), default=3)
+    parser.add_argument("--phase6", action="store_true", help="compare cold bulk daemon and manual publication")
+    parser.add_argument("--sizes", type=int, choices=(6, 96), nargs="+")
+    parser.add_argument("--repeats", type=int, choices=range(1, 6))
     args = parser.parse_args()
     args.evidence = args.evidence.resolve()
     if Path("/tmp") not in args.evidence.parents or args.evidence.exists():
         parser.error("--evidence must be a new directory beneath /tmp")
-    if len(set(args.sizes)) != len(args.sizes):
+    if args.phase6 and (args.sizes is not None or args.repeats is not None):
+        parser.error("--phase6 uses a fixed trial set")
+    sizes = args.sizes or (6, 96)
+    repeats = args.repeats or 3
+    if len(set(sizes)) != len(sizes):
         parser.error("--sizes must be distinct")
     args.evidence.mkdir(mode=0o700, parents=True)
     os.environ["RFC_E2E_PRELOADED"] = "1"
@@ -378,18 +517,33 @@ def main():
             summary["images"] = dict(zip(images, ids, strict=True))
             phase3.fixture_driver(docker, args.image_prefix, driver)
             phase6.fixture_binaries(docker, args.image_prefix, work)
-        for size in args.sizes:
-            for repeat in range(1, args.repeats + 1):
-                summary["runs"].append(trial(args, docker, driver, work, size, repeat))
-        summary["runs"].append(trial(args, docker, driver, work, 6, 1, failure=True))
-    summary["median_t1_seconds"] = {}
-    for size in args.sizes:
-        runs = [r for r in summary["runs"] if r["size"] == size and r["status"] == "published_and_ready"]
-        if runs:
-            summary["median_t1_seconds"][size] = median(r["milestones"]["t1_mcp_read"]["seconds"] for r in runs)
-            assert len({r["collector_reports"][0]["manifest_digest"] for r in runs}) == 1, runs
+        if args.phase6:
+            for mode in ("bulk-daemon", "bulk-manual", "strict-failure"):
+                summary["runs"].append(trial(args, docker, driver, work, 6, 1,
+                                             failure=mode == "strict-failure", mode=mode))
+        else:
+            for size in sizes:
+                for repeat in range(1, repeats + 1):
+                    summary["runs"].append(trial(args, docker, driver, work, size, repeat))
+            summary["runs"].append(trial(args, docker, driver, work, 6, 1, failure=True))
+    if args.phase6:
+        daemon, manual, _ = summary["runs"]
+        matched = all(r["status"] == "published_and_ready" for r in (daemon, manual)) and (
+            daemon["fixture_sha256"] == manual["fixture_sha256"]
+            and (args.evidence / "bulk-daemon/manifest.json").read_bytes()
+            == (args.evidence / "bulk-manual/manifest.json").read_bytes()
+        )
+        summary["manual_daemon_equivalent"] = matched
+    else:
+        summary["median_t1_seconds"] = {}
+        for size in sizes:
+            runs = [r for r in summary["runs"] if r["size"] == size and r["status"] == "published_and_ready"]
+            if runs:
+                summary["median_t1_seconds"][size] = median(r["milestones"]["t1_mcp_read"]["seconds"] for r in runs)
+                assert len({r["collector_reports"][0]["manifest_digest"] for r in runs}) == 1, runs
     (args.evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    return int(any(run["status"] == "error" for run in summary["runs"]))
+    return int(any(run["status"] == "error" for run in summary["runs"])
+               or (args.phase6 and not summary["manual_daemon_equivalent"]))
 
 
 if __name__ == "__main__":
