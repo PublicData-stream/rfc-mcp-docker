@@ -32,6 +32,7 @@ CASE_FIXTURES = {
     "phase6": ("publication-fixture", "control-fixture"),
     "phase7": ("publication-fixture",),
     "phase8": ("publication-fixture",),
+    "bootstrap-quick": ("publication-fixture", "control-fixture"),
 }
 ARCH_NAMES = {"x86_64": "amd64", "aarch64": "arm64", "amd64": "amd64", "arm64": "arm64"}
 
@@ -128,11 +129,15 @@ def pinned_images(case):
 
 def run_case(args, docker):
     args.evidence.mkdir(parents=True)
-    script = ROOT / "scripts" / args.case / "integration.py"
+    scripts = ROOT / "scripts"
+    script = (scripts / "bootstrap" / "baseline.py" if args.case == "bootstrap-quick"
+              else scripts / args.case / "integration.py")
     prefix_option = "--project" if args.case == "phase0" else "--image-prefix"
     command = [sys.executable, "-B", str(script), "--context", args.context, prefix_option, args.image_prefix]
     if args.case == "phase8":
         command.extend(("--evidence", str(args.evidence)))
+    elif args.case == "bootstrap-quick":
+        command.extend(("--phase8", "quick", "--evidence", str(args.evidence / "bootstrap-quick")))
     env = dict(os.environ, RFC_E2E_PRELOADED="1", TMPDIR="/tmp", PYTHONUNBUFFERED="1")
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace", dir=args.evidence) as stream:
         try:

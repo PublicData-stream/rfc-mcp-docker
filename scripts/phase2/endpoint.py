@@ -2,7 +2,9 @@
 
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 from pathlib import Path
 import selectors
 import socket
@@ -25,10 +27,16 @@ def wait_for_release(name):
         time.sleep(0.02)
 
 
+@cache
+def benchmark_xml_cases():
+    return json.loads((ROOT / "phase8-xml.json").read_text())
+
+
 class Https(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     drift_captures = 0
     xml_attempts = {}
+    benchmark_lock = threading.Lock()
 
     def response(self, body, media_type):
         self.send_response(200)
@@ -38,12 +46,15 @@ class Https(BaseHTTPRequestHandler):
         self.send_header("Last-Modified", "Sun, 22 Nov 2026 00:00:00 GMT")
         self.end_headers()
         try:
-            self.wfile.write(body)
+            return self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
-            pass
+            return 0
 
     def do_GET(self):
         scenario = mode()
+        if scenario.startswith("phase8-") and self.path.startswith("/rfc/") and self.path.endswith(".xml"):
+            self.benchmark_xml(scenario)
+            return
         if scenario.startswith("xml-"):
             print(f"fixture request {scenario} {self.path} {time.monotonic():.6f}", flush=True)
             if self.path.endswith(".xml") and self.path.startswith("/rfc/") and self.xml_fixture(scenario):
@@ -52,7 +63,7 @@ class Https(BaseHTTPRequestHandler):
             time.sleep(2.35)
         if scenario == "slow-txt" and self.path == "/rfc/rfc100.txt":
             time.sleep(2.0)
-        if scenario in ("benchmark", "cold-bootstrap"):
+        if scenario in ("benchmark", "cold-bootstrap", "phase8-paced"):
             # Alternate long and short responses so ordering and overlap matter.
             longer = self.path.endswith((".xml", "0.txt", "2.txt", "4.txt", "6.txt", "8.txt"))
             time.sleep(1.20 if longer else 0.10)
@@ -127,6 +138,33 @@ class Https(BaseHTTPRequestHandler):
         if scenario == "bad-rfcxml" and file.name == "rfc8174.xml":
             payload = b"<rfc number='8174'><back>"
         self.response(payload, "text/plain" if file.suffix == ".txt" else "application/xml")
+
+    def benchmark_xml(self, scenario):
+        start = time.monotonic_ns()
+        rfc = int(self.path.removeprefix("/rfc/rfc").removesuffix(".xml"))
+        case = benchmark_xml_cases()[str(rfc)]
+        if scenario == "phase8-paced":
+            time.sleep(1.20)
+        else:
+            time.sleep(0.10 if rfc % 97 == 0 else 0.025 if rfc % 3 == 0 else 0.005)
+        if case == "retried":
+            with self.benchmark_lock:
+                key = (scenario, rfc)
+                attempt = self.xml_attempts.get(key, 0) + 1
+                self.xml_attempts[key] = attempt
+        else:
+            attempt = 1
+        status = {"not_found": 404, "gone": 410, "retries_exhausted": 503}.get(case, 200)
+        if case == "retried" and attempt == 1:
+            status = 503
+        if status == 200:
+            sent = self.response((ROOT / "https" / f"rfc{rfc}.xml").read_bytes(), "application/xml")
+        else:
+            self.status(status)
+            sent = 0
+        print("phase8_xml " + json.dumps({
+            "scenario": scenario, "rfc": rfc, "start_ns": start, "status": status, "body_bytes_sent": sent,
+        }), flush=True)
 
     def xml_fixture(self, scenario):
         rfc = int(self.path.removeprefix("/rfc/rfc").removesuffix(".xml"))
@@ -206,7 +244,7 @@ class Rsync(socketserver.BaseRequestHandler):
         if scenario == "xml-overlap":
             print("fixture rsync held for XML", flush=True)
             wait_for_release("release-rsync")
-        if scenario in ("benchmark", "cold-bootstrap"):
+        if scenario in ("benchmark", "cold-bootstrap", "phase8-paced"):
             time.sleep(0.20)
         interrupted = {"rsync-interrupted": 1024, "rsync-partial": 65536}.get(scenario)
         with socket.create_connection(("127.0.0.1", 9873), 3) as upstream:

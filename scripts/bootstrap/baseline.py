@@ -43,10 +43,11 @@ PUBLICATION_SQL = """SELECT json_build_object(
         'generation_state', g.state, 'generation_created_at', g.created_at,
         'published_at', g.published_at, 'scope', i.scope, 'manifest', encode(g.manifest_digest, 'hex'))
         FROM rfc.sync_jobs j LEFT JOIN rfc.generations g ON g.id = j.generation_id
-        LEFT JOIN rfc.generation_ingestion i ON i.generation_id = g.id ORDER BY j.id LIMIT 1),
+        LEFT JOIN rfc.generation_ingestion i ON i.generation_id = g.id
+        WHERE j.id > {after_job} ORDER BY j.id LIMIT 1),
     'outbox', (SELECT json_build_object('state', delivery_state, 'attempts', attempts,
         'generation', generation_id, 'delivered_at', delivered_at, 'event_id', event_id)
-        FROM rfc.notification_outbox WHERE publication_sequence = 1))
+        FROM rfc.notification_outbox WHERE publication_sequence = {sequence}))
     FROM rfc.active_generation a WHERE a.singleton"""
 XML_RESPONSE = re.compile(r'"GET /rfc/rfc[0-9]+\.xml HTTP/1\.1" ([0-9]{3}) ')
 SCALE_SIZE = 3072
@@ -84,7 +85,7 @@ class Project(phase6.Project):
         index = command.index("-p")
         return [*command[:index], "-f", str(HERE / "compose.yml"), *command[index:]]
 
-    def preprovision(self, size, work, *, scale=False):
+    def preprovision(self, size, work, *, scale=False, paced=True):
         with duration(self.setup, "fixture_subnet_selection"):
             self.prepare_network(work)
         with duration(self.setup, "proxy_tls"):
@@ -95,7 +96,7 @@ class Project(phase6.Project):
         with duration(self.setup, "fixture_payload_and_upstream_tls"):
             base_sources = phase2.prepare_benchmark(self, size)
             (self.source / "mode").write_text("scale-bootstrap" if scale else "cold-bootstrap")
-            self.env["PHASE_BOOTSTRAP_PACED"] = "0" if scale else "1"
+            self.env["PHASE_BOOTSTRAP_PACED"] = "1" if paced and not scale else "0"
             if scale:
                 for rfc in range(10000, 10000 + size - len(base_sources)):
                     if rfc % 3 == 0:
@@ -109,8 +110,8 @@ class Project(phase6.Project):
         assert not any((self.directory / "pgdata").iterdir())
         assert not any((self.directory / "mirror").iterdir())
 
-    def publication_snapshot(self):
-        return json.loads(self.sql(PUBLICATION_SQL))
+    def publication_snapshot(self, sequence=1, after_job=0):
+        return json.loads(self.sql(PUBLICATION_SQL.format(sequence=int(sequence), after_job=int(after_job))))
 
     def resources(self, mode):
         data = {}
@@ -327,18 +328,7 @@ def prepare_manual_candidate(project, evidence, mark):
     return generation
 
 
-def run_workflow(project, receipt, texts, failure, evidence):
-    mode = receipt["mode"]
-    manual = mode == "bulk-manual"
-    bulk = mode in BULK_MODES
-    scale = mode == "bulk-scale"
-    stages, milestones = receipt["workflow_seconds"], receipt["milestones"]
-    receipt["t0_utc"] = utc_now()
-    t0 = time.monotonic()
-
-    def mark(name):
-        milestones[name] = {"utc": utc_now(), "seconds": time.monotonic() - t0}
-
+def initialize_stack(project, stages, mark, *, preflight):
     for name, action in (
         ("volume_initialization", project.initialize_volumes),
         ("postgres_initdb_and_start", project.start_postgres),
@@ -348,9 +338,10 @@ def run_workflow(project, receipt, texts, failure, evidence):
     ):
         with duration(stages, name):
             action()
-    if mode != "baseline":
+    config = None
+    if preflight:
         with duration(stages, "sync_config_preflight"):
-            receipt["effective_config"] = json.loads(phase1.capture(
+            config = json.loads(phase1.capture(
                 project.app("sync", "-T", args=("--check-config",)), env=project.env))
     empty = project.publication_snapshot()
     assert empty["sequence"] == 0 and empty["latest_generation"] is None and empty["job_count"] == 0, empty
@@ -363,6 +354,24 @@ def run_workflow(project, receipt, texts, failure, evidence):
         schema = next(tool["outputSchema"] for tool in json.loads(phase5.TOOL_SCHEMA.read_bytes())
                       if tool["name"] == "get")
         client.schemas["get"] = phase5.Draft202012Validator(schema)
+    return client, config
+
+
+def run_workflow(project, receipt, texts, failure, evidence):
+    mode = receipt["mode"]
+    manual = mode == "bulk-manual"
+    bulk = mode in BULK_MODES
+    scale = mode == "bulk-scale"
+    stages, milestones = receipt["workflow_seconds"], receipt["milestones"]
+    receipt["t0_utc"] = utc_now()
+    t0 = time.monotonic()
+
+    def mark(name):
+        milestones[name] = {"utc": utc_now(), "seconds": time.monotonic() - t0}
+
+    client, config = initialize_stack(project, stages, mark, preflight=mode != "baseline")
+    if config is not None:
+        receipt["effective_config"] = config
     disk = receipt["disk"] = {"peak_allocated_bytes": {}, "samples": Counter(), "sampling_errors": {}}
     with DiskSamples(project, disk, mode):
         if manual:
@@ -553,13 +562,15 @@ def main():
     profiles = parser.add_mutually_exclusive_group()
     profiles.add_argument("--phase6", action="store_true", help="compare cold bulk daemon and manual publication")
     profiles.add_argument("--phase7-scale", action="store_true", help="qualify 3072 RFCs on a local private fixture")
+    profiles.add_argument("--phase8", choices=("quick", "paced", "full", "rollback"),
+                          help="measure the private dual-queue bootstrap qualification")
     parser.add_argument("--sizes", type=int, choices=(6, 96), nargs="+")
     parser.add_argument("--repeats", type=int, choices=range(1, 6))
     args = parser.parse_args()
     args.evidence = args.evidence.resolve()
     if Path("/tmp") not in args.evidence.parents or args.evidence.exists():
         parser.error("--evidence must be a new directory beneath /tmp")
-    if (args.phase6 or args.phase7_scale) and (args.sizes is not None or args.repeats is not None):
+    if (args.phase6 or args.phase7_scale or args.phase8) and (args.sizes is not None or args.repeats is not None):
         parser.error("the selected profile uses a fixed trial set")
     sizes = args.sizes or (6, 96)
     repeats = args.repeats or 3
@@ -589,7 +600,12 @@ def main():
             summary["images"] = dict(zip(images, ids, strict=True))
             phase3.fixture_driver(docker, args.image_prefix, driver)
             phase6.fixture_binaries(docker, args.image_prefix, work)
-        if args.phase7_scale:
+        if args.phase8:
+            import qualification
+
+            summary["phase8"] = args.phase8
+            qualification.run(args, docker, driver, work, summary, sys.modules[__name__])
+        elif args.phase7_scale:
             summary["runs"].append(trial(args, docker, driver, work, SCALE_SIZE, 1, mode="bulk-scale"))
         elif args.phase6:
             for mode in ("bulk-daemon", "bulk-manual", "strict-failure"):
@@ -608,7 +624,7 @@ def main():
             == (args.evidence / "bulk-manual/manifest.json").read_bytes()
         )
         summary["manual_daemon_equivalent"] = matched
-    elif not args.phase7_scale:
+    elif not args.phase7_scale and not args.phase8:
         summary["median_t1_seconds"] = {}
         for size in sizes:
             runs = [r for r in summary["runs"] if r["size"] == size and r["status"] == "published_and_ready"]
@@ -617,6 +633,7 @@ def main():
                 assert len({r["collector_reports"][0]["manifest_digest"] for r in runs}) == 1, runs
     (args.evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return int(any(run["status"] == "error" for run in summary["runs"])
+               or (args.phase8 and not (summary["fixtures_reproducible"] and summary["cold_manifests_reproducible"]))
                or (args.phase6 and not summary["manual_daemon_equivalent"]))
 
 
