@@ -80,6 +80,18 @@ def read_exact(client, active, rfc, expected):
     assert base64.b64decode(original["content_base64"], validate=True) == expected, rfc
 
 
+def verify_restricted_original(project, baseline, client, active, rfc, expected):
+    client.call("get", id=rfc, format="base64", _error="source_policy_restricted")
+    generation = int(active["active"])
+    digest = project.sql(f"""
+        SELECT encode(v.txt_digest,'hex') FROM rfc.document_versions v
+        JOIN rfc.generation_documents d ON d.document_version=v.identity
+        WHERE d.generation_id={generation} AND d.rfc_id={int(rfc)}
+    """, baseline.phase1.SERVE)
+    assert project.canonical(digest).read_bytes() == expected, rfc
+    return digest
+
+
 def verify_documents(project, baseline, active, texts, cases, dual_ids, prior=None):
     generation = int(active["active"])
     old_generation = int(prior["active"]) if prior else 0
@@ -223,9 +235,15 @@ def measure(project, baseline, receipt, evidence, texts, cases, *, bulk, full, p
                          read_incumbent if incremental else None)
         baseline.phase6.wait(lambda: project.admin("/ready").returncode == 0)
         mark("ready_observed")
-        rfc = min(changed) if incremental else 2119
-        read_exact(client, active, rfc, texts[rfc])
+        read_exact(client, active, 2119, texts[2119])
         mark("t1_mcp_read")
+        if incremental:
+            rfc = min(changed)
+            leg["changed_original"] = {
+                "rfc": rfc, "mcp_policy": "source_policy_restricted",
+                "blake3": verify_restricted_original(project, baseline, client, active, rfc, texts[rfc]),
+            }
+            mark("changed_original_verified")
         assert time.monotonic() < deadline, "publication and MCP read exceeded the trial limit"
 
         def delivered():
@@ -281,9 +299,11 @@ def measure(project, baseline, receipt, evidence, texts, cases, *, bulk, full, p
         assert disk["peak_allocated_bytes"]["bulk_stage"] <= receipt["stage_limit_bytes"]
     with baseline.duration(stages, "read_only_storage_verification"):
         leg["storage_verification"] = verify_documents(project, baseline, active, texts, cases, dual_ids, prior)
-    elapsed = leg["milestones"]["t1_mcp_read"]["seconds"]
-    leg["rfc_per_second_at_t1"] = size / elapsed
-    leg["fixture_900_second_target_met"] = elapsed <= TARGET_SECONDS
+    completion = "changed_original_verified" if incremental else "t1_mcp_read"
+    leg["completed_seconds"] = leg["milestones"][completion]["seconds"]
+    leg["rfc_per_second_at_completion"] = size / leg["completed_seconds"]
+    if not incremental:
+        leg["fixture_900_second_target_met"] = leg["completed_seconds"] <= TARGET_SECONDS
     return active
 
 
@@ -335,7 +355,7 @@ parser_workers = 1
     assert failed["outbox_count"] == 1 and failed["outbox"] is None, failed
     assert project.admin("/ready").returncode == 0
     read_exact(client, active, 2119, texts[2119])
-    read_exact(client, active, 100, texts[100])
+    verify_restricted_original(project, baseline, client, active, 100, texts[100])
     https.write_bytes(texts[100])
 
     def delivered():
@@ -346,7 +366,8 @@ parser_workers = 1
     assert verified["sequence"] == 2 and verified["outbox_count"] == 2, verified
     assert verified["job"]["state"] == "succeeded" and verified["job"]["expected_sequence"] == 1, verified
     assert project.admin("/ready").returncode == 0
-    read_exact(client, verified, 100, texts[100])
+    read_exact(client, verified, 2119, texts[2119])
+    verify_restricted_original(project, baseline, client, verified, 100, texts[100])
     assert project.sql(historical_proofs, baseline.phase1.SERVE) == previous
     reports, events, _ = baseline.collect_logs(project, evidence)
     failed_report, successful_report = reports
@@ -401,7 +422,7 @@ def trial(args, docker, driver, work, baseline, repeat, size, *, bulk=False, ful
             project.run("up", "-d", "--no-deps", "control-probe", timeout=30)
             measure(project, baseline, receipt, evidence / "incremental", texts, cases,
                     bulk=True, full=True, prior=active, changed=changed)
-            print(f"{label} incremental T1={receipt['incremental']['milestones']['t1_mcp_read']['seconds']:.3f}s",
+            print(f"{label} incremental completed={receipt['incremental']['completed_seconds']:.3f}s",
                   flush=True)
         if rollback:
             rehearse_rollback(project, baseline, receipt, evidence / "rollback", active, texts, cases)
@@ -461,10 +482,10 @@ def run(args, docker, driver, work, summary, baseline):
             if name in record:
                 leg = record[name]
                 key = f"{'bulk' if record['bulk'] else 'strict'}_{name}"
-                groups[key].append(leg["milestones"]["t1_mcp_read"]["seconds"])
+                groups[key].append(leg["completed_seconds"])
                 manifests[key].add(leg["collector"]["manifest_digest"])
                 inventories[name].add(record["fixture_sha256" if name == "cold" else "incremental_fixture_sha256"])
-    summary["aggregate_t1_seconds"] = {
+    summary["aggregate_workflow_seconds"] = {
         key: {"trials": values, "p50": median(values), "p95": sorted(values)[math.ceil(0.95 * len(values)) - 1]}
         for key, values in groups.items()
     }

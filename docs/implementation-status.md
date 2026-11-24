@@ -667,3 +667,66 @@ Three cold candidates per profile used identical synthetic bytes, request delays
 All nine runs made 194 HTTPS starts and accepted 2,935,483 bytes. The shortest start interval was 1,000,208 µs. The current one-slot and pipelined profiles reserved 16 MiB and 48 MiB of raw payload capacity respectively. The read-only verifier validated each manifest. The two current profiles produced byte-identical manifests. Across both schemas, the comparison matched RFC membership, originals, byte ranges, relation evidence, and coverage.
 
 The receipts and logs are under `/tmp/rfc-dual-phase7.peGcsqOy` on the qualification host. `benchmark.json` holds the nine runs and their image IDs. `scale/summary.json` and `cold-cli/summary.json` hold the cold publication evidence. `compose-results.txt` and `forced-image.log` record the probe exit statuses and the final image identities.
+
+## Dual-queue bootstrap implementation Phase 8
+
+Phase 8 adds cold and incremental trials to the private Compose benchmark, a six-RFC paced CI case, an offline image-import probe, and a schema 9 configuration rollback rehearsal. The production defaults remain strict batched TXT verification and at least one second between HTTPS starts. Persistent bulk with `rsync_bootstrap` is an opt-in for operators who accept rsync-only TXT evidence on first publication. [Settings and reproduction commands](ingestion.md#bootstrap-qualification) · [Strict rollback](deployment.md#return-to-strict-batched-ingestion)
+
+### Qualification environment
+
+The qualification host was an amd64 KVM guest on an AMD EPYC 4585PX with 18 vCPUs and 34.2 GiB RAM. It ran Linux `7.0.0-44-generic`, Docker 29.10.0 in both contexts, Compose 5.8.0, overlayfs, cgroup v2, PostgreSQL 19.0, and Rust 1.100.0 for the current native images. Timed trials used the rootful context and the preloaded `rfc-dual-phase7-rebuilt` image set. Each receipt records exact image IDs and the observed service CPU and memory limits. The initial quick run and cold pilot recorded source base `35c6523` with benchmark changes in the working tree. The definitive full suite used `eb8cdd9` plus the source-policy probe correction in the working tree. Image inspection and fixture binary extraction took 5.557 s before the full suite.
+
+### Full-size private fixture
+
+The three cold trials initialized fresh PostgreSQL, mirror and ext4 staging storage before publishing all 9,861 selected TXT originals. All reached sequence 1, returned HTTP 200 on `/ready`, and served a byte-exact RFC 2119 over HTTPS at MCP revision `2026-07-28`. The incremental passes retained sequence 1 for readers during ingestion and published sequence 2. Each reused 9,851 TXT proofs, obtained ten new dual-source matches, and verified the changed synthetic original under the existing source policy. All six authenticated notifications delivered on the first attempt. The cold manifests reproduced exactly across the three pairs and the pilot.
+
+| Workflow completion (seconds) | Trial 1 | Trial 2 | Trial 3 | p50 | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cold through MCP read | 1,364.022 | 1,313.921 | 1,339.594 | 1,339.594 | 1,364.022 |
+| Incremental through changed-original verification | 584.257 | 462.585 | 460.715 | 462.585 | 584.257 |
+
+The p95 is the nearest-rank estimate, which equals the maximum with three samples. At the median, the workflows processed 7.361 RFCs/s cold and 21.317 RFCs/s incrementally. Cold collector wall time ranged from 1,283.691 to 1,333.668 s. The candidate-to-publication log interval ranged from 15.919 to 18.789 s. The cold medians for rsync, blob installation, database work and XML requests were 117.126, 587.070, 580.527 and 142.287 s respectively. These cumulative stage spans overlap. Blob installation and database work accounted for the largest measured service times as the three-slot queue filled. The median incremental collector took 460.005 s, including 1.308 s for rsync, 342.383 s for blob installation, and 104.010 s for database work.
+
+Each leg attempted 9,891 XML requests and sent 71,978,002 XML response body bytes. Each recorded 3,313 valid captures, including ten recovered retries, alongside 6,477 HTTP 404s, 51 HTTP 410s, ten malformed captures and ten exhausted retries. The median observed XML arrival rate was 7.537 starts/s cold and 21.568 starts/s incremental. Queue occupancy peaked at three documents and 48 MiB of reserved raw buffers. Median cumulative queue waits were 2,188.789 s cold and 675.354 s incremental.
+
+Cold Sync used 44.163–45.005 process and child CPU s, with a maximum process RSS of 24.281 MiB and a maximum container memory peak of 1,145.867 MiB. Sync's cgroup consumed 35.262–38.217 additional CPU s during each incremental workflow. From cold start through incremental completion the process and container peaks reached 40.504 and 1,163.309 MiB. Cold sampled disk peaks reached 502.71 MiB for PostgreSQL, 407.11 MiB for the canonical mirror, and 323.56 MiB for bulk staging. The incremental peaks were 519.54, 407.49, and 323.60 MiB. Each cold verifier checked 13,185 blobs and 4,919,686 ranges and line starts. Each incremental verifier checked 13,195 blobs, 4,920,976 ranges and line starts, and both readable manifests.
+
+### Paced 96-RFC comparison
+
+Both current profiles used identical fixture bytes, the one-second HTTPS start interval, and fresh data. The strict batched profile made 194 HTTPS starts per trial. Bulk bootstrap made 98 by using rsync-only TXT evidence at sequence zero. The shortest observed spacing was 1,000,257 µs. Each run delivered the publication notification and each profile reproduced its manifest across its three trials.
+
+| Current profile | Cold through MCP read (seconds) | p50 | p95 | Median collector wall (seconds) |
+| --- | --- | ---: | ---: | ---: |
+| Strict batched | 221.123, 207.513, 213.095 | 213.095 | 221.123 | 196.307 |
+| Persistent bulk bootstrap | 119.504, 116.681, 119.914 | 119.504 | 119.914 | 100.960 |
+
+The separate `scripts/phase2/integration.py --benchmark 96 --repeats 3 --serial-image-prefix rfc-p7-e2e5a41` comparison timed the historical and current collectors through candidate validation. The historical build used schema 6 and the pinned Rust 1.99.1 toolchain. The current profiles used schema 9. All nine runs made 194 HTTPS starts, read 2,935,483 HTTPS payload bytes, and passed the content and manifest verification. The minimum start spacing was 1,000,239 µs.
+
+| Candidate collector | Collector wall trials (seconds) | p50 | p95 |
+| --- | --- | ---: | ---: |
+| Historical serial | 260.330, 254.870, 269.679 | 260.330 | 269.679 |
+| Current one-slot | 249.622, 250.827, 242.348 | 249.622 | 250.827 |
+| Current pipeline | 196.199, 195.754, 197.194 | 196.199 | 197.194 |
+
+### Production feasibility
+
+For the 9,861-RFC planning case, persistent bulk TXT still leaves 9,863 HTTPS starts for RFCXML and the two catalog captures. The one-second production interval imposes a 9,862-second floor from the first to the last start, or 2 h 44 min 22 s. Strict cold TXT verification takes 19,724 starts with a 19,723-second floor, or 5 h 28 min 43 s. Reserving 90 seconds each for initialization and publication leaves 720 seconds and requires approximately 13.7 or 27.4 starts per second, respectively, before retries. The production objective is infeasible at current pacing. [Timing contract](decisions/0009-cold-rfc-bootstrap.md)
+
+### Observed checks
+
+- The six-RFC paced quick profile reached sequence 1 and a byte-exact HTTPS MCP read at 30.809 s. It made 14 HTTPS starts, with minimum start spacing of 1,000,649 µs. Its six XML attempts delivered 662 response body bytes and the publication notification delivered on the first attempt. A local invocation of the `bootstrap-quick` case through the CI runner also passed and wrote the summary that the workflow uploads.
+- The full-size pilot published and passed cold verification in 1,364.218 s. Its incremental pass published sequence 2, then the probe requested public original bytes from a metadata-only synthetic RFC and received `source_policy_restricted`. The definitive suite used the corrected policy-aware probe above.
+- The strict rollback rehearsal preserved sequence 1, the incumbent MCP read and one delivered outbox entry through a deliberate TXT disagreement. After the fixture sources agreed, the retry obtained six matching HTTPS proofs and published sequence 2 with a new delivered outbox entry. The verifier checked both readable manifests and the unchanged historical proof IDs.
+- The cold image-cache probe exported 174,190,592 bytes in 4.981 s and imported the checksum-verified archive into an empty image store in 20.072 s. Isolated backend and daemon startup took 0.356 s and warm image-ID inspection took 0.081 s. An early run exposed Docker auto-detecting the host containerd socket. The successful run used a dedicated temporary containerd backend. Registry pulls remain unmeasured.
+
+### Offline verification
+
+- `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, and frozen all-feature workspace Clippy and tests passed with Cargo artifacts under `/tmp/rust/target`. The HTTP smoke passed 258 seeded mutations. Workflow lint and the bind-backed, bulk-stage, and Docker-managed mirror Compose renders passed. The Docker-managed render retained the service-specific mirror access modes.
+- `python3 -B scripts/phase0/integration.py --context CONTEXT --project rfc-dual-phase7-rebuilt --skip-build` and the Phase 7 integration script passed in both `default` and `rootless`. Phases 1–5 passed on `default` using `python3 -B scripts/phaseN/integration.py --context default --image-prefix rfc-dual-phase7-rebuilt`. A build of the Phase 4 fixture hit an empty BuildKit dependency cache. The probe passed with the existing schema 9 search fixture, image `sha256:2245c322aea18a6646bd96223890bc5d7bc170a23fd5bfe7489df88f344dc4e9`.
+- The standard rootful Phase 6 run timed out waiting for its post-restart outbox to drain. The same suite passed on `rootless`, covering authenticated control, crash recovery, and scheduled reconciliation. The rootful Phase 2 and Phase 6 `--bulk-bootstrap` runs passed, including fault cases and authenticated first-publication delivery.
+- `python3 -B scripts/phase8/integration.py --context default --image-prefix rfc-dual-phase7-rebuilt --evidence "$evidence/restore"` passed the destructive restore. The restored pointer was `2|2` and both published and retained generations were readable. The verifier checked 16 canonical blobs, 794 ranges and line starts, and three manifests. Public compatibility checks passed over HTTPS at MCP revision `2026-07-28`.
+
+### Files and evidence
+
+- `scripts/bootstrap/` contains the added benchmark profiles, image-cache timing, and shared initialization. `scripts/phase2/endpoint.py` generates private per-RFC HTTP timing and outcome receipts. The Docker CI workflows and runner add the paced quick case to native amd64.
+- `deploy/` and the README, ingestion, deployment and storage guides document the recognized configurations, first-publication checks, and backup or rollback procedures. The offline evidence directory is `/tmp/rfc-dual-phase8.kNsyYHym` on the qualification host. It contains `full-final/summary.json`, `paced/summary.json`, `serial.json`, `rollback-final/summary.json`, `image-cache-final/image-cache.json`, `restore/restore.json`, and the individual command logs and exit statuses.

@@ -2,6 +2,7 @@
 """Measure an offline import of the benchmark images into a fresh Docker store."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -29,6 +30,18 @@ def sha256(path):
         return hashlib.file_digest(archive, "sha256").hexdigest()
 
 
+@contextmanager
+def background(command, log):
+    with log.open("w") as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=60)
+
+
 def import_images(source, prefix, evidence, receipt):
     postgres = re.search(r"(?m)^    image: (docker\.io/library/postgres\S+)$",
                          (ROOT / "scripts" / "phase1" / "compose.yml").read_text()).group(1)
@@ -50,18 +63,28 @@ def import_images(source, prefix, evidence, receipt):
         receipt["archive_bytes"] = archive.stat().st_size
         receipt["archive_sha256"] = sha256(archive)
         (work / "daemon.json").write_text("{}\n")
+        (work / "containerd.toml").write_text("version = 2\n")
         socket = f"unix://{work / 'docker.sock'}"
         cold = ["sudo", "-n", "docker", "--host", socket]
+        # Docker otherwise detects the system containerd socket even with a fresh data root.
+        containerd_socket = work / "containerd.sock"
+        containerd = [
+            "sudo", "-n", "containerd", "--config", work / "containerd.toml",
+            "--address", containerd_socket, "--root", work / "content", "--state", work / "state",
+        ]
         daemon = [
             "sudo", "-n", "dockerd", "--host", socket, "--config-file", work / "daemon.json",
             "--data-root", work / "data", "--exec-root", work / "exec", "--pidfile", work / "pid",
+            "--containerd", containerd_socket,
             "--bridge=none", "--iptables=false", "--ip6tables=false", "--ip-forward=false", "--ip-masq=false",
         ]
-        with (evidence / "daemon.log").open("w") as log:
-            start = time.monotonic()
-            process = subprocess.Popen(daemon, stdout=log, stderr=subprocess.STDOUT)
-            try:
+        start = time.monotonic()
+        try:
+            with (background(containerd, evidence / "containerd.log") as backend,
+                  background(daemon, evidence / "daemon.log") as process):
                 while time.monotonic() < start + 60:
+                    if backend.poll() is not None:
+                        raise RuntimeError(f"isolated containerd exited with status {backend.returncode}")
                     if process.poll() is not None:
                         raise RuntimeError(f"isolated dockerd exited with status {process.returncode}")
                     try:
@@ -83,13 +106,10 @@ def import_images(source, prefix, evidence, receipt):
                 start = time.monotonic()
                 assert image_ids(cold, refs) == receipt["images"], "loaded image IDs differ"
                 receipt["warm_image_inspection_seconds"] = time.monotonic() - start
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    process.wait(timeout=60)
-                # The daemon owns these paths inside this newly created directory.
-                subprocess.run(["sudo", "-n", "rm", "-rf", "--", work / "data", work / "exec"],
-                               check=True, timeout=60)
+        finally:
+            # The daemons own these paths inside this newly created directory.
+            subprocess.run(["sudo", "-n", "rm", "-rf", "--", work / "data", work / "exec",
+                            work / "content", work / "state"], check=True, timeout=60)
 
 
 def main():

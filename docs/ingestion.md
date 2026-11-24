@@ -125,7 +125,7 @@ python3 -B scripts/phase2/integration.py --context default \
     --serial-image-prefix "$SERIAL_IMAGE_PREFIX" --receipt "$evidence/serial.json"
 ```
 
-The paced, full and rollback profiles need a host that permits the disposable ext4 mount under `/tmp` and the associated disk sampling. The full profile runs three cold and incremental pairs. Run it on an otherwise idle host. The image-cache probe starts a separate local Docker daemon with its storage and socket under `/tmp`. It measures a checksum-verified offline import with a fresh image store. The historical serial prefix uses revision `e2e5a41` and its matching Sync and ingestion-fixture images. [Observed results and prerequisites](implementation-status.md)
+The paced, full and rollback profiles need a host that permits the disposable ext4 mount under `/tmp` and the associated disk sampling. The full profile runs three cold and incremental pairs. Run it on an otherwise idle host. Incremental MCP timing uses the byte-reviewed RFC 2119 fixture at the new sequence. The harness separately checks the MCP source-policy response and verifies the changed synthetic original against its canonical bytes. The image-cache probe uses isolated Docker and containerd stores and sockets under `/tmp` for a checksum-verified offline import. The historical serial prefix uses revision `e2e5a41` and its matching Sync and ingestion-fixture images. [Observed results and prerequisites](implementation-status.md)
 
 ## Reading candidate metadata
 
