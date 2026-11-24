@@ -104,6 +104,29 @@ Sync still stages the selected TXT on retry. It uses a completed-generation base
 
 The cache admits up to 40,000 source records and 4 GiB of recorded body bytes across full and sample runs. Each record counts its length against the budget even when bytes are shared. TXT entries expire seven days after checkpoint creation, and RFCXML entries expire 24 hours after the original HTTPS fetch. Reuse keeps those deadlines. Sync removes expired entries and evicts the oldest remaining entries when space is needed. A crash before a checkpoint commits leaves the newly installed file eligible for ordinary GC.
 
+## Bootstrap qualification
+
+The production template uses strict TXT verification and batched rsync. To opt in to persistent bulk staging and accept rsync-only TXT evidence at sequence zero, set `ingestion.txt_provenance = "rsync_bootstrap"` and `ingestion.rsync.mode = "persistent_bulk"`. Use the dedicated staging filesystem, then run `--check-config`. Use the [deployment procedure](deployment.md#first-publication) to check the active generation, pinned MCP read, and outbox. [Return to strict batched ingestion](deployment.md#return-to-strict-batched-ingestion)
+
+The 900-second objective measures a cold initialization from the first volume ownership step through publication, `/ready` and a byte-exact MCP read. Record authenticated notification delivery and image preparation separately. A planning corpus of 9,861 RFCs needs 9,863 HTTPS starts for XML and the two catalog captures. With the one-second minimum, their first-to-last start window alone is at least 9,862 seconds (2 h 44 min 22 s). Strict cold TXT verification increases the floor to 19,723 seconds. Private accelerated measurements describe the local collector. The production objective is infeasible at current pacing. [Timing contract and rate calculation](decisions/0009-cold-rfc-bootstrap.md)
+
+Load matching native service and fixture images, including the publication and control fixtures, into the target Docker context. Use the pinned PostgreSQL image from the fixture Compose file. These commands use the private upstream and a new evidence directory for each profile.
+
+```sh
+evidence=$(mktemp -d /tmp/rfc-dual-qualify.XXXXXXXX)
+for profile in quick paced full rollback; do
+    python3 -B scripts/bootstrap/baseline.py --phase8 "$profile" --context default \
+        --image-prefix "$IMAGE_PREFIX" --evidence "$evidence/$profile"
+done
+python3 -B scripts/bootstrap/image-cache.py --context default \
+    --image-prefix "$IMAGE_PREFIX" --evidence "$evidence/image-cache"
+python3 -B scripts/phase2/integration.py --context default \
+    --image-prefix "$IMAGE_PREFIX" --benchmark 96 --repeats 3 \
+    --serial-image-prefix "$SERIAL_IMAGE_PREFIX" --receipt "$evidence/serial.json"
+```
+
+The paced, full and rollback profiles need a host that permits the disposable ext4 mount under `/tmp` and the associated disk sampling. The full profile runs three cold and incremental pairs. Run it on an otherwise idle host. The image-cache probe starts a separate local Docker daemon with its storage and socket under `/tmp`. It measures a checksum-verified offline import with a fresh image store. The historical serial prefix uses revision `e2e5a41` and its matching Sync and ingestion-fixture images. [Observed results and prerequisites](implementation-status.md)
+
 ## Reading candidate metadata
 
 - Manifest format 2 extends format 1 with the scope, the two catalog observation identities, the policy registry version, and catalog entries without TXT. A generation records the exact publication date or its available month precision.

@@ -4,6 +4,8 @@
 
 The mirror is a Linux filesystem exposed through a Docker Compose named volume. Give sync UID 10002 write access to its root and mount it read-only for serve UID 10001. Feed has no mirror mount. Provision the mirror root for sync ownership with mode 0755. Sync creates the private `staging` and `quarantine` directories with mode 0700. Canonical files have mode 0444.
 
+Use the [mirror volume examples](deployment.md#mirror-volume) for Docker-managed or bind-backed storage. The separate bulk rsync filesystem holds transfer state and can be rebuilt. Keep matched PostgreSQL and canonical mirror backups when changing volume backing or qualifying older application versions. [Backup and restore](publication.md#backup-and-restore)
+
 ```text
 /mirror/
   blobs/blake3/<first two hex>/<64 lowercase hex>

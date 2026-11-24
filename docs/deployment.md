@@ -17,6 +17,22 @@ docker compose --env-file /path/to/rfc.env config --quiet
 
 Set `RFC_NOTIFY_DYNAMIC_RANGE` and `RFC_CONTROL_DYNAMIC_RANGE` to ranges within their corresponding private subnets and outside the fixed listener addresses. This reserves the listener addresses during concurrent startup and recreation. An omitted range uses the full subnet for compatibility with existing environment files. For a qualified upgrade, add the ranges to the private environment file and recreate the affected Compose networks after draining the application services. Preserve the bind-backed mirror and database directories.
 
+### Mirror volume
+
+The default mirror is a Compose named volume backed by the host directory in `RFC_MIRROR_DIR`. Create that directory before running `volume-admin`. For a Docker-managed mirror on a fresh project, save the following overlay in your private configuration directory and include it after `compose.yml` in every Compose command.
+
+```yaml
+volumes:
+  mirror:
+    driver_opts: !reset {}
+```
+
+```sh
+docker compose -f compose.yml -f /path/to/managed-mirror.yml --env-file /path/to/rfc.env config --quiet
+```
+
+Set `RFC_MIRROR_DIR` in the environment file so the base Compose file can interpolate it before merging. The overlay removes the bind driver options. Initialize the Docker-managed mirror with the same `volume-admin` step below. Both layouts provide Serve with read-only access and Sync with write access. To change the backing of an existing mirror, use a fresh project and the matched [backup and restore procedure](publication.md#backup-and-restore).
+
 ### Bulk rsync staging
 
 To enable `ingestion.rsync.mode = "persistent_bulk"`, provision a dedicated ext4 filesystem with at most 5 GiB and 24,576 inodes. Set an explicit inode count when formatting and use `--check-config` to check the resulting capacity. Leave room for one replacement file and the small sample tree. Set the mounted filesystem root to mode `0700` and map its owner to Sync's container UID 10002. Mount with `nosuid,nodev,noexec`. Use distinct filesystems for staging, the canonical mirror, and PostgreSQL. The staging tree is private to Sync and can be regenerated from upstream.
@@ -71,7 +87,46 @@ Use the [operating checks](#operate-and-recover) to match the active PostgreSQL 
 
 ### Upgrade existing volumes
 
-For schema 9, close public ingress, drain Feed and Sync, and stop Serve. Take a matched database and mirror backup and retain the previous image references. Keep the existing roles and role passwords. Run the owner migrations, start the schema 9 images, and verify the active sequence, retained snapshots, `/ready` and a pinned MCP read before reopening ingress. Stop Sync and set `txt_provenance = "dual_source"` to turn off rsync-only trust while staying on schema 9. To return to schema 7 binaries, restore the matched pre-upgrade backup into fresh volumes and verify it with the previous images. The restored instance resumes at the backup's publication sequence. [Publication and recovery](publication.md)
+For schema 9, close public ingress, drain Feed and Sync, and stop Serve. Take a matched database and mirror backup and retain the previous image references. Keep the existing roles and role passwords. Run the owner migrations, start the schema 9 images, and verify the active sequence, retained snapshots, `/ready` and a pinned MCP read before reopening ingress. To return to earlier binaries that require an older schema, restore the matching pre-upgrade backup into fresh volumes and verify it with the saved images. The restored instance resumes at the backup's publication sequence. [Publication and recovery](publication.md)
+
+### Return to strict batched ingestion
+
+On schema 9, stop Feed and allow the running Sync job to settle before stopping Sync. Leave Serve running.
+
+```sh
+compose stop rfc-mcp-docker-feed
+# Use the job check below to confirm that the running job has settled.
+compose stop rfc-mcp-docker-sync
+```
+
+Install a TOML file with the following settings. Preserve the ingestion file path and the volume backing of the canonical mirror and database.
+
+```toml
+schema_version = 1
+
+[ingestion]
+txt_provenance = "dual_source"
+
+[ingestion.https]
+max_in_flight_requests = 1
+
+[ingestion.rsync]
+mode = "batched"
+
+[ingestion.pipeline]
+max_pending_documents = 1
+parser_workers = 1
+```
+
+Remove the bulk rsync overlay from the Compose invocation. Leave any private staging filesystem available if you may return to bulk mode. Use the same project name and environment file.
+
+```sh
+compose config --quiet
+compose run --rm --no-deps rfc-mcp-docker-sync --check-config
+compose up -d --no-deps --force-recreate rfc-mcp-docker-sync
+```
+
+The restarted daemon queues a full run. Serve continues to read the active generation during the run. New strict membership requires a matching HTTPS proof or a reusable prior verified proof. Rsync-only observations remain historical evidence. On a TXT disagreement, check that the incumbent still passes the readiness and MCP probes. Resume Feed after verifying the daemon, active sequence and outbox. To reactivate a retained generation separately, use [sequence-fenced publication rollback](publication.md#operator-commands).
 
 ## Proxy and network boundaries
 

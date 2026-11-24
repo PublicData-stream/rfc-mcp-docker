@@ -22,3 +22,6 @@ bulk_transfer_timeout_seconds = 900
 [ingestion.pipeline]
 max_pending_documents = 3
 parser_workers = 1
+
+# For strict single-slot operation, keep dual_source and batched, set
+# max_in_flight_requests and max_pending_documents to 1, and leave parser_workers at 1.
