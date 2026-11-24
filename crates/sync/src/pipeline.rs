@@ -1,11 +1,10 @@
 //! Bounded producer tasks supervised by the ordered ingestion coordinator.
 
-use crate::upstream::{
-    Capture, Download, RsyncBatch, Source, TXT_LIMIT, Upstream, XML_LIMIT, concurrency,
-};
 use crate::{
+    config::RAW_PER_DOCUMENT,
     metrics::Stage,
     parse::{Budget, BudgetExceeded, DOCUMENT_BYTES, OwnedText},
+    upstream::{Capture, Download, RsyncBatch, Source, Upstream},
     xml::{self, XmlReferences},
 };
 use rfc_core::{BlobDigest, RfcNumber};
@@ -15,9 +14,6 @@ use tokio::{
     sync::{Semaphore, watch},
     task::{self, JoinSet},
 };
-
-pub(crate) const DOCUMENT_SLOTS: usize = 3;
-const RAW_PER_DOCUMENT: usize = 2 * TXT_LIMIT + XML_LIMIT;
 
 #[derive(Clone)]
 pub(crate) struct Shutdown(watch::Sender<bool>);
@@ -88,10 +84,9 @@ impl Pipeline {
         Ok(Self {
             tasks: JoinSet::new(),
             shutdown: Shutdown::new(),
-            parse_slots: Arc::new(Semaphore::new(concurrency(
-                "RFC_SYNC_PARSE_CONCURRENCY",
-                1,
-            )?)),
+            parse_slots: Arc::new(Semaphore::new(
+                upstream.config().ingestion.pipeline.parser_workers,
+            )),
             parse_bytes: parse_bytes(&upstream)?,
             upstream,
         })

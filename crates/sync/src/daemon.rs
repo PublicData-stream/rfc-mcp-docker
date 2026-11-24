@@ -1,5 +1,6 @@
 use crate::{
     Scope, Writer,
+    config::SyncConfig,
     ingest::ingest_locked,
     pipeline::Shutdown,
     policy::Registry,
@@ -65,15 +66,16 @@ fn fixtures() -> bool {
     env::var("RFC_PHASE6_FIXTURES").as_deref() == Ok("1")
 }
 
-fn upstream() -> Result<Upstream> {
+fn upstream(config: SyncConfig) -> Result<Upstream> {
     #[cfg(feature = "phase6-fixtures")]
     if fixtures() {
-        return Upstream::fixture();
+        return Upstream::fixture(config);
     }
-    Upstream::official()
+    Upstream::official(config)
 }
 
 pub async fn run_daemon() -> Result<()> {
+    let config = SyncConfig::load()?;
     let listen = control::address(&env::var("RFC_SYNC_CONTROL_BIND")?)?;
     let notify = control::address(&env::var("RFC_SYNC_SERVE_ADDR")?)?;
     let feed_keys = Keys::load(Link::FeedSync)?;
@@ -98,7 +100,7 @@ pub async fn run_daemon() -> Result<()> {
     let shutdown = Shutdown::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let worker_shutdown = shutdown.clone();
-    let mut worker = tokio::spawn(async move { worker(&schedule, &worker_shutdown).await });
+    let mut worker = tokio::spawn(async move { worker(config, &schedule, &worker_shutdown).await });
     let services = async {
         tokio::try_join!(
             control::serve(listener, Link::FeedSync, feed_keys, accept),
@@ -313,7 +315,7 @@ async fn schedule_retry(writer: &mut Writer, job: i64) -> Result<()> {
     Ok(())
 }
 
-async fn reconcile(job: i64, shutdown: &Shutdown) -> Result<()> {
+async fn reconcile(job: i64, config: SyncConfig, shutdown: &Shutdown) -> Result<()> {
     let mut writer = Writer::connect().await?;
     let _corpus = writer.acquire_coordinator().await?;
     let row = writer.client.query_one(
@@ -339,7 +341,7 @@ async fn reconcile(job: i64, shutdown: &Shutdown) -> Result<()> {
         _ => {
             let (id, _) = ingest_locked(
                 &mut writer,
-                upstream(),
+                upstream(config),
                 Registry::load(),
                 Scope::Full,
                 Some(job),
@@ -362,11 +364,11 @@ async fn reconcile(job: i64, shutdown: &Shutdown) -> Result<()> {
     Ok(())
 }
 
-async fn catalog_changed() -> Result<bool> {
+async fn catalog_changed(config: SyncConfig) -> Result<bool> {
     // Use a short-lived session so the advisory lock is released on return.
     let writer = Writer::connect().await?;
     let _corpus = writer.acquire_coordinator().await?;
-    let upstream = upstream()?;
+    let upstream = upstream(config)?;
     upstream.after_fence().await;
     let stored: Option<String> = writer.client.query_opt(
         "SELECT encode(o.raw_digest, 'hex')
@@ -385,7 +387,7 @@ async fn catalog_changed() -> Result<bool> {
     Ok(true)
 }
 
-async fn worker(schedule: &Schedule, shutdown: &Shutdown) -> Result<()> {
+async fn worker(config: SyncConfig, schedule: &Schedule, shutdown: &Shutdown) -> Result<()> {
     let mut writer = Writer::connect().await?;
     let mut daily = Instant::now() + jitter(schedule.daily);
     let mut hourly = Instant::now() + jitter(schedule.hourly);
@@ -395,7 +397,7 @@ async fn worker(schedule: &Schedule, shutdown: &Shutdown) -> Result<()> {
         }
         match claim(&mut writer).await {
             Ok(NextJob::Ready(job)) => {
-                if reconcile(job, shutdown).await.is_err() && shutdown.check().is_ok() {
+                if reconcile(job, config, shutdown).await.is_err() && shutdown.check().is_ok() {
                     eprintln!("reconciliation job {job} encountered an error");
                     if schedule_retry(&mut writer, job).await.is_err() {
                         sleep(LOOP_TICK).await;
@@ -407,7 +409,7 @@ async fn worker(schedule: &Schedule, shutdown: &Shutdown) -> Result<()> {
                 let changed = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
-                    result = catalog_changed() => result,
+                    result = catalog_changed(config) => result,
                 };
                 match changed {
                     Ok(true) if enqueue(&mut writer, None, false).await.is_err() => {

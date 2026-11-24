@@ -1,7 +1,8 @@
 use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
+    config::SyncConfig,
     metrics::{Record, Stage},
-    pipeline::{DOCUMENT_SLOTS, Event, Pipeline, Prepared, PriorTxt, Shutdown, VerifiedTxt},
+    pipeline::{Event, Pipeline, Prepared, PriorTxt, Shutdown, VerifiedTxt},
     policy::Registry,
     recovery::recover_before_ingestion,
     upstream::{self, Capture, Download, Source, Upstream},
@@ -28,7 +29,6 @@ const FAMILIES: [&str; 4] = [
     "obsoletes",
 ];
 const SAMPLE: [i32; 3] = [2119, 8174, 9110];
-const MAX_INPUT: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -104,11 +104,11 @@ impl Report {
         }
     }
 
-    fn accept(&mut self, bytes: usize) -> Result<()> {
+    fn accept(&mut self, bytes: usize, max_accepted_bytes: u64) -> Result<()> {
         self.accepted_bytes = self
             .accepted_bytes
             .checked_add(u64::try_from(bytes)?)
-            .filter(|bytes| *bytes <= MAX_INPUT)
+            .filter(|bytes| *bytes <= max_accepted_bytes)
             .ok_or("run input exceeds byte limit")?;
         Ok(())
     }
@@ -126,20 +126,30 @@ fn bounded_error(error: impl std::fmt::Display) -> String {
 
 /// Reconciles a candidate using the official upstream endpoints.
 pub async fn reconcile(scope: Scope) -> Result<()> {
-    execute(Upstream::official(), Registry::load(), scope).await
+    execute(
+        Upstream::official(SyncConfig::load()?),
+        Registry::load(),
+        scope,
+    )
+    .await
 }
 
 /// Fixture endpoints are compiled only into the dedicated test build.
 #[cfg(feature = "phase2-fixtures")]
 pub async fn reconcile_fixture(scope: Scope) -> Result<()> {
-    execute(Upstream::fixture(), Registry::load(), scope).await
+    execute(
+        Upstream::fixture(SyncConfig::load()?),
+        Registry::load(),
+        scope,
+    )
+    .await
 }
 
 /// Only the disposable fixture driver passes synthetic review receipts.
 #[cfg(feature = "phase3-fixtures")]
 pub async fn reconcile_fixture_with_reviews(scope: Scope, reviews: &str) -> Result<()> {
     execute(
-        Upstream::fixture(),
+        Upstream::fixture(SyncConfig::load()?),
         serde_json::from_str(reviews).map_err(Into::into),
         scope,
     )
@@ -424,6 +434,7 @@ impl Run<'_> {
         before: BlobDigest,
     ) -> Result<()> {
         let ordered: Vec<_> = selected.iter().copied().collect();
+        let config = self.upstream.config().ingestion;
         let mut batch: Option<upstream::RsyncBatch> = None;
         let mut staging = false;
         let mut stage_end = 0;
@@ -434,12 +445,14 @@ impl Run<'_> {
         let mut stage_error = None;
         while committed < ordered.len() {
             if !failed && !staging && batch.is_none() && admitted < ordered.len() {
-                stage_end = (admitted + upstream::BATCH).min(ordered.len());
+                stage_end = (admitted + config.rsync.batch_size).min(ordered.len());
                 pipeline.stage(ordered[admitted..stage_end].to_vec());
                 staging = true;
             }
             if !failed && let Some(staged) = batch.as_ref() {
-                while admitted < stage_end && admitted - committed < DOCUMENT_SLOTS {
+                while admitted < stage_end
+                    && admitted - committed < config.pipeline.max_pending_documents
+                {
                     let id = ordered[admitted];
                     self.report.current_rfc = Some(id.get());
                     let bytes = staged.take(&self.store, id)?;
@@ -528,7 +541,10 @@ impl Run<'_> {
     async fn catalog_capture(&mut self) -> Result<Capture> {
         match self.upstream.fetch(Source::Catalog).await? {
             Download::Captured(capture) => {
-                self.report.accept(capture.bytes.len())?;
+                self.report.accept(
+                    capture.bytes.len(),
+                    self.upstream.config().ingestion.max_accepted_bytes,
+                )?;
                 Ok(capture)
             }
             Download::Unavailable => Err("required catalog is unavailable".into()),
@@ -681,7 +697,10 @@ impl Run<'_> {
             parsed,
             ..
         } = *prepared;
-        self.report.accept(bytes.len())?;
+        self.report.accept(
+            bytes.len(),
+            self.upstream.config().ingestion.max_accepted_bytes,
+        )?;
         let source = Source::Txt(id);
         if let VerifiedTxt::Mismatch(capture) = &verified {
             self.store
@@ -846,7 +865,10 @@ impl Run<'_> {
         let mut result = OptionalXml::default();
         match download {
             Ok(Download::Captured(capture)) => {
-                self.report.accept(capture.bytes.len())?;
+                self.report.accept(
+                    capture.bytes.len(),
+                    self.upstream.config().ingestion.max_accepted_bytes,
+                )?;
                 match references.ok_or("missing RFCXML parser output")? {
                     Ok(references) => result.references = Some(references),
                     Err(error) => {

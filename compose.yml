@@ -63,8 +63,7 @@ services:
       postgres: {condition: service_healthy}
     environment:
       <<: *db-client
-      RFC_SYNC_HTTP_CONCURRENCY: ${RFC_SYNC_HTTP_CONCURRENCY:-2}
-      RFC_SYNC_PARSE_CONCURRENCY: ${RFC_SYNC_PARSE_CONCURRENCY:-1}
+      RFC_SYNC_CONFIG_FILE: /etc/rfc-mcp/ingestion.toml
       RFC_SYNC_CONTROL_BIND: ${RFC_CONTROL_SYNC_IP:?Set RFC_CONTROL_SYNC_IP}:8783
       RFC_SYNC_SERVE_ADDR: ${RFC_NOTIFY_SERVE_IP:?Set RFC_NOTIFY_SERVE_IP}:8782
       RFC_SYNC_SERVE_KEY_ID: ${RFC_SYNC_SERVE_KEY_ID:?Set RFC_SYNC_SERVE_KEY_ID}
@@ -73,6 +72,12 @@ services:
       RFC_FEED_SYNC_KEY_FILE: /run/secrets/feed_key
     volumes:
       - mirror:/mirror:rw
+      - type: bind
+        source: ${RFC_SYNC_CONFIG_HOST_FILE:?Set RFC_SYNC_CONFIG_HOST_FILE}
+        target: /etc/rfc-mcp/ingestion.toml
+        read_only: true
+        bind:
+          create_host_path: false
     secrets:
       - {source: db_ca, target: db_ca}
       - {source: sync_database_password, target: db_password}

@@ -1,0 +1,18 @@
+schema_version = 1
+
+[ingestion]
+max_accepted_bytes = 4294967296
+
+[ingestion.https]
+max_in_flight_requests = 2
+# Applies to catalog, TXT verification and RFCXML. The minimum is 1000 ms.
+min_request_start_interval_ms = 1000
+request_timeout_seconds = 30
+
+[ingestion.rsync]
+batch_size = 32
+transfer_timeout_seconds = 120
+
+[ingestion.pipeline]
+max_pending_documents = 3
+parser_workers = 1

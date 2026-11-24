@@ -32,6 +32,8 @@ class Project(phase5.Project):
         command = super().command(*args)
         index = command.index("-p")
         files = ["-f", str(HERE / "compose.yml")]
+        if hasattr(self, "ingestion_overlay"):
+            files.extend(("-f", str(self.ingestion_overlay)))
         if hasattr(self, "rotation"):
             files.extend(("-f", str(self.rotation)))
         return [*command[:index], *files, *command[index:]]
@@ -351,9 +353,32 @@ def exercise(project):
     hold = project.source / "hold-catalog"
     hold.touch()
     project.run("up", "-d", "--wait", "--wait-timeout", "30", "fixtures", "control-probe")
+    config = project.directory / "ingestion.toml"
+    valid = (phase2.REPO / "deploy/ingestion.toml.example").read_bytes()
+    invalid = b"schema_version = 2\n"
+    config.write_bytes(invalid)
+    container_path = "/etc/rfc-mcp/ingestion.toml"
+    project.ingestion_overlay = project.directory / "ingestion-compose.json"
+    project.ingestion_overlay.write_text(json.dumps({"services": {"sync": {
+        "environment": {"RFC_SYNC_CONFIG_FILE": container_path},
+        "volumes": [f"{config}:{container_path}:ro"],
+    }}}))
+    counts = "SELECT (SELECT count(*) FROM rfc.sync_jobs), (SELECT count(*) FROM rfc.generations)"
+    previous = project.sql(counts)
+    requests = project.capture("logs", "--no-color", "fixtures")
+    for options, args in (((), ()),
+                          (("--entrypoint", "/usr/local/bin/rfc-mcp-docker-sync"),
+                           ("--phase2-reconcile", "--sample"))):
+        phase1.failed(project.app("sync", *options, args=args), project.env,
+                      "ingestion schema_version must be 1")
+    assert project.sql(counts) == previous
+    assert project.capture("logs", "--no-color", "fixtures") == requests
+    config.write_bytes(valid)
     project.restart_sync()
     try:
         epoch = identity(project)
+        # Later jobs must keep the startup snapshot even if the mounted file changes.
+        config.write_bytes(invalid)
         assert project.publication() == 0
         wire_checks(project, epoch)
         payload = event("repeat")
@@ -368,7 +393,11 @@ def exercise(project):
         print("Sync queue saturation retained one running job and one coalesced pending job", flush=True)
     finally:
         hold.unlink()
-    wait(lambda: project.publication() == 2)
+    try:
+        wait(lambda: project.publication() == 2)
+    finally:
+        config.write_bytes(valid)
+    print("Sync rejected invalid startup before side effects and reused its startup configuration", flush=True)
     wait(lambda: "forged identity" in project.capture("logs", "control-probe"))
     assert "forged acknowledgment" not in project.capture("logs", "control-probe")
     (project.directory.parent / "spoof-mode").write_text("acknowledgment")

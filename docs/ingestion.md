@@ -5,13 +5,34 @@ Provision the mirror and PostgreSQL 19 roles using the [storage instructions](st
 Use these commands in a Compose project configured with the sync service.
 
 ~~~sh
-docker compose run --rm --no-deps sync --phase2-reconcile --full
-docker compose run --rm --no-deps sync --phase2-reconcile --sample
+docker compose run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --full
+docker compose run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --sample
 ~~~
 
 Full mode reconciles the expected TXT set from the RFC Editor catalog. Sample mode uses RFCs 2119, 8174, and 9110 and records its restricted scope. A missing expected TXT, a lost previously accepted RFC, a byte disagreement, or catalog drift fails the run. The JSON report identifies the failed input when available and includes a generation ID, digest, counts, and coverage warnings. For a disagreement, sync saves both originals and their digests in /mirror/quarantine. Only sync can read that directory. An abrupt interruption can leave a building generation and durable blobs for Phase 3 recovery.
 
 The collector bounds requests, disk staging, and accepted input. HTTPS requires the RFC Editor hostname and native trust roots. The collector rejects redirects and encoded bodies. Rsync uses catalog-derived filenames and transfers into a fresh private directory. A previous verified TXT observation is eligible for reuse when the staged bytes and the canonical blob match its digest.
+
+## Sync configuration
+
+Production Compose mounts the [ingestion TOML](../deploy/ingestion.toml.example) read-only for Sync, including one-shot commands. For direct invocations, `RFC_SYNC_CONFIG_FILE` selects the file. Each file requires `schema_version = 1`. Omitted settings use the defaults below. The file must be regular UTF-8 and at most 16 KiB. Sync rejects unknown keys and invalid settings before connecting or enqueuing work.
+
+| Key | Default | Range |
+| --- | ---: | ---: |
+| `ingestion.https.max_in_flight_requests` | 2 | 1–2 |
+| `ingestion.https.min_request_start_interval_ms` | 1000 | 1000–60000 |
+| `ingestion.https.request_timeout_seconds` | 30 | 5–30 |
+| `ingestion.rsync.batch_size` | 32 | 1–32 |
+| `ingestion.rsync.transfer_timeout_seconds` | 120 | 30–120 |
+| `ingestion.pipeline.max_pending_documents` | 3 | 1–3 |
+| `ingestion.pipeline.parser_workers` | 1 | 1–2 |
+| `ingestion.max_accepted_bytes` | 4294967296 | 1–4294967296 |
+
+The pending-document window must fit both concurrency settings. The HTTPS request timeout includes the fixed five-second connect timeout. The rsync transfer timeout applies to one batch, including its fixed 30-second inactivity timeout. The accepted-byte cap is cumulative across the two catalog captures, accepted TXT and captured RFCXML. The 12-hour run deadline applies independently.
+
+Run `rfc-mcp-docker-sync --check-config` to see the effective settings and resource reservations as JSON. The check uses the same startup validation without opening the mirror or connecting to PostgreSQL or upstream. Sync reserves 4 MiB per batch entry plus 8 MiB for scratch. Its RAM estimate includes that scratch, 144 MiB per pending document, and 512 MiB of working memory. The 512 MiB scratch and 2 GiB RAM envelope is tightened by available space on `/tmp`, physical memory, and visible cgroup v2 memory limits. Run the check inside the target container to measure its limits. Sync uses the validated snapshot until restart.
+
+When `RFC_SYNC_CONFIG_FILE` is unset, `RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_PARSE_CONCURRENCY` are accepted for compatibility. Both accept `1` or `2`. Setting either alongside `RFC_SYNC_CONFIG_FILE` fails validation. [Compose provisioning and preflight](deployment.md#provision)
 
 ## Pipeline and recovery
 
@@ -26,12 +47,12 @@ flowchart LR
     C --> H[Quarantine on byte disagreement]
 ```
 
-At most 32 TXT files of up to 4 MiB each are staged per batch. Sync takes a document out of staging only after admitting it to the three-document window. The next batch starts after the previous staging directory has been removed. Three slots reserve at most 48 MiB for document payloads. Each admitted document has a 128 MiB application parse budget, with the existing TXT and RFCXML input caps and XML node limits. Catalog processing runs outside the document window. The 20,000-entry, 4 GiB accepted-input, and 12-hour limits continue to apply.
+At most 32 TXT files of up to 4 MiB each are staged per batch. Sync takes a document out of staging only after admitting it to the pending-document window. The next batch starts after the previous staging directory has been removed. The default three slots reserve at most 48 MiB for document payloads. Each admitted document has a 128 MiB application parse budget, with the existing TXT and RFCXML input caps and XML node limits. Catalog processing runs outside the document window and has a 20,000-entry cap.
 
-- `RFC_SYNC_HTTP_CONCURRENCY` sets the in-flight HTTPS limit and accepts `1` or `2`. It defaults to `2`. The shared start gate spaces catalog, TXT, and RFCXML dispatches by at least one second even when two responses overlap. Hourly catalog probes and reconciliations sharing the mirror also share the corpus fence. Each new lock holder allows a one-second handoff interval before starting HTTPS.
-- `RFC_SYNC_PARSE_CONCURRENCY` sets the blocking parser limit and accepts `1` or `2`. It defaults to `1`. The writer commits in ascending RFC order and ends each document transaction before taking the next prepared result. One supervised blocking task at a time performs blob installation and fsync so transfers can continue while the writer waits.
+- The shared HTTPS start gate spaces catalog, TXT, and RFCXML dispatches by the configured interval even when two responses overlap. Hourly catalog probes and reconciliations sharing the mirror also share the corpus fence. Each new lock holder waits for the configured interval before starting HTTPS.
+- The writer commits in ascending RFC order and ends each document transaction before taking the next prepared result. One supervised blocking task at a time performs blob installation and fsync so transfers can continue while the writer waits.
 - On failure, timeout, or SIGTERM, sync stops admission, cancels HTTPS work, reaps rsync, and joins parsing and any active blob install before releasing the corpus fence. Phase 3 recovery handles unfinished generations and orphaned blobs after an abrupt interruption. Existing optional RFCXML handling still records partial coverage for unavailable or invalid reference evidence as appropriate. [Publication and recovery](publication.md)
-- To reduce overlap, set both concurrency settings to `1` in the sync environment. To roll back the code, stop sync gracefully, pin the previous sync image, and restart using the existing database schema and mirror. Keep the larger sync mount so the serial collector can stage a full batch.
+- To reduce overlap, set both concurrency settings to `1` in TOML. To roll back the code, stop Sync gracefully and use the previous Compose definition and Sync image with the existing database schema and mirror.
 
 ### Verified TXT reuse
 

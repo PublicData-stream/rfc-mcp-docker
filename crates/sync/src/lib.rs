@@ -9,6 +9,7 @@ use rfc_storage::{
 use std::os::fd::OwnedFd;
 use tokio_postgres::{Client, Transaction};
 
+mod config;
 mod daemon;
 mod ingest;
 mod metrics;
@@ -21,6 +22,7 @@ mod text;
 mod upstream;
 mod xml;
 
+pub use config::check_config;
 pub use daemon::run_daemon;
 #[cfg(feature = "phase2-fixtures")]
 pub use ingest::reconcile_fixture;

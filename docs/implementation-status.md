@@ -475,3 +475,17 @@ The full receipts and service logs are under `/tmp/rfc-bootstrap-phase0-evidence
 
 - `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, and frozen all-feature workspace Clippy and tests passed on Rust 1.100.0 with Cargo artifacts under `/tmp/rust/target`.
 - The repository’s offline Compose Phases 0, 1, 2, 3, 6 and 7 passed sequentially with preloaded images on the rootless context. They covered MCP wire and sandbox checks, storage roles and restore, NUL and legacy-byte preservation, publication and recovery, daemon control and authenticated notification, and production Compose confinement. The exit statuses and logs are under `/tmp/rfc-bootstrap-phase0-evidence`.
+
+## Dual-queue bootstrap implementation Phase 1
+
+Sync reads a versioned ingestion TOML at startup. The daemon uses one snapshot for its jobs and hourly catalog probes. Each manual reconciliation uses one snapshot for its candidate. Production Compose requires `RFC_SYNC_CONFIG_HOST_FILE` and mounts it read-only for Sync. Official HTTPS starts are at least one second apart. The collector verifies TXT against the official HTTPS body or an eligible prior proof. [Settings and preflight](ingestion.md#sync-configuration)
+
+### Verification on 2026-11-24
+
+- `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, frozen all-feature workspace Clippy and tests, `actionlint`, and production `docker compose config --quiet` passed. Cargo used Rust 1.100.0 and `/tmp/rust/target`.
+- The RustSec audit scanned 247 locked dependencies and passed with the existing `chrono 0.4.45` unmaintained warning. [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543)
+- One native Linux amd64 image bundle was built locally and loaded into both Docker contexts. Tests ran on Docker Engine 29.10.0, Compose 5.8.0, and Linux 7.0.0-44-generic. The Rust, audit, image bundle, and Compose logs are under `/tmp/rfc-bootstrap-phase1.DZamDFRu`.
+- Offline Compose Phase 0 passed on both engines. The rootless Phase 1 storage, Phase 3 publication and recovery, Phase 6 daemon and control, and Phase 8 destructive restore probes passed. Phase 6 rejected invalid daemon and manual configuration before job, generation, or upstream activity. The daemon completed two publications after the mounted file was changed to an invalid version, confirming that subsequent jobs used the startup snapshot.
+- The isolated preflight probes accepted the defaults and the example file, exercised legacy settings and file rejections, and rejected the default profile under a 768 MiB cgroup or a 128 MiB scratch mount. The one-document profile passed with 768 MiB RAM and a 16 MiB tmpfs. Compose rendered the read-only bind exclusively for Sync, including when the tools profile was enabled.
+- Phase 2 passed on rootless Docker. The omitted, default-file, and tuned sample profiles produced the same manifest at publication sequence zero. The tuned run used three one-file rsync batches, peaked at one pending document, one HTTPS request and one parser, and measured a shortest HTTPS start interval of 1,050,987 µs for the 1,050 ms setting. The input-cap and occupied-scratch probes rejected their runs. The byte-fidelity, HTTPS fault, cancellation, and recovery checks also passed.
+- Phase 7 passed on both engines with the same preloaded images. The initial rootful attempt exposed a fixture helper incompatibility, which was corrected before the passing run. The initial rootless Phase 2 probe timed out waiting for `docker exec ... pidof rsync` during concurrent fixture runs. It passed when rerun in isolation.

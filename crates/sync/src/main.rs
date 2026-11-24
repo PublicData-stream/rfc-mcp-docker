@@ -1,6 +1,8 @@
 use rfc_core::GenerationId;
 use rfc_mcp_docker::{ProbeResult, https_probe};
-use rfc_mcp_docker_sync::{Maintenance, Scope, Writer, maintain, promote, reconcile, run_daemon};
+use rfc_mcp_docker_sync::{
+    Maintenance, Scope, Writer, check_config, maintain, promote, reconcile, run_daemon,
+};
 use rfc_storage::{blob::BlobWriter, postgres::mirror_root};
 use std::path::Path;
 
@@ -9,6 +11,7 @@ async fn main() -> ProbeResult {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => run_daemon().await,
+        [option] if option == "--check-config" => check_config(),
         [option] if option == "--version" => {
             println!("rfc-mcp-docker-sync {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -49,7 +52,7 @@ async fn main() -> ProbeResult {
             maintain(Maintenance::Discard(generation)).await
         }
         _ => Err(
-            "expected --version, --phase1-check-storage, --phase2-reconcile (--full|--sample), \
+            "expected --version, --check-config, --phase1-check-storage, --phase2-reconcile (--full|--sample), \
              --phase3-(publish|rollback) GENERATION --expect-sequence SEQUENCE, \
              --phase3-(recover|gc), or --phase3-discard GENERATION"
                 .into(),

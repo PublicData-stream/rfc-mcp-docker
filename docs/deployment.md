@@ -8,9 +8,12 @@ The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It
 2. Create the mirror and PostgreSQL backing directories. Choose nonoverlapping IPv4 subnets. Put only serve and the existing proxy on the dedicated ingress bridge. Give the proxy a separate frontend network and assign the fixed backend addresses from the environment file.
 3. Copy [the PostgreSQL access policy](../deploy/pg_hba.conf.example) and update its two private subnets if needed. Supply a database certificate with DNS SAN `postgres`, its private key, and the issuing CA. Use independent passwords for PostgreSQL bootstrap, `rfc_serve`, and `rfc_sync`.
 4. Generate three distinct 48-byte raw keys under a private umask. Make separate per-service copies of each pairwise key. Set the cursor and notification keys for serve to UID 10001, the sync copies to UID 10002, and the feed copy to UID 10003. PostgreSQL private material belongs to UID 70. Set secret files to mode 0400 and give the designated container UID access using the host’s actual UID mapping. Verify ownership inside the containers because Compose mounts the backing files directly.
+5. Copy [the ingestion example](../deploy/ingestion.toml.example) to the host file named by `RFC_SYNC_CONFIG_HOST_FILE`. Use a regular file readable by Sync's container UID 10002 under the host's rootless or rootful mapping. Mode `0444` is suitable for the example, which has no credentials. On an upgrade, carry any old `RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_PARSE_CONCURRENCY` values over to the TOML equivalents and remove those environment settings from custom Compose overrides. [Ingestion settings](ingestion.md#sync-configuration)
 
 ```sh
 docker network create --internal --subnet 172.30.70.0/28 rfc-public-ingress
+docker compose --env-file /path/to/rfc.env config --quiet
+docker compose --env-file /path/to/rfc.env run --rm --no-deps rfc-mcp-docker-sync --check-config
 docker compose --env-file /path/to/rfc.env --profile tools run --rm --no-deps volume-admin
 docker compose --env-file /path/to/rfc.env up -d --wait postgres
 ```

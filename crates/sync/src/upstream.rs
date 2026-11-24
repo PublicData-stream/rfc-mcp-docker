@@ -1,6 +1,7 @@
 //! Fixed upstream destinations and bounded, private transfers.
 
 use crate::{
+    config::{SyncConfig, scratch_stats},
     metrics::{Metrics, Stage, StageLease},
     pipeline::Shutdown,
 };
@@ -25,7 +26,6 @@ use tokio::{
 pub(crate) const TXT_LIMIT: usize = 4 * 1024 * 1024;
 pub(crate) const CATALOG_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) const XML_LIMIT: usize = 8 * 1024 * 1024;
-pub(crate) const BATCH: usize = 32;
 const OFFICIAL_HTTPS: &str = "https://www.rfc-editor.org";
 const OFFICIAL_RSYNC: &str = "rsync://rsync.rfc-editor.org/rfcs-text-only/";
 
@@ -92,6 +92,7 @@ pub(crate) enum Download {
 
 #[derive(Clone)]
 pub(crate) struct Upstream {
+    config: SyncConfig,
     http: Client,
     https_origin: &'static str,
     rsync_module: &'static str,
@@ -104,13 +105,14 @@ pub(crate) struct Upstream {
 }
 
 impl Upstream {
-    pub(crate) fn official() -> Result<Self> {
-        Self::new(OFFICIAL_HTTPS, OFFICIAL_RSYNC, None)
+    pub(crate) fn official(config: SyncConfig) -> Result<Self> {
+        Self::new(config, OFFICIAL_HTTPS, OFFICIAL_RSYNC, None)
     }
 
     #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn fixture() -> Result<Self> {
+    pub(crate) fn fixture(config: SyncConfig) -> Result<Self> {
         let mut upstream = Self::new(
+            config,
             "https://fixtures:8443",
             "rsync://fixtures:8873/rfc/",
             Some(reqwest::Certificate::from_pem(&std::fs::read(
@@ -125,11 +127,13 @@ impl Upstream {
     }
 
     fn new(
+        config: SyncConfig,
         https_origin: &'static str,
         rsync_module: &'static str,
         ca: Option<reqwest::Certificate>,
     ) -> Result<Self> {
-        let timeout = Duration::from_secs(30);
+        let https = config.ingestion.https;
+        let timeout = Duration::from_secs(https.request_timeout_seconds);
         #[cfg(feature = "phase2-fixtures")]
         let timeout = if ca.is_some()
             && let Ok(value) = std::env::var("RFC_PHASE2_HTTP_TIMEOUT_MS")
@@ -157,6 +161,7 @@ impl Upstream {
                 .add_root_certificate(ca);
         }
         Ok(Self {
+            config,
             http: builder.build()?,
             https_origin,
             rsync_module,
@@ -165,8 +170,16 @@ impl Upstream {
             #[cfg(feature = "phase2-fixtures")]
             fixture_clock: None,
             next_request: Arc::new(Mutex::new(time::Instant::now())),
-            in_flight: Arc::new(Semaphore::new(concurrency("RFC_SYNC_HTTP_CONCURRENCY", 2)?)),
+            in_flight: Arc::new(Semaphore::new(https.max_in_flight_requests)),
         })
+    }
+
+    pub(crate) fn config(&self) -> &SyncConfig {
+        &self.config
+    }
+
+    fn start_interval(&self) -> Duration {
+        Duration::from_millis(self.config.ingestion.https.min_request_start_interval_ms)
     }
 
     #[cfg(feature = "phase2-fixtures")]
@@ -180,7 +193,7 @@ impl Upstream {
 
     pub(crate) async fn after_fence(&self) {
         if self.paced {
-            *self.next_request.lock().await = time::Instant::now() + Duration::from_secs(1);
+            *self.next_request.lock().await = time::Instant::now() + self.start_interval();
         }
     }
 
@@ -209,7 +222,7 @@ impl Upstream {
         // First-poll under the start gate, then release it before awaiting anything
         // from the network. Late scheduling cannot create a burst of starts.
         let initial = poll_fn(|context| Poll::Ready(response.as_mut().poll(context))).await;
-        *next = time::Instant::now() + Duration::from_secs(1);
+        *next = time::Instant::now() + self.start_interval();
         drop(next);
         let mut response = match initial {
             Poll::Ready(result) => result,
@@ -297,7 +310,8 @@ impl Upstream {
 
     pub(crate) async fn stage(&self, ids: &[RfcNumber], shutdown: &Shutdown) -> Result<RsyncBatch> {
         let _timing = self.metrics.span(Stage::Rsync);
-        if ids.is_empty() || ids.len() > BATCH {
+        let rsync = self.config.ingestion.rsync;
+        if ids.is_empty() || ids.len() > rsync.batch_size {
             return Err("rsync batch count exceeds bounds".into());
         }
         let lease = self.metrics.stage_start();
@@ -355,7 +369,7 @@ impl Upstream {
                 child.wait().await?;
                 return Err("rsync batch cancelled".into());
             }
-            _ = time::sleep(Duration::from_secs(120)) => {
+            _ = time::sleep(Duration::from_secs(rsync.transfer_timeout_seconds)) => {
                 group.kill();
                 child.wait().await?;
                 return Err("rsync batch deadline exceeded".into());
@@ -406,12 +420,11 @@ impl Upstream {
 }
 
 fn scratch_used() -> Option<u64> {
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    if unsafe { libc::statvfs(c"/tmp".as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    let stats = unsafe { stats.assume_init() };
-    Some((stats.f_blocks - stats.f_bfree) * stats.f_frsize)
+    let stats = scratch_stats()?;
+    stats
+        .f_blocks
+        .checked_sub(stats.f_bfree)?
+        .checked_mul(stats.f_frsize)
 }
 
 fn filename(id: RfcNumber) -> String {
@@ -483,14 +496,5 @@ impl RsyncBatch {
     pub(crate) fn close(self) -> Result<()> {
         self.temp.close()?;
         Ok(())
-    }
-}
-
-pub(crate) fn concurrency(name: &str, default: usize) -> Result<usize> {
-    match std::env::var(name) {
-        Ok(value) if value == "1" => Ok(1),
-        Ok(value) if value == "2" => Ok(2),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        _ => Err(format!("{name} must be 1 or 2").into()),
     }
 }

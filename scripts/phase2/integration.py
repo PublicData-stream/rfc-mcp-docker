@@ -45,9 +45,11 @@ class Project(phase1.Project):
                             args=("-c", prelude))
         return self.app("sync", *options, *overrides, "--entrypoint", "/phase2/fixture-driver", args=(scope,))
 
-    def reconcile(self, scope="full", expected=None, live=False, settings=(), timeout=180, prelude=None):
-        command = (self.reconcile_command(live, scope, settings, prelude=prelude)
-                   if settings or prelude is not None else self.reconcile_command(live, scope))
+    def reconcile(self, scope="full", expected=None, live=False, settings=(), timeout=180, prelude=None, *, options=()):
+        if settings or prelude is not None or options:
+            command = self.reconcile_command(live, scope, settings, options=options, prelude=prelude)
+        else:
+            command = self.reconcile_command(live, scope)
         result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=timeout)
         if not result.stdout.strip():
             raise AssertionError(f"no ingestion report: {result.stderr}")
@@ -312,9 +314,11 @@ def exercise(project):
     ) == "Updated catalog metadata"
     assert second["manifest_digest"] != first["manifest_digest"]
     project.verify_manifest(second)
-    sample = project.reconcile(scope="sample")
+    clock = "RFC_PHASE2_FIXED_CLOCK=1"
+    sample = project.reconcile(scope="sample", settings=(clock,))
     assert sample["verified_txt"] == 3 and sample["scope"] == "sample"
     project.verify_manifest(sample)
+    exercise_config(project, sample)
 
     unchanged_catalog = catalog.read_text()
     catalog.write_text(unchanged_catalog.replace(catalog_entry(101, "Legacy bytes", day="<day>23</day>"), ""))
@@ -399,6 +403,40 @@ def assert_pipeline_bounds(report, *, http_limit, paced=False):
     assert metrics["staged_peak"] == 1 and metrics["rsync_peak_bytes"] <= 128 * 1024**2, metrics
     if paced:
         assert metrics["minimum_start_spacing_us"] >= 1_000_000, metrics
+
+
+def exercise_config(project, baseline):
+    config = project.directory / "ingestion.toml"
+    config.write_bytes((REPO / "deploy/ingestion.toml.example").read_bytes())
+    options = ("-v", f"{config}:/phase2/ingestion.toml:ro")
+    settings = ("RFC_SYNC_CONFIG_FILE=/phase2/ingestion.toml", "RFC_PHASE2_FIXED_CLOCK=1")
+    default_file = project.reconcile(scope="sample", settings=settings, options=options)
+    assert default_file["manifest_digest"] == baseline["manifest_digest"]
+
+    config.write_text("""schema_version = 1
+[ingestion.https]
+max_in_flight_requests = 1
+min_request_start_interval_ms = 1050
+request_timeout_seconds = 5
+[ingestion.rsync]
+batch_size = 1
+transfer_timeout_seconds = 30
+[ingestion.pipeline]
+max_pending_documents = 1
+""")
+    tuned = project.reconcile(scope="sample", settings=(*settings, "RFC_PHASE2_PACED=1"), options=options)
+    assert tuned["manifest_digest"] == baseline["manifest_digest"]
+    assert_pipeline_bounds(tuned, http_limit=1, paced=True)
+    metrics = tuned["metrics"]
+    assert metrics["parse_peak"] == metrics["admitted_peak"] == 1, metrics
+    assert metrics["rsync"]["calls"] == 3 and metrics["minimum_start_spacing_us"] >= 1_050_000, metrics
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
+
+    config.write_text("schema_version = 1\n[ingestion]\nmax_accepted_bytes = 1\n")
+    limited = project.reconcile(scope="sample", expected="run input exceeds byte limit",
+                                settings=settings, options=options)
+    assert limited["accepted_bytes"] == 0 and limited["verified_txt"] == 0
+    print("Sync TOML defaults and tuned reconciliation bounds passed", flush=True)
 
 
 def exercise_cancellation(project):
@@ -493,9 +531,12 @@ def exercise_resources(project):
     assert 0 < metrics["memory_peak"] < 1536 * 1024**2, metrics
     project.verify_manifest(result)
 
-    project.reconcile(expected="rsync", prelude=
-                      "dd if=/dev/zero of=/tmp/occupied bs=1M count=140 2>/dev/null || exit; "
-                      "exec /phase2/fixture-driver full")
+    before = project.sql("SELECT count(*) FROM rfc.generations")
+    command = project.reconcile_command(False, "full", prelude=
+        "dd if=/dev/zero of=/tmp/occupied bs=1M count=140 2>/dev/null || exit; "
+        "exec /phase2/fixture-driver full")
+    phase1.failed(command, project.env, "ingestion scratch needs")
+    assert project.sql("SELECT count(*) FROM rfc.generations") == before
     project.reconcile(expected="parse budget exceeded", settings=("RFC_PHASE2_PARSE_BUDGET=512",))
     assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
 

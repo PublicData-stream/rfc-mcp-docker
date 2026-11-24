@@ -25,6 +25,7 @@ spec.loader.exec_module(phase5)
 phase1 = phase5.phase1
 phase0 = phase1.phase0
 SERVE, SYNC, FEED = ("rfc-mcp-docker-" + role for role in ("serve", "sync", "feed"))
+INGESTION_PATH = "/etc/rfc-mcp/ingestion.toml"
 
 
 class Deployment:
@@ -53,8 +54,12 @@ class Deployment:
                 self.env[key] = value.replace("172.30.70.", self.net + ".")
         for role in ("serve", "sync", "feed"):
             self.env[f"RFC_{role.upper()}_IMAGE"] = f"{prefix}-{role}"
+        self.ingestion = work / "ingestion.toml"
+        self.ingestion.write_bytes((ROOT / "deploy/ingestion.toml.example").read_bytes())
+        self.ingestion.chmod(0o444)
         self.env.update(RFC_INGRESS_NETWORK=self.network, RFC_MCP_HOSTS="rfc.test",
                         RFC_MCP_ORIGINS="https://rfc.test",
+                        RFC_SYNC_CONFIG_HOST_FILE=str(self.ingestion),
                         RFC_MIRROR_DIR=str(seed.directory / "mirror"),
                         RFC_PGDATA_DIR=str(self.pgdata),
                         RFC_DB_CA=str(seed.directory / "certs/ca.crt"),
@@ -122,6 +127,8 @@ class Deployment:
     def provision(self):
         base = [*self.docker, "compose", "-f", str(ROOT / "compose.yml"), "config", "--quiet"]
         phase5.run(base, env=self.env)
+        summary = json.loads(self.capture("run", "--rm", "--no-deps", SYNC, "--check-config", timeout=40))
+        assert summary["source"] == "file" and summary["schema_version"] == 1
         self.run("--profile", "tools", "run", "--rm", "--no-deps", "volume-admin")
         self.run("up", "-d", "--wait", "postgres", timeout=90)
         assert self.sql("-c", "SHOW data_directory") == "/var/lib/postgresql/19/docker"
@@ -156,6 +163,51 @@ class Deployment:
         self.run("up", "-d", "--no-deps", SYNC, timeout=55)
         self.open()
 
+    def check_config(self):
+        def probe(*options, memory="2g", scratch="512m", expected=None):
+            command = [*self.docker, "run", *phase0.local_image_args(), "--rm", "--network", "none",
+                       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                       "--memory", memory, "--tmpfs", f"/tmp:size={scratch},mode=1777,noexec,nosuid,nodev",
+                       *options, f"{self.prefix}-sync", "--check-config"]
+            if expected is not None:
+                phase1.failed(command, self.env, expected)
+                return None
+            return json.loads(phase1.capture(command, env=self.env, timeout=40))
+
+        file_options = ("-e", f"RFC_SYNC_CONFIG_FILE={INGESTION_PATH}",
+                        "-v", f"{self.ingestion}:{INGESTION_PATH}:ro")
+        defaults = probe()
+        assert defaults["source"] == "defaults"
+        assert defaults["ingestion"] == probe(*file_options)["ingestion"]
+        legacy = probe("-e", "RFC_SYNC_HTTP_CONCURRENCY=1", "-e", "RFC_SYNC_PARSE_CONCURRENCY=2")
+        assert legacy["source"] == "legacy_env"
+        assert legacy["ingestion"]["https"]["max_in_flight_requests"] == 1
+        assert legacy["ingestion"]["pipeline"]["parser_workers"] == 2
+        probe(*file_options, "-e", "RFC_SYNC_HTTP_CONCURRENCY=1", expected="conflicts with legacy")
+        probe("-e", f"RFC_SYNC_CONFIG_FILE={INGESTION_PATH}", expected="cannot open ingestion config")
+        probe("-e", "RFC_SYNC_CONFIG_FILE=", expected="must be nonempty")
+        probe(memory="768m", expected="ingestion memory needs")
+        probe(scratch="128m", expected="ingestion scratch needs")
+
+        small = self.work / "small-ingestion.toml"
+        small.write_text("""schema_version = 1
+[ingestion.https]
+max_in_flight_requests = 1
+[ingestion.rsync]
+batch_size = 1
+[ingestion.pipeline]
+max_pending_documents = 1
+""")
+        small_options = ("-e", f"RFC_SYNC_CONFIG_FILE={INGESTION_PATH}",
+                         "-v", f"{small}:{INGESTION_PATH}:ro")
+        small.chmod(0o400)
+        probe(*small_options, expected="cannot open ingestion config")
+        small.chmod(0o444)
+        resources = probe(*small_options, memory="768m", scratch="16m")["resources"]
+        assert resources["cgroup_memory_limit_bytes"] == resources["memory_available_bytes"] == 768 * 1024**2
+        assert resources["scratch_available_bytes"] == 16 * 1024**2
+        print("Sync configuration preflight passed with isolated and constrained containers", flush=True)
+
     def verify(self):
         for service, uid, secrets_expected in (
             (SERVE, 10001, {"cursor_key", "db_ca", "db_password", "notify_key"}),
@@ -171,12 +223,19 @@ class Deployment:
             assert host["NanoCpus"] > 0 and host["Memory"] > 0 and host["PortBindings"] == {}
             assert host["LogConfig"]["Type"] == "local" and host["LogConfig"]["Config"]["max-file"] == "3"
             assert set(self.capture("exec", "-T", service, "ls", "/run/secrets").split()) == secrets_expected
+            config_mounts = [mount for mount in info["Mounts"] if mount["Destination"] == INGESTION_PATH]
+            config_env = [value for value in info["Config"]["Env"] if value.startswith("RFC_SYNC_CONFIG_FILE=")]
             if service == SYNC:
+                assert len(config_mounts) == 1 and not config_mounts[0]["RW"]
+                assert config_env == [f"RFC_SYNC_CONFIG_FILE={INGESTION_PATH}"]
+                self.run("exec", "-T", SYNC, "sh", "-ec", 'test -r "$RFC_SYNC_CONFIG_FILE"')
                 assert host["Memory"] == 2 * 1024**3 and host["NanoCpus"] == 2_000_000_000
                 block_size, blocks = map(int, self.capture(
                     "exec", "-T", SYNC, "stat", "-f", "-c", "%S %b", "/tmp"
                 ).split())
                 assert block_size * blocks == 512 * 1024**2
+            else:
+                assert not config_mounts and not config_env
             if service == FEED:
                 assert not any(mount["Destination"] == "/mirror" for mount in info["Mounts"])
             if service in (SYNC, FEED):
@@ -360,6 +419,7 @@ def main():
             seed.run("stop", "fixtures", "postgres", timeout=50)
             deployment = Deployment(work, seed, args.image_prefix)
             try:
+                deployment.check_config()
                 deployment.start()
                 deployment.verify()
                 deployment.run("up", "-d", "--force-recreate", "--wait", "--wait-timeout", "55",
