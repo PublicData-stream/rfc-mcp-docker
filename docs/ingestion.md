@@ -22,6 +22,7 @@ Production Compose mounts the [ingestion TOML](../deploy/ingestion.toml.example)
 | `ingestion.https.max_in_flight_requests` | 2 | 1–2 |
 | `ingestion.https.min_request_start_interval_ms` | 1000 | 1000–60000 |
 | `ingestion.https.request_timeout_seconds` | 30 | 5–30 |
+| `ingestion.https.rfcxml_max_attempts` | 3 | 1–3 |
 | `ingestion.rsync.mode` | `batched` | `batched`, `persistent_bulk` |
 | `ingestion.rsync.batch_size` | 32 | 1–32 |
 | `ingestion.rsync.transfer_timeout_seconds` | 120 | 30–120 |
@@ -39,24 +40,28 @@ When `RFC_SYNC_CONFIG_FILE` is unset, `RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_
 
 ## Pipeline and recovery
 
-Bulk mode runs one rsync session for the selected RFCs. It keeps full and sample working trees on a separate capped filesystem. Sync checks the rsync receipt and the complete inventory before any file enters the bounded document window. Subsequent sessions use the existing files as checksum-verified transfer bases. A failed or interrupted session can leave some files updated. A retry must finish a fresh rsync session and validate the whole selection before using those bytes. [Bulk mount provisioning](deployment.md#bulk-rsync-staging)
+Bulk mode runs one rsync session for the selected RFCs. It keeps full and sample working trees on a separate capped filesystem. Sync checks the rsync receipt and the complete inventory before admitting TXT files. Subsequent sessions use the existing files as checksum-verified transfer bases. A failed or interrupted session can leave some files updated. A retry must finish a fresh rsync session and validate the whole selection before using those bytes. [Bulk mount provisioning](deployment.md#bulk-rsync-staging)
 
 ```mermaid
 flowchart LR
     A[Initial catalog and selected RFC IDs] --> B[Private rsync staging]
-    B --> C[TXT provenance check]
-    C --> D[Optional RFCXML and bounded parsing]
-    D --> E[Ordered blob and database commits]
+    B --> C[TXT verification and parsing]
+    A --> D[Independent RFCXML HTTPS queue]
+    C --> J[Join and parse XML by RFC ID]
+    D --> J
+    J --> E[Ordered blob and database commits]
     E --> F[End catalog digest and candidate validation]
     F --> G[Ready candidate]
     C --> H[Quarantine on byte disagreement]
 ```
 
-In batched mode, Sync stages at most 32 TXT files of up to 4 MiB each and starts the next batch after removing the previous staging directory. In both modes the pending-document window admits files as capacity becomes available. The default three slots reserve at most 48 MiB for document payloads. Each admitted document has a 128 MiB application parse budget, with the existing TXT and RFCXML input caps and XML node limits. Catalog processing runs outside the document window and has a 20,000-entry cap.
+In batched mode, Sync stages at most 32 TXT files of up to 4 MiB each and starts the next batch after removing the previous staging directory. In both modes RFCXML fills the pending-document window immediately after catalog selection, even during rsync. TXT verification and parsing can proceed while its RFCXML request is pending. The window refills as each RFC commits. The default three slots reserve at most 48 MiB for raw payloads, including one RFCXML body per slot. Each document shares a 128 MiB application parse budget between TXT and RFCXML, with the existing XML node and work limits. Catalog processing runs outside the document window and has a 20,000-entry cap.
 
 - The shared HTTPS start gate spaces catalog, TXT, and RFCXML dispatches by the configured interval even when two responses overlap. Hourly catalog probes and reconciliations sharing the mirror also share the corpus fence. Each new lock holder waits for the configured interval before starting HTTPS.
+- RFCXML retries timeouts, interrupted transfers, and HTTP 429, 500, 502, 503, and 504. The default allows two retries with jittered one- and two-second backoffs. A valid `Retry-After` on RFCXML 429 or 503 delays new HTTPS starts for all sources in that run. Values above 30 seconds end retries for that RFC and keep the shared delay, subject to the run deadline.
+- The reconciliation report's `rfcxml` counters distinguish valid captures, 404, 410, malformed responses that passed HTTPS body validation, exhausted retries, and terminal fetch failures. The legacy `xml_unavailable` count still includes 404, 410, and fetch failures. HTTPS evidence for malformed XML preserves the captured bytes. Only valid parsed results supply RFCXML relations. A 404 or 410 uses normal TXT fallback. Failure or malformed XML caps otherwise complete fallback reference coverage at partial. Metrics include dispatched retries, peak lookahead, reserved bytes, and shared HTTPS concurrency and start spacing.
 - The writer commits in ascending RFC order and ends each document transaction before taking the next prepared result. One supervised blocking task at a time performs blob installation and fsync so transfers can continue while the writer waits.
-- On failure, timeout, or SIGTERM, sync stops admission, cancels HTTPS work, reaps rsync, and joins parsing and any active blob install before releasing the corpus fence. Phase 3 recovery handles unfinished generations and orphaned blobs after an abrupt interruption. Existing optional RFCXML handling still records partial coverage for unavailable or invalid reference evidence as appropriate. [Publication and recovery](publication.md)
+- On fatal failure, timeout, or SIGTERM, Sync stops admission, cancels HTTPS work and retry waits, reaps rsync, and joins parsing and any active blob install before releasing the corpus fence. Recovery handles unfinished generations and orphaned blobs after an abrupt interruption. [Publication and recovery](publication.md)
 - To reduce overlap, set both concurrency settings to `1` in TOML. For policy or schema rollback, follow the [deployment upgrade procedure](deployment.md#initialize-or-upgrade).
 
 ### TXT provenance and reuse

@@ -15,6 +15,7 @@ rfc-mcp-docker = { path = "../../apps" }
 rfc-storage = { path = "../storage" }
 tokio-postgres.workspace = true
 reqwest.workspace = true
+httpdate = "1"
 serde.workspace = true
 serde_json.workspace = true
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }

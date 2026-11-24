@@ -7,6 +7,7 @@ use crate::{
 };
 use reqwest::{Client, StatusCode, header};
 use rfc_core::RfcNumber;
+use rfc_mcp_docker::control::jitter;
 use rfc_storage::{blob::BlobWriter, postgres::Result};
 use std::{
     collections::BTreeSet,
@@ -27,6 +28,7 @@ pub(crate) const TXT_LIMIT: usize = 4 * 1024 * 1024;
 pub(crate) const CATALOG_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) const XML_LIMIT: usize = 8 * 1024 * 1024;
 const OFFICIAL_HTTPS: &str = "https://www.rfc-editor.org";
+const MAX_XML_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub(crate) const OFFICIAL_RSYNC: &str = "rsync://rsync.rfc-editor.org/rfcs-text-only/";
 pub(crate) const MAX_CATALOG_ENTRIES: usize = 20_000;
 
@@ -88,7 +90,57 @@ pub(crate) struct Capture {
 
 pub(crate) enum Download {
     Captured(Capture),
-    Unavailable,
+    Missing(MissingXml),
+}
+
+pub(crate) enum MissingXml {
+    NotFound,
+    Gone,
+}
+
+type Error = Box<dyn std::error::Error + Send + Sync>;
+
+pub(crate) enum XmlFailure {
+    Exhausted(Error),
+    Terminal(Error),
+}
+
+enum FetchFailure {
+    Retryable {
+        error: Error,
+        retry_after: Option<Duration>,
+    },
+    Terminal(Error),
+}
+
+impl FetchFailure {
+    fn terminal(error: impl Into<Error>) -> Self {
+        Self::Terminal(error.into())
+    }
+
+    fn transport(source: Source, error: reqwest::Error) -> Self {
+        let retryable = error.is_timeout()
+            || error.is_connect()
+            || error.is_request()
+            || error.is_body()
+            || error.is_decode();
+        let error = error.without_url();
+        let reason = if error.is_timeout() {
+            "timeout"
+        } else {
+            "request failed"
+        };
+        let detail = std::error::Error::source(&error).unwrap_or(&error);
+        let message = format!("{} HTTPS transport: {reason}: {detail}", source.kind());
+        if retryable {
+            Self::Retryable {
+                error: message.into(),
+                retry_after: None,
+            }
+        } else {
+            Self::Terminal(message.into())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -101,7 +153,8 @@ pub(crate) struct Upstream {
     metrics: Metrics,
     #[cfg(feature = "phase2-fixtures")]
     fixture_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
-    next_request: Arc<Mutex<time::Instant>>,
+    // None represents a Retry-After beyond the range of the monotonic clock.
+    next_request: Arc<Mutex<Option<time::Instant>>>,
     in_flight: Arc<Semaphore>,
 }
 
@@ -170,7 +223,7 @@ impl Upstream {
             metrics: Metrics::default(),
             #[cfg(feature = "phase2-fixtures")]
             fixture_clock: None,
-            next_request: Arc::new(Mutex::new(time::Instant::now())),
+            next_request: Arc::new(Mutex::new(Some(time::Instant::now()))),
             in_flight: Arc::new(Semaphore::new(https.max_in_flight_requests)),
         })
     }
@@ -198,25 +251,92 @@ impl Upstream {
 
     pub(crate) async fn after_fence(&self) {
         if self.paced {
-            *self.next_request.lock().await = time::Instant::now() + self.start_interval();
+            self.delay_starts(self.start_interval()).await;
         }
     }
 
     pub(crate) async fn fetch(&self, source: Source) -> Result<Download> {
-        let queue = self.metrics.span(Stage::Queue);
-        let _permit = self.in_flight.acquire().await?;
+        self.fetch_once(source, false)
+            .await
+            .map_err(|failure| match failure {
+                FetchFailure::Retryable { error, .. } | FetchFailure::Terminal(error) => error,
+            })
+    }
+
+    pub(crate) async fn fetch_xml(
+        &self,
+        id: RfcNumber,
+    ) -> std::result::Result<Download, XmlFailure> {
+        let source = Source::Xml(id);
+        let max_attempts = self.config.ingestion.https.rfcxml_max_attempts;
+        let mut attempt = 1;
+        loop {
+            match self.fetch_once(source, attempt > 1).await {
+                Ok(download) => return Ok(download),
+                Err(FetchFailure::Terminal(error)) => return Err(XmlFailure::Terminal(error)),
+                Err(FetchFailure::Retryable { error, retry_after }) => {
+                    if attempt >= max_attempts
+                        || retry_after.is_some_and(|delay| delay > MAX_XML_RETRY_AFTER)
+                    {
+                        return Err(XmlFailure::Exhausted(error));
+                    }
+                    time::sleep(jitter(Duration::from_secs(1 << (attempt - 1)))).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn delay_starts(&self, delay: Duration) {
         let mut next = self.next_request.lock().await;
-        if self.paced {
-            time::sleep_until(*next).await;
+        *next = next
+            .zip(time::Instant::now().checked_add(delay))
+            .map(|(current, requested)| current.max(requested));
+    }
+
+    async fn fetch_once(
+        &self,
+        source: Source,
+        retry: bool,
+    ) -> std::result::Result<Download, FetchFailure> {
+        let queue = self.metrics.span(Stage::Queue);
+        let mut next;
+        let _permit;
+        loop {
+            let permit = self
+                .in_flight
+                .acquire()
+                .await
+                .map_err(FetchFailure::terminal)?;
+            let gate = self.next_request.lock().await;
+            let Some(deadline) = *gate else {
+                drop(gate);
+                drop(permit);
+                return std::future::pending().await;
+            };
+            if deadline <= time::Instant::now() {
+                next = gate;
+                _permit = permit;
+                break;
+            }
+            drop(gate);
+            drop(permit);
+            time::sleep_until(deadline).await;
         }
         let clock = self.capture_clock(source);
-        let observed_us = clock.map_or_else(now_us, Ok)?;
+        let observed_us = clock
+            .map_or_else(now_us, Ok)
+            .map_err(FetchFailure::terminal)?;
         let request = self
             .http
             .get(format!("{}{}", self.https_origin, source.path()))
             .header(header::ACCEPT_ENCODING, "identity")
-            .build()?;
+            .build()
+            .map_err(FetchFailure::terminal)?;
         drop(queue);
+        if retry {
+            self.metrics.xml_retry();
+        }
         let _http = self.metrics.http_start(match source {
             Source::Catalog => Stage::Catalog,
             Source::Txt(_) => Stage::Txt,
@@ -227,33 +347,44 @@ impl Upstream {
         // First-poll under the start gate, then release it before awaiting anything
         // from the network. Late scheduling cannot create a burst of starts.
         let initial = poll_fn(|context| Poll::Ready(response.as_mut().poll(context))).await;
-        *next = time::Instant::now() + self.start_interval();
+        if self.paced {
+            *next = Some(time::Instant::now() + self.start_interval());
+        }
         drop(next);
         let mut response = match initial {
             Poll::Ready(result) => result,
             Poll::Pending => response.await,
         }
-        .map_err(|error| {
-            let error = error.without_url();
-            let reason = if error.is_timeout() {
-                "timeout"
-            } else {
-                "request failed"
-            };
-            if let Some(cause) = std::error::Error::source(&error) {
-                format!("{} HTTPS transport: {reason}: {cause}", source.kind())
-            } else {
-                format!("{} HTTPS transport: {reason}: {error}", source.kind())
-            }
-        })?;
+        .map_err(|error| FetchFailure::transport(source, error))?;
         let status = response.status();
-        if matches!(source, Source::Xml(_))
-            && matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE)
-        {
-            return Ok(Download::Unavailable);
-        }
         if status != StatusCode::OK {
-            return Err(format!("{} unexpected HTTPS status {status}", source.kind()).into());
+            let error = format!("{} unexpected HTTPS status {status}", source.kind());
+            if matches!(source, Source::Xml(_)) {
+                match status {
+                    StatusCode::NOT_FOUND => return Ok(Download::Missing(MissingXml::NotFound)),
+                    StatusCode::GONE => return Ok(Download::Missing(MissingXml::Gone)),
+                    StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                        let retry_after = retry_after(response.headers(), SystemTime::now());
+                        if let Some(delay) = retry_after {
+                            self.delay_starts(delay).await;
+                        }
+                        return Err(FetchFailure::Retryable {
+                            error: error.into(),
+                            retry_after,
+                        });
+                    }
+                    StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::GATEWAY_TIMEOUT => {
+                        return Err(FetchFailure::Retryable {
+                            error: error.into(),
+                            retry_after: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            return Err(FetchFailure::terminal(error));
         }
         let headers = response.headers();
         let encoding = headers.get_all(header::CONTENT_ENCODING);
@@ -262,40 +393,52 @@ impl Upstream {
                 .iter()
                 .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
         {
-            return Err("unsupported HTTPS content encoding".into());
+            return Err(FetchFailure::terminal("unsupported HTTPS content encoding"));
         }
         if !headers
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| source.accepts(value))
         {
-            return Err(format!("{} unexpected HTTPS media type", source.kind()).into());
+            return Err(FetchFailure::terminal(format!(
+                "{} unexpected HTTPS media type",
+                source.kind()
+            )));
         }
-        let etag = validator(headers, header::ETAG)?;
-        let last_modified = validator(headers, header::LAST_MODIFIED)?;
+        let etag = validator(headers, header::ETAG).map_err(FetchFailure::terminal)?;
+        let last_modified =
+            validator(headers, header::LAST_MODIFIED).map_err(FetchFailure::terminal)?;
         let limit = source.limit();
         if response
             .content_length()
             .is_some_and(|size| size > limit as u64)
         {
-            return Err("HTTPS transfer exceeds byte limit".into());
+            return Err(FetchFailure::terminal("HTTPS transfer exceeds byte limit"));
         }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(limit)?;
-        while let Some(chunk) = response.chunk().await? {
+        bytes
+            .try_reserve_exact(limit)
+            .map_err(FetchFailure::terminal)?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| FetchFailure::transport(source, error))?
+        {
             if chunk.len() > limit - bytes.len() {
-                return Err("HTTPS transfer exceeds byte limit".into());
+                return Err(FetchFailure::terminal("HTTPS transfer exceeds byte limit"));
             }
             self.metrics.received(chunk.len());
             bytes.extend_from_slice(&chunk);
         }
         if bytes.is_empty() {
-            return Err("HTTPS body is empty".into());
+            return Err(FetchFailure::terminal("HTTPS body is empty"));
         }
         Ok(Download::Captured(Capture {
             bytes: Arc::new(bytes),
             observed_us,
-            fetched_us: clock.map_or_else(now_us, |us| Ok(us + 1))?,
+            fetched_us: clock
+                .map_or_else(now_us, |us| Ok(us + 1))
+                .map_err(FetchFailure::terminal)?,
             etag,
             last_modified,
         }))
@@ -448,6 +591,20 @@ fn validator(headers: &header::HeaderMap, name: header::HeaderName) -> Result<Op
         .transpose()
 }
 
+fn retry_after(headers: &header::HeaderMap, now: SystemTime) -> Option<Duration> {
+    let all = headers.get_all(header::RETRY_AFTER);
+    let mut values = all.iter();
+    let value = values.next()?.to_str().ok()?.trim();
+    if values.next().is_some() || value.is_empty() {
+        return None;
+    }
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    Some(date.duration_since(now).unwrap_or_default())
+}
+
 pub(crate) fn now_us() -> Result<i64> {
     Ok(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros(),
@@ -513,4 +670,38 @@ pub(crate) fn read_staged(
         return Err("rsync TXT changed during read".into());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_accepts_dates_and_delays() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(retry_after(&headers, now), None);
+        headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("2"));
+        assert_eq!(retry_after(&headers, now), Some(Duration::from_secs(2)));
+        headers.append(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        assert_eq!(retry_after(&headers, now), None);
+        for offset in [0, 3, 60] {
+            let date = httpdate::fmt_http_date(now + Duration::from_secs(offset));
+            headers.insert(header::RETRY_AFTER, date.parse().unwrap());
+            assert_eq!(
+                retry_after(&headers, now),
+                Some(Duration::from_secs(offset))
+            );
+        }
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(60));
+        headers.insert(header::RETRY_AFTER, past.parse().unwrap());
+        assert_eq!(retry_after(&headers, now), Some(Duration::ZERO));
+        headers.insert(header::RETRY_AFTER, "18446744073709551616".parse().unwrap());
+        assert_eq!(
+            retry_after(&headers, now),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        headers.insert(header::RETRY_AFTER, "-1".parse().unwrap());
+        assert_eq!(retry_after(&headers, now), None);
+    }
 }

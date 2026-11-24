@@ -505,3 +505,17 @@ Sync supports one persistent rsync session for each catalog-selected TXT set on 
 - The standard Phase 2 suite and the bulk bootstrap suite passed on the final images in both Docker contexts. The first standard rootless run timed out starting the lock-contention fixture during concurrent Compose tests. The retry passed.
 
 Verification used private fixtures. Official full-corpus acquisition and the 900-second first-publication measurement remain open. The current HTTPS request-start interval is still at least one second in the official profile.
+
+## Dual-queue bootstrap implementation Phase 3
+
+Sync schedules RFCXML as soon as the starting catalog selects RFC IDs. The bounded lookahead overlaps with rsync and TXT parsing. A shared HTTPS gate enforces the configured request spacing and concurrency, including RFCXML retries and provider cooldowns. The reconciliation report distinguishes missing XML, malformed captures, and fetch failures. [Pipeline and retry policy](ingestion.md#pipeline-and-recovery)
+
+### Verification on 2026-11-24
+
+- `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, and fixture-enabled Clippy passed with Rust 1.100.0 and Cargo artifacts under `/tmp/rust/target`. The offline Phase 0 Compose probes passed on rootless and rootful Docker Engine 29.10.0 with Compose 5.8.0 on Linux amd64.
+- The rootless Phase 2 suite verified byte ranges, coverage, source evidence, request spacing, and cancellation. The six-RFC paced run made 14 HTTPS starts, reached two in-flight requests, and recorded a minimum start spacing of 1,000,414 µs. The three-slot window reserved 48 MiB of raw payload capacity. The single-slot profile reserved 16 MiB.
+- The bulk bootstrap fixture held rsync until the first three XML requests started, then held the first XML response until TXT parsing finished. The HTTP faults exercised 404, 410, malformed and wrong-RFC XML, 429 and 503 cooldowns, retries after 502 and interrupted bodies, timeouts, and HTTP body validation errors. SIGTERM during a response, retry wait, and a long shared cooldown preserved the active generation.
+- The rootless Phase 2 strict bulk, Phase 3 publication and recovery, Phase 6 standard and bulk bootstrap, and Phase 7 isolation suites passed. The bulk daemon published its first fixture generation, delivered the authenticated notification, returned a successful `/ready`, and served the original bytes over MCP.
+- A fixed-clock, unpaced six-RFC comparison against the Phase 2 images reproduced the manifest `ca0734a5fe6b5a3c700344a0695dd3756e8935a64357f8f48e2a31a393f6fb5e`, 32,113 accepted bytes, and 14 HTTPS starts. The one run per version took 9.323 s before the change and 10.101 s after it. This comparison verifies manifest equivalence at fixture scale. Logs and receipts are under `/tmp/rfc-dual-phase3` on the qualification host.
+
+Verification used private fixtures. At the official one-second start interval, 9,861 RFCXML requests plus two catalog requests require at least 2 h 44 min 22 s between the first and last dispatch. A full official bootstrap through publication and readiness remains unmeasured. [Cold-start measurement contract](decisions/0009-cold-rfc-bootstrap.md#900-second-gate)

@@ -343,6 +343,7 @@ def exercise(project):
         f"SELECT state FROM rfc.relation_coverage WHERE generation_id={int(fallback['generation_id'])}"
         " AND rfc_id=8174 AND family='all_references'"
     ) == "partial"
+    exercise_xml_statuses(project)
     mode.write_text("normal")
     original = project.source / "rsync/rfc100.txt"
     original.unlink()
@@ -400,7 +401,8 @@ def assert_pipeline_bounds(report, *, http_limit, paced=False):
     assert 1 <= metrics["https_peak"] <= http_limit, metrics
     assert 1 <= metrics["parse_peak"] <= 2, metrics
     assert 1 <= metrics["admitted_peak"] <= 3, metrics
-    assert metrics["raw_reserved_peak"] == metrics["admitted_peak"] * 16 * 1024**2, metrics
+    assert metrics["admitted_peak"] <= metrics["xml_window_peak"] <= 3, metrics
+    assert metrics["raw_reserved_peak"] == metrics["xml_window_peak"] * 16 * 1024**2, metrics
     assert metrics["staged_peak"] == 1 and metrics["rsync_peak_bytes"] <= 128 * 1024**2, metrics
     if paced:
         assert metrics["minimum_start_spacing_us"] >= 1_000_000, metrics
@@ -419,6 +421,7 @@ def exercise_config(project, baseline):
 max_in_flight_requests = 1
 min_request_start_interval_ms = 1050
 request_timeout_seconds = 5
+rfcxml_max_attempts = 1
 [ingestion.rsync]
 batch_size = 1
 transfer_timeout_seconds = 30
@@ -429,7 +432,7 @@ max_pending_documents = 1
     assert tuned["manifest_digest"] == baseline["manifest_digest"]
     assert_pipeline_bounds(tuned, http_limit=1, paced=True)
     metrics = tuned["metrics"]
-    assert metrics["parse_peak"] == metrics["admitted_peak"] == 1, metrics
+    assert metrics["parse_peak"] == metrics["admitted_peak"] == metrics["xml_window_peak"] == 1, metrics
     assert metrics["rsync"]["calls"] == 3 and metrics["minimum_start_spacing_us"] >= 1_050_000, metrics
     assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
 
@@ -438,6 +441,149 @@ max_pending_documents = 1
                                 settings=settings, options=options)
     assert limited["accepted_bytes"] == 0 and limited["verified_txt"] == 0
     print("Sync TOML defaults and tuned reconciliation bounds passed", flush=True)
+
+
+def fixture_logs(project):
+    return project.capture("logs", "--no-color", "--no-log-prefix", "fixtures")
+
+
+def verify_xml_observation(project, report, rfc, body):
+    generation = int(report["generation_id"])
+    digest, transport, verification, url = project.sql(
+        "SELECT encode(o.raw_digest,'hex'),o.source_transport,o.https_verification,o.source_url "
+        "FROM rfc.generation_documents d JOIN rfc.source_observations o ON o.identity=d.rfcxml_observation "
+        f"WHERE d.generation_id={generation} AND d.rfc_id={rfc}"
+    ).split("|")
+    assert (transport, verification, url) == (
+        "https", "verified", f"https://www.rfc-editor.org/rfc/rfc{rfc}.xml",
+    )
+    assert (project.directory / "mirror/blobs/blake3" / digest[:2] / digest).read_bytes() == body
+
+
+def exercise_xml_statuses(project):
+    for scenario, expected, malformed, terminal_ids in (
+        ("xml-statuses", {"not_found": 1, "gone": 1, "terminal_failure": 1},
+         b'<rfc number="102"><middle/></rfc>', [9110]),
+        ("xml-policy", {"not_found": 0, "gone": 0, "terminal_failure": 3},
+         b"<rfc number='8174'><back>", [101, 102, 2119]),
+    ):
+        (project.source / "mode").write_text(scenario)
+        report = project.reconcile(settings=(
+            "RFC_SYNC_HTTP_CONCURRENCY=1", "RFC_PHASE2_HTTP_TIMEOUT_MS=1000",
+        ))
+        assert report["rfcxml"] == {
+            "captured": 1, "malformed": 1, "retries_exhausted": 1, **expected,
+        }, report
+        assert report["xml_unavailable"] == 4 and report["metrics"]["retries"] == 3, report
+        verify_xml_observation(project, report, 100, b'<rfc number="100"><middle/></rfc>')
+        verify_xml_observation(project, report, 8174, malformed)
+        generation = int(report["generation_id"])
+        assert project.sql(
+            f"SELECT count(*) FROM rfc.generation_documents WHERE generation_id={generation}"
+            " AND rfcxml_observation IS NOT NULL"
+        ) == "2"
+        assert project.sql(
+            f"SELECT state FROM rfc.relation_coverage WHERE generation_id={generation}"
+            " AND rfc_id=8174 AND family='all_references'"
+        ) == "partial"
+        logs = fixture_logs(project)
+        cooldown, = re.findall(rf"fixture cooldown {scenario} /rfc/rfc100.xml (\d+\.\d+)", logs)
+        starts = [(path, float(at)) for path, at in
+                  re.findall(rf"fixture request {scenario} (\S+) (\d+\.\d+)", logs)]
+        after_cooldown = [(path, at) for path, at in starts if at > float(cooldown)]
+        assert after_cooldown[0][1] - float(cooldown) >= 1.9, starts
+        assert sum(path == "/rfc/rfc100.xml" for path, _ in starts) == 2
+        exhausted = 2119 if scenario == "xml-statuses" else 9110
+        assert sum(path == f"/rfc/rfc{exhausted}.xml" for path, _ in starts) == 3
+        for rfc in terminal_ids:
+            assert sum(path == f"/rfc/rfc{rfc}.xml" for path, _ in starts) == 1
+        project.verify_manifest(report)
+    (project.source / "mode").write_text("xml-interrupted")
+    interrupted = project.reconcile()
+    assert interrupted["metrics"]["retries"] == 1 and interrupted["rfcxml"]["captured"] == 3, interrupted
+    verify_xml_observation(project, interrupted, 9110, (project.source / "https/rfc9110.xml").read_bytes())
+    project.verify_manifest(interrupted)
+    print("RFCXML HTTP outcomes, evidence and shared Retry-After passed", flush=True)
+
+
+@contextmanager
+def xml_collector(project, scenario, *, options, settings):
+    mode = project.source / "mode"
+    previous = mode.read_text()
+    mode.write_text(scenario)
+    name = f"{project.name}-{scenario}"
+    command = project.reconcile_command(False, "full", settings=settings,
+                                        options=("--name", name, *options))
+    stdout = project.directory / f"{scenario}.json"
+    stderr = project.directory / f"{scenario}.log"
+    with stdout.open("w") as out, stderr.open("w") as err:
+        with subprocess.Popen(command, env=project.env, stdout=out, stderr=err) as collector:
+            try:
+                yield collector, name, stdout, stderr
+            finally:
+                for gate in ("release-rsync", "release-xml"):
+                    (project.source / gate).touch()
+                subprocess.run([*project.docker, "rm", "-f", name], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=15)
+                mode.write_text(previous)
+                for gate in ("release-rsync", "release-xml"):
+                    (project.source / gate).unlink()
+
+
+def wait_for_fixture(collector, check, description):
+    until = time.monotonic() + 15
+    while time.monotonic() < until:
+        if check():
+            return
+        assert collector.poll() is None, description
+        time.sleep(0.1)
+    raise AssertionError(description)
+
+
+def exercise_xml_overlap(project, *, options, settings):
+    settings = (*settings, "RFC_PHASE2_TRACE_TXT_PARSE=1")
+    with xml_collector(project, "xml-overlap", options=options, settings=settings) as run:
+        collector, _, stdout, stderr = run
+        def rsync_and_window():
+            logs = fixture_logs(project)
+            requests = re.findall(r"fixture request xml-overlap /rfc/rfc(\d+)\.xml", logs)
+            return "fixture rsync held for XML" in logs and set(requests) == {"100", "101", "102"}
+        wait_for_fixture(collector, rsync_and_window, "XML window did not fill while bulk rsync was held")
+        (project.source / "release-rsync").touch()
+        wait_for_fixture(collector, lambda: "fixture TXT parsed before XML for RFC 100" in stderr.read_text(),
+                         "TXT parsing did not finish while RFCXML was held")
+        assert rsync_and_window(), "XML exceeded the document window before the first commit"
+        (project.source / "release-xml").touch()
+        assert collector.wait(timeout=30) == 0, stderr.read_text()
+        report = json.loads(stdout.read_text().strip().splitlines()[-1])
+    assert report["state"] == "ready" and report["metrics"]["xml_window_peak"] == 3, report
+    assert_pipeline_bounds(report, http_limit=2)
+    print("RFCXML starts during bulk rsync and TXT parses during an XML response wait", flush=True)
+    return report
+
+
+def exercise_xml_cancellation(project, *, options, settings, active):
+    for scenario, retries_exhausted in (
+        ("xml-stop-response", 0), ("xml-stop-retry", 0), ("xml-stop-cooldown", 1),
+    ):
+        with xml_collector(project, scenario, options=options, settings=settings) as run:
+            collector, name, stdout, stderr = run
+            marker = "request" if scenario == "xml-stop-response" else "cooldown"
+            wait_for_fixture(collector, lambda: f"fixture {marker} {scenario} /rfc/rfc100.xml" in fixture_logs(project),
+                             f"RFC 100 did not reach {scenario}")
+            if retries_exhausted:
+                wait_for_fixture(collector, lambda: project.sql(
+                    "SELECT count(*) FROM rfc.generation_documents d JOIN rfc.generations g ON g.id=d.generation_id "
+                    "WHERE g.state='building' AND d.rfc_id=100"
+                ) == "1", "long cooldown did not settle RFC 100 without retrying it")
+            phase1.run([*project.docker, "kill", "--signal", "TERM", name], stdout=subprocess.DEVNULL)
+            assert collector.wait(timeout=10) == 1, stderr.read_text()
+            report = json.loads(stdout.read_text().strip().splitlines()[-1])
+            assert report["error"] == "reconciliation cancelled" and report["metrics"]["retries"] == 0, report
+            assert report["rfcxml"]["retries_exhausted"] == retries_exhausted, report
+        assert project.sql("SELECT state FROM rfc.generations ORDER BY id DESC LIMIT 1") == "failed"
+        assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
+    print("RFCXML response and retry cancellation preserved the active generation", flush=True)
 
 
 def exercise_cancellation(project, *, options=(), settings=(), active="|0"):
@@ -702,7 +848,7 @@ def exercise_bootstrap(project):
         project.start()
         project.migrate()
         project.run("up", "-d", "--wait", "fixtures", timeout=35)
-        first = project.reconcile(options=options, settings=settings)
+        first = exercise_xml_overlap(project, options=options, settings=settings)
         assert first["verified_txt"] == 0 and first["rsync_only_txt"] == count
         assert first["metrics"]["txt"]["calls"] == 0 and first["metrics"]["https_requests"] == count + 2
         first_id = int(first["generation_id"])
@@ -724,6 +870,7 @@ def exercise_bootstrap(project):
         active = f"{first_id}|1"
         assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
         assert project.sql(f"SELECT state FROM rfc.generations WHERE id={stale}") == "ready"
+        exercise_xml_cancellation(project, options=options, settings=settings, active=active)
 
         rsync = project.source / "rsync/rfc100.txt"
         https = project.source / "https/rfc100.txt"

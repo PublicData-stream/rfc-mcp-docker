@@ -50,6 +50,7 @@ pub(crate) struct Record {
     pub scratch_peak_bytes: Option<u64>,
     pub out_of_order: u64,
     pub admitted_peak: u64,
+    pub xml_window_peak: u64,
     pub raw_reserved_peak: u64,
     pub parse_peak: u64,
     pub staged_peak: u64,
@@ -152,10 +153,19 @@ impl Metrics {
         self.0.lock().unwrap().out_of_order += 1;
     }
 
-    pub(crate) fn admitted(&self, entries: usize, raw_bytes: usize) {
+    pub(crate) fn admitted(&self, entries: usize) {
         let mut record = self.0.lock().unwrap();
         record.admitted_peak = record.admitted_peak.max(entries as u64);
+    }
+
+    pub(crate) fn xml_reserved(&self, entries: usize, raw_bytes: usize) {
+        let mut record = self.0.lock().unwrap();
+        record.xml_window_peak = record.xml_window_peak.max(entries as u64);
         record.raw_reserved_peak = record.raw_reserved_peak.max(raw_bytes as u64);
+    }
+
+    pub(crate) fn xml_retry(&self) {
+        self.0.lock().unwrap().retries += 1;
     }
 
     pub(crate) fn queue_wait(&self, elapsed: Duration) {

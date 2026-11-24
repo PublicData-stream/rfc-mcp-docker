@@ -1,5 +1,7 @@
 """Private TLS and rsync fixture endpoints, including bounded fault cases."""
 
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import selectors
@@ -17,9 +19,16 @@ def mode():
     return (ROOT / "mode").read_text().strip()
 
 
+def wait_for_release(name):
+    until = time.monotonic() + 25
+    while not (ROOT / name).exists() and time.monotonic() < until:
+        time.sleep(0.02)
+
+
 class Https(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     drift_captures = 0
+    xml_attempts = {}
 
     def response(self, body, media_type):
         self.send_response(200)
@@ -35,6 +44,10 @@ class Https(BaseHTTPRequestHandler):
 
     def do_GET(self):
         scenario = mode()
+        if scenario.startswith("xml-"):
+            print(f"fixture request {scenario} {self.path} {time.monotonic():.6f}", flush=True)
+            if self.path.endswith(".xml") and self.path.startswith("/rfc/") and self.xml_fixture(scenario):
+                return
         if scenario == "overlap" and self.path == "/rfc/rfc100.txt":
             time.sleep(2.35)
         if scenario == "slow-txt" and self.path == "/rfc/rfc100.txt":
@@ -112,6 +125,73 @@ class Https(BaseHTTPRequestHandler):
             payload = b"<rfc number='8174'><back>"
         self.response(payload, "text/plain" if file.suffix == ".txt" else "application/xml")
 
+    def xml_fixture(self, scenario):
+        rfc = int(self.path.removeprefix("/rfc/rfc").removesuffix(".xml"))
+        if scenario == "xml-interrupted" and rfc == 9110:
+            key = (scenario, rfc)
+            if key not in self.xml_attempts:
+                self.xml_attempts[key] = 1
+                self.status(200, {"Content-Type": "application/xml"}, length=64)
+                self.wfile.write(b"<rfc")
+                self.close_connection = True
+                return True
+        if scenario == "xml-overlap":
+            if rfc == 100:
+                wait_for_release("release-xml")
+            return False
+        if scenario == "xml-stop-response":
+            if rfc == 100:
+                wait_for_release("release-xml")
+            return False
+        if scenario in ("xml-stop-retry", "xml-stop-cooldown") and rfc == 100:
+            self.status(429, {"Retry-After": "20" if scenario == "xml-stop-retry" else "60"})
+            return True
+        if scenario in ("xml-statuses", "xml-policy"):
+            key = (scenario, rfc)
+            attempt = self.xml_attempts.get(key, 0) + 1
+            self.xml_attempts[key] = attempt
+            if rfc == 100:
+                if attempt == 1:
+                    if scenario == "xml-statuses":
+                        self.status(429, {"Retry-After": "2"})
+                    else:
+                        date = datetime.now(timezone.utc) + timedelta(seconds=3)
+                        self.status(503, {"Retry-After": format_datetime(date, usegmt=True)})
+                else:
+                    self.response(b'<rfc number="100"><middle/></rfc>', "application/xml")
+                return True
+        if scenario == "xml-statuses":
+            if rfc in (101, 102, 2119):
+                self.status({101: 410, 102: 404, 2119: 502}[rfc])
+            elif rfc == 8174:
+                self.response(b'<rfc number="102"><middle/></rfc>', "application/xml")
+            else:
+                self.response(b"<html/>", "text/html")
+            return True
+        if scenario == "xml-policy":
+            if rfc == 101:
+                self.status(302, {"Location": "https://invalid.example/rfc/rfc101.xml"})
+            elif rfc == 102:
+                self.status(200, {"Content-Type": "application/xml", "Content-Encoding": "gzip"})
+            elif rfc == 2119:
+                self.status(200, {"Content-Type": "application/xml"}, length=8 * 1024**2 + 1)
+            elif rfc == 8174:
+                self.response(b"<rfc number='8174'><back>", "application/xml")
+            else:
+                time.sleep(1.5)
+                self.response(b'<rfc number="9110"><middle/></rfc>', "application/xml")
+            return True
+        return False
+
+    def status(self, status, headers=None, *, length=0):
+        self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(length))
+        self.end_headers()
+        if status in (429, 503):
+            print(f"fixture cooldown {mode()} {self.path} {time.monotonic():.6f}", flush=True)
+
 
 class Rsync(socketserver.BaseRequestHandler):
     def handle(self):
@@ -120,6 +200,9 @@ class Rsync(socketserver.BaseRequestHandler):
             time.sleep(15)
         if scenario == "hold-rsync-timeout":
             time.sleep(45)
+        if scenario == "xml-overlap":
+            print("fixture rsync held for XML", flush=True)
+            wait_for_release("release-rsync")
         if scenario in ("benchmark", "cold-bootstrap"):
             time.sleep(0.20)
         with socket.create_connection(("127.0.0.1", 9873), 3) as upstream:

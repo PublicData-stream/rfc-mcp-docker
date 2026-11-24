@@ -58,6 +58,7 @@ pub(crate) struct Https {
     pub(crate) max_in_flight_requests: usize,
     pub(crate) min_request_start_interval_ms: u64,
     pub(crate) request_timeout_seconds: u64,
+    pub(crate) rfcxml_max_attempts: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -110,6 +111,7 @@ impl Default for Https {
             max_in_flight_requests: 2,
             min_request_start_interval_ms: MIN_HTTPS_INTERVAL_MS,
             request_timeout_seconds: 30,
+            rfcxml_max_attempts: 3,
         }
     }
 }
@@ -257,6 +259,9 @@ impl SyncConfig {
         }
         if !(5..=30).contains(&https.request_timeout_seconds) {
             return Err("request_timeout_seconds must be 5 through 30".into());
+        }
+        if !(1..=3).contains(&https.rfcxml_max_attempts) {
+            return Err("rfcxml_max_attempts must be 1 through 3".into());
         }
         if !(1..=MAX_RSYNC_BATCH).contains(&rsync.batch_size) {
             return Err("batch_size must be 1 through 32".into());
@@ -429,6 +434,8 @@ mod tests {
             "schema_version = 1\n[ingestion.https]\nmax_in_flight_requests = -1",
             "schema_version = 1\n[ingestion.https]\nmin_request_start_interval_ms = 999",
             "schema_version = 1\n[ingestion.https]\nrequest_timeout_seconds = 31",
+            "schema_version = 1\n[ingestion.https]\nrfcxml_max_attempts = 0",
+            "schema_version = 1\n[ingestion.https]\nrfcxml_max_attempts = 4",
             "schema_version = 1\n[ingestion.rsync]\nbatch_size = 33",
             "schema_version = 1\n[ingestion.rsync]\ntransfer_timeout_seconds = 29",
             "schema_version = 1\n[ingestion]\nmax_accepted_bytes = 4294967297",

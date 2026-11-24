@@ -2,10 +2,12 @@ use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
     config::{RsyncMode, SyncConfig, TxtProvenance},
     metrics::{Record, Stage},
-    pipeline::{Event, Pipeline, Prepared, PriorTxt, Shutdown, StagedTxt, TxtEvidence},
+    pipeline::{
+        Event, Pipeline, Prepared, PreparedXml, PriorTxt, Shutdown, StagedTxt, TxtEvidence,
+    },
     policy::Registry,
     recovery::recover_before_ingestion,
-    upstream::{self, Capture, Download, Source, Upstream},
+    upstream::{self, Capture, Download, MissingXml, Source, Upstream, XmlFailure},
     xml,
 };
 use rfc_core::{BlobDigest, ByteRange, Coverage, GenerationId, Relation, RelationKind, RfcNumber};
@@ -73,6 +75,7 @@ struct Report {
     partial_references: usize,
     unclassified_or_incomplete: usize,
     xml_unavailable: usize,
+    rfcxml: XmlCounts,
     catalog_dangling_observations: usize,
     reference_targets_without_txt: usize,
     accepted_bytes: u64,
@@ -80,6 +83,16 @@ struct Report {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<Record>,
+}
+
+#[derive(Default, Serialize)]
+struct XmlCounts {
+    captured: usize,
+    not_found: usize,
+    gone: usize,
+    malformed: usize,
+    retries_exhausted: usize,
+    terminal_failure: usize,
 }
 
 impl Report {
@@ -104,6 +117,7 @@ impl Report {
             partial_references: 0,
             unclassified_or_incomplete: 0,
             xml_unavailable: 0,
+            rfcxml: XmlCounts::default(),
             catalog_dangling_observations: 0,
             reference_targets_without_txt: 0,
             accepted_bytes: 0,
@@ -340,6 +354,7 @@ impl Run<'_> {
         {
             return Err("catalog lacks an expected TXT entry".into());
         }
+        pipeline.prefetch_xml(selected.iter().copied(), 0);
         let baseline = self.baseline(txt_policy).await?;
         if self.scope == Scope::Full
             && let Some(missing) = baseline.keys().find(|id| !selected.contains(id))
@@ -457,6 +472,9 @@ impl Run<'_> {
         let mut failed = false;
         let mut stage_error = None;
         while committed < ordered.len() {
+            if !failed {
+                pipeline.prefetch_xml(ordered.iter().copied(), committed);
+            }
             if !failed && !staging && batch.is_none() && admitted < ordered.len() {
                 stage_end = match config.rsync.mode {
                     RsyncMode::Batched => (admitted + config.rsync.batch_size).min(ordered.len()),
@@ -484,7 +502,7 @@ impl Run<'_> {
                         matches!(txt_policy, TxtPolicy::Bootstrap),
                         self.reader.clone(),
                         admitted - committed,
-                    );
+                    )?;
                 }
                 if admitted == stage_end {
                     batch.take().expect("staged batch").close()?;
@@ -506,6 +524,7 @@ impl Run<'_> {
                 continue;
             }
             match pipeline.next().await? {
+                Event::XmlFetched => {}
                 Event::Staged(result) => {
                     staging = false;
                     match result {
@@ -600,7 +619,7 @@ impl Run<'_> {
                 )?;
                 Ok(capture)
             }
-            Download::Unavailable => Err("required catalog is unavailable".into()),
+            Download::Missing(_) => Err("required catalog is unavailable".into()),
         }
     }
 
@@ -746,7 +765,6 @@ impl Run<'_> {
             bytes,
             digest,
             txt_evidence,
-            xml,
             parsed,
             ..
         } = *prepared;
@@ -767,7 +785,7 @@ impl Run<'_> {
             let _database = self.upstream.metrics().span(Stage::Database);
             self.writer.register_blob(durable).await?;
         }
-        let optional = self.rfcxml(id, xml, parsed.references).await?;
+        let optional = self.rfcxml(id, parsed.xml).await?;
         let (policy, notices) =
             if let Some(notices) = self.registry.pagination_notices(id, digest, &bytes)? {
                 indexed.notice_state = Coverage::Complete;
@@ -927,38 +945,54 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn rfcxml(
-        &mut self,
-        id: RfcNumber,
-        download: Result<Download>,
-        references: Option<Result<xml::XmlReferences>>,
-    ) -> Result<OptionalXml> {
-        let source = Source::Xml(id);
+    async fn rfcxml(&mut self, id: RfcNumber, xml: PreparedXml) -> Result<OptionalXml> {
         let mut result = OptionalXml::default();
-        match download {
-            Ok(Download::Captured(capture)) => {
-                self.report.accept(
-                    capture.bytes.len(),
-                    self.upstream.config().ingestion.max_accepted_bytes,
-                )?;
-                match references.ok_or("missing RFCXML parser output")? {
-                    Ok(references) => result.references = Some(references),
-                    Err(error) => {
-                        self.report
-                            .diagnostic(format!("RFC {} RFCXML parse: {error}", id.get()));
-                        result.failed = true;
-                    }
-                }
-                let digest = self.install(source, capture.bytes.clone()).await?;
-                result.capture = Some((capture, digest));
+        let capture = match xml {
+            PreparedXml::Captured(capture, references) => {
+                self.report.rfcxml.captured += 1;
+                result.references = Some(references);
+                Some(capture)
             }
-            Ok(Download::Unavailable) => self.report.xml_unavailable += 1,
-            Err(error) => {
+            PreparedXml::Malformed(capture, error) => {
+                self.report.rfcxml.malformed += 1;
+                self.report
+                    .diagnostic(format!("RFC {} RFCXML parse: {error}", id.get()));
+                result.failed = true;
+                Some(capture)
+            }
+            PreparedXml::Missing(status) => {
+                match status {
+                    MissingXml::NotFound => self.report.rfcxml.not_found += 1,
+                    MissingXml::Gone => self.report.rfcxml.gone += 1,
+                }
+                self.report.xml_unavailable += 1;
+                None
+            }
+            PreparedXml::Failed(failure) => {
+                let error = match failure {
+                    XmlFailure::Exhausted(error) => {
+                        self.report.rfcxml.retries_exhausted += 1;
+                        error
+                    }
+                    XmlFailure::Terminal(error) => {
+                        self.report.rfcxml.terminal_failure += 1;
+                        error
+                    }
+                };
                 self.report.xml_unavailable += 1;
                 self.report
                     .diagnostic(format!("RFC {} RFCXML fetch: {error}", id.get()));
                 result.failed = true;
+                None
             }
+        };
+        if let Some(capture) = capture {
+            self.report.accept(
+                capture.bytes.len(),
+                self.upstream.config().ingestion.max_accepted_bytes,
+            )?;
+            let digest = self.install(Source::Xml(id), capture.bytes.clone()).await?;
+            result.capture = Some((capture, digest));
         }
         Ok(result)
     }
