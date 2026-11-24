@@ -3,10 +3,12 @@ use crate::{
     config::{RsyncMode, SyncConfig, TxtProvenance},
     metrics::{Record, Stage},
     pipeline::{
-        Event, Pipeline, Prepared, PreparedXml, PriorTxt, Shutdown, StagedTxt, TxtEvidence,
+        Event, Pipeline, Prepared, PreparedXml, PriorTxt, Selection, Shutdown, StagedTxt,
+        TxtEvidence, WorkId,
     },
     policy::Registry,
     recovery::recover_before_ingestion,
+    text::TextReference,
     upstream::{self, Capture, Download, MissingXml, Source, Upstream, XmlFailure},
     xml,
 };
@@ -291,14 +293,20 @@ async fn run(
         registry,
         report,
     };
-    let result = tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => Err("reconciliation cancelled".into()),
-        _ = tokio::time::sleep(Duration::from_secs(12 * 60 * 60)) => {
-            Err("reconciliation deadline exceeded".into())
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12 * 60 * 60);
+    let result = async {
+        let candidate = shutdown.until(deadline, run.collect(&mut pipeline)).await?;
+        let digest = shutdown
+            .until(deadline, candidate.prepare_readiness())
+            .await?;
+        shutdown.check()?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err("reconciliation deadline exceeded".into());
         }
-        result = run.collect(&mut pipeline) => result,
-    };
+        // Once submitted, observe the COMMIT outcome before releasing the fence.
+        candidate.commit_readiness(digest).await
+    }
+    .await;
     pipeline.drain().await;
     run.drain_install().await;
     if result.is_err()
@@ -323,8 +331,38 @@ struct Run<'a> {
     report: &'a mut Report,
 }
 
+#[derive(Clone, Copy)]
+struct CatalogWork {
+    selection: Selection,
+    before: BlobDigest,
+    txt_policy: TxtPolicy,
+}
+
+struct SealedTxt {
+    version: BlobDigest,
+    observation: BlobDigest,
+    reused: bool,
+    rsync_only: bool,
+    references: Vec<TextReference>,
+    all: Coverage,
+    classified: Coverage,
+}
+
+fn pending_slot(
+    pending: &mut BTreeMap<RfcNumber, Option<SealedTxt>>,
+    selection: Selection,
+    id: WorkId,
+) -> Result<&mut Option<SealedTxt>> {
+    if id.selection != selection {
+        return Err("document result belongs to another catalog selection".into());
+    }
+    pending
+        .get_mut(&id.rfc)
+        .ok_or_else(|| "document result has no pending slot".into())
+}
+
 impl Run<'_> {
-    async fn collect(&mut self, pipeline: &mut Pipeline) -> Result<(GenerationId, BlobDigest)> {
+    async fn collect(&mut self, pipeline: &mut Pipeline) -> Result<Candidate<'_>> {
         let txt_policy = self.txt_policy().await?;
         let start = self.catalog_capture().await?;
         let catalog = {
@@ -354,7 +392,12 @@ impl Run<'_> {
         {
             return Err("catalog lacks an expected TXT entry".into());
         }
-        pipeline.prefetch_xml(selected.iter().copied(), 0);
+        let ordered: Vec<_> = selected.iter().copied().collect();
+        let selection = Selection {
+            generation: self.id,
+            catalog: BlobDigest::hash(&start.bytes),
+        };
+        pipeline.prefetch_xml(selection, &ordered, 0);
         let baseline = self.baseline(txt_policy).await?;
         if self.scope == Scope::Full
             && let Some(missing) = baseline.keys().find(|id| !selected.contains(id))
@@ -370,14 +413,28 @@ impl Run<'_> {
         self.report.catalog_only = catalog_only.len();
         self.report.expected_txt = selected.len();
         let start_digest = self.install(Source::Catalog, start.bytes.clone()).await?;
+        if start_digest != selection.catalog {
+            return Err("installed catalog differs from selected catalog".into());
+        }
         self.report.catalog_digest = Some(start_digest.to_string());
         let before = self.store_catalog(&start, start_digest).await?;
         drop(start);
         self.store_catalog_graph(&catalog, &selected, before)
             .await?;
 
-        self.collect_documents(pipeline, &catalog, &selected, &baseline, before, txt_policy)
-            .await?;
+        self.collect_documents(
+            pipeline,
+            &catalog,
+            &ordered,
+            &baseline,
+            CatalogWork {
+                selection,
+                before,
+                txt_policy,
+            },
+        )
+        .await?;
+        pipeline.finish().await?;
 
         let end = self.catalog_capture().await?;
         let end_digest = self.install(Source::Catalog, end.bytes.clone()).await?;
@@ -449,33 +506,26 @@ impl Run<'_> {
         if !validated {
             return Err("candidate failed membership or coverage validation".into());
         }
-        candidate.ready().await
+        Ok(candidate)
     }
 
     async fn collect_documents(
         &mut self,
         pipeline: &mut Pipeline,
         catalog: &xml::Catalog,
-        selected: &BTreeSet<RfcNumber>,
+        ordered: &[RfcNumber],
         baseline: &BTreeMap<RfcNumber, Option<PriorTxt>>,
-        before: BlobDigest,
-        txt_policy: TxtPolicy,
+        work: CatalogWork,
     ) -> Result<()> {
-        let ordered: Vec<_> = selected.iter().copied().collect();
         let config = self.upstream.config().ingestion;
         let mut batch: Option<StagedTxt> = None;
-        let mut staging = false;
         let mut stage_end = 0;
         let mut admitted = 0;
         let mut committed = 0;
-        let mut completed = BTreeMap::new();
-        let mut failed = false;
-        let mut stage_error = None;
+        let mut pending = BTreeMap::<RfcNumber, Option<SealedTxt>>::new();
         while committed < ordered.len() {
-            if !failed {
-                pipeline.prefetch_xml(ordered.iter().copied(), committed);
-            }
-            if !failed && !staging && batch.is_none() && admitted < ordered.len() {
+            pipeline.prefetch_xml(work.selection, ordered, committed);
+            if batch.is_none() && admitted == stage_end && admitted < ordered.len() {
                 stage_end = match config.rsync.mode {
                     RsyncMode::Batched => (admitted + config.rsync.batch_size).min(ordered.len()),
                     RsyncMode::PersistentBulk => ordered.len(),
@@ -485,23 +535,25 @@ impl Run<'_> {
                     ordered[admitted..stage_end].to_vec(),
                     config.max_accepted_bytes - self.report.accepted_bytes,
                 );
-                staging = true;
             }
-            if !failed && let Some(staged) = batch.as_ref() {
-                while admitted < stage_end
-                    && admitted - committed < config.pipeline.max_pending_documents
+            if let Some(staged) = batch.as_ref() {
+                while admitted < stage_end && pending.len() < config.pipeline.max_pending_documents
                 {
-                    let id = ordered[admitted];
-                    self.report.current_rfc = Some(id.get());
-                    let bytes = staged.take(&self.store, id)?;
+                    let rfc = ordered[admitted];
+                    self.report.current_rfc = Some(rfc.get());
+                    let bytes = staged.take(&self.store, rfc)?;
                     admitted += 1;
+                    pending.insert(rfc, None);
                     pipeline.prepare(
-                        id,
+                        WorkId {
+                            selection: work.selection,
+                            rfc,
+                        },
                         bytes,
-                        baseline.get(&id).copied().flatten(),
-                        matches!(txt_policy, TxtPolicy::Bootstrap),
+                        baseline.get(&rfc).copied().flatten(),
+                        matches!(work.txt_policy, TxtPolicy::Bootstrap),
                         self.reader.clone(),
-                        admitted - committed,
+                        pending.len(),
                     )?;
                 }
                 if admitted == stage_end {
@@ -510,40 +562,48 @@ impl Run<'_> {
                     continue;
                 }
             }
-            if committed == admitted
-                && let Some(error) = stage_error.take()
-            {
-                return Err(error);
-            }
-            let id = ordered[committed];
-            if let Some(document) = completed.remove(&id) {
-                self.report.current_rfc = Some(id.get());
-                self.store_document(id, &catalog.entries[&id], before, document?, selected)
-                    .await?;
-                committed += 1;
-                continue;
-            }
             match pipeline.next().await? {
-                Event::XmlFetched => {}
                 Event::Staged(result) => {
-                    staging = false;
-                    match result {
-                        Ok(staged) => batch = Some(staged),
-                        Err(error) => {
-                            failed = true;
-                            stage_error = Some(error);
-                        }
-                    }
+                    batch = Some(result?);
                 }
-                Event::Document(id, result) => {
-                    if id != ordered[committed] {
+                Event::Txt(id, prepared) => {
+                    let slot = pending_slot(&mut pending, work.selection, id)?;
+                    if slot.is_some() {
+                        return Err("duplicate TXT result".into());
+                    }
+                    self.report.current_rfc = Some(id.rfc.get());
+                    *slot = Some(
+                        self.store_txt(id.rfc, &catalog.entries[&id.rfc], *prepared)
+                            .await?,
+                    );
+                }
+                Event::Xml(id, xml) => {
+                    let out_of_order = pending
+                        .first_key_value()
+                        .is_some_and(|(rfc, _)| *rfc != id.rfc);
+                    let txt = pending_slot(&mut pending, work.selection, id)?
+                        .take()
+                        .ok_or("RFCXML result arrived before TXT was sealed")?;
+                    self.report.current_rfc = Some(id.rfc.get());
+                    self.store_membership(
+                        id.rfc,
+                        &catalog.entries[&id.rfc],
+                        work.before,
+                        txt,
+                        xml,
+                        ordered,
+                    )
+                    .await?;
+                    pending.remove(&id.rfc);
+                    if out_of_order {
                         self.upstream.metrics().out_of_order();
                     }
-                    failed |= result.is_err();
-                    if let Ok(document) = &result {
-                        failed |= matches!(document.txt_evidence, TxtEvidence::Mismatch(_));
-                    }
-                    completed.insert(id, result);
+                    committed += 1;
+                }
+                Event::Failed(id, error) => {
+                    pending_slot(&mut pending, work.selection, id)?;
+                    self.report.current_rfc = Some(id.rfc.get());
+                    return Err(error);
                 }
             }
         }
@@ -750,14 +810,12 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn store_document(
+    async fn store_txt(
         &mut self,
         id: RfcNumber,
         entry: &xml::Entry,
-        catalog: BlobDigest,
-        prepared: Box<Prepared>,
-        selected: &BTreeSet<RfcNumber>,
-    ) -> Result<()> {
+        prepared: Prepared,
+    ) -> Result<SealedTxt> {
         self.upstream
             .metrics()
             .queue_wait(prepared.queued_at.elapsed());
@@ -767,7 +825,7 @@ impl Run<'_> {
             txt_evidence,
             parsed,
             ..
-        } = *prepared;
+        } = prepared;
         self.report.accept(
             bytes.len(),
             self.upstream.config().ingestion.max_accepted_bytes,
@@ -779,13 +837,12 @@ impl Run<'_> {
             return Err(format!("RFC {} rsync and HTTPS TXT disagree", id.get()).into());
         }
         let parsed = parsed.ok_or("missing TXT parser output")?;
-        let mut indexed = parsed.txt.data.into_view(&bytes, &parsed.txt.headings)?;
+        let mut indexed = parsed.data.into_view(&bytes, &parsed.headings)?;
         let durable = self.install_durable(source, bytes.clone()).await?;
         {
             let _database = self.upstream.metrics().span(Stage::Database);
             self.writer.register_blob(durable).await?;
         }
-        let optional = self.rfcxml(id, parsed.xml).await?;
         let (policy, notices) =
             if let Some(notices) = self.registry.pagination_notices(id, digest, &bytes)? {
                 indexed.notice_state = Coverage::Complete;
@@ -828,12 +885,6 @@ impl Run<'_> {
             }
             TxtEvidence::Mismatch(_) => unreachable!("mismatches are quarantined before commit"),
         };
-        let xml_observation = match &optional.capture {
-            Some((capture, digest)) => {
-                Some(observe(&candidate, Source::Xml(id), capture, *digest).await?)
-            }
-            None => None,
-        };
         self.report.invalid_utf8 += usize::from(indexed.invalid_utf8);
         self.report.contains_nul += usize::from(indexed.contains_nul);
         self.report.incomplete_sections += usize::from(indexed.section_state != Coverage::Complete);
@@ -866,13 +917,43 @@ impl Run<'_> {
                 }),
             )
             .await?;
+        candidate.commit().await?;
+        Ok(SealedTxt {
+            version,
+            observation: txt,
+            reused,
+            rsync_only,
+            references: indexed.references,
+            all: indexed.all_references,
+            classified: indexed.classified_references,
+        })
+    }
+
+    async fn store_membership(
+        &mut self,
+        id: RfcNumber,
+        entry: &xml::Entry,
+        catalog: BlobDigest,
+        txt: SealedTxt,
+        xml: PreparedXml,
+        selected: &[RfcNumber],
+    ) -> Result<()> {
+        let optional = self.rfcxml(id, xml).await?;
+        let _database = self.upstream.metrics().span(Stage::Database);
+        let candidate = self.writer.batch(self.id).await?;
+        let xml_observation = match &optional.capture {
+            Some((capture, digest)) => {
+                Some(observe(&candidate, Source::Xml(id), capture, *digest).await?)
+            }
+            None => None,
+        };
         candidate
             .member_with_sources(
                 &Membership {
                     rfc: id,
-                    version,
+                    version: txt.version,
                     catalog,
-                    txt,
+                    txt: txt.observation,
                     title: &entry.title,
                     stream: entry.stream.as_deref(),
                     publication_date: entry.date.as_deref(),
@@ -883,8 +964,8 @@ impl Run<'_> {
                 true,
             )
             .await?;
-        let mut all = indexed.all_references;
-        let mut classified = indexed.classified_references;
+        let mut all = txt.all;
+        let mut classified = txt.classified;
         let mut use_txt = true;
         if let Some(xml) = optional.references {
             all = xml.all;
@@ -892,7 +973,7 @@ impl Run<'_> {
             use_txt = all != Coverage::Complete;
             for edge in xml.edges {
                 self.report.reference_targets_without_txt +=
-                    usize::from(!selected.contains(&edge.target));
+                    usize::from(selected.binary_search(&edge.target).is_err());
                 store_edge(
                     &candidate,
                     id,
@@ -913,9 +994,9 @@ impl Run<'_> {
             classified = cap_coverage(classified);
         }
         if use_txt {
-            for edge in indexed.references {
+            for edge in txt.references {
                 self.report.reference_targets_without_txt +=
-                    usize::from(!selected.contains(&edge.target));
+                    usize::from(selected.binary_search(&edge.target).is_err());
                 store_edge(
                     &candidate,
                     id,
@@ -923,7 +1004,7 @@ impl Run<'_> {
                     edge.target,
                     Evidence {
                         observation: None,
-                        version: Some(version),
+                        version: Some(txt.version),
                         range: Some(edge.range),
                         method: "txt",
                         xml_locator: None,
@@ -939,9 +1020,9 @@ impl Run<'_> {
         self.report.partial_references += usize::from(all != Coverage::Complete);
         self.report.unclassified_or_incomplete += usize::from(classified != Coverage::Complete);
         candidate.commit().await?;
-        self.report.reused_txt += usize::from(reused);
-        self.report.verified_txt += usize::from(!rsync_only);
-        self.report.rsync_only_txt += usize::from(rsync_only);
+        self.report.reused_txt += usize::from(txt.reused);
+        self.report.verified_txt += usize::from(!txt.rsync_only);
+        self.report.rsync_only_txt += usize::from(txt.rsync_only);
         Ok(())
     }
 

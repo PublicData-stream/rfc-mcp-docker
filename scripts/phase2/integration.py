@@ -541,35 +541,75 @@ def wait_for_fixture(collector, check, description):
 
 
 def exercise_xml_overlap(project, *, options, settings):
-    settings = (*settings, "RFC_PHASE2_TRACE_TXT_PARSE=1")
     with xml_collector(project, "xml-overlap", options=options, settings=settings) as run:
         collector, _, stdout, stderr = run
+        def xml_starts(logs):
+            return set(re.findall(r"fixture request xml-overlap /rfc/rfc(\d+)\.xml", logs))
+
         def rsync_and_window():
             logs = fixture_logs(project)
-            requests = re.findall(r"fixture request xml-overlap /rfc/rfc(\d+)\.xml", logs)
-            return "fixture rsync held for XML" in logs and set(requests) == {"100", "101", "102"}
+            return "fixture rsync held for XML" in logs and xml_starts(logs) == {"100", "101", "102"}
+
+        def made_progress():
+            state = project.sql("""
+                SELECT g.state,
+                    EXISTS (SELECT FROM rfc.document_versions WHERE rfc_id=100 AND sealed),
+                    EXISTS (SELECT FROM rfc.generation_documents WHERE generation_id=g.id AND rfc_id=100),
+                    EXISTS (SELECT FROM rfc.generation_documents WHERE generation_id=g.id AND rfc_id=101)
+                FROM rfc.generations g ORDER BY g.id DESC LIMIT 1
+            """)
+            return state == "building|t|f|t" and "2119" in xml_starts(fixture_logs(project))
+
         wait_for_fixture(collector, rsync_and_window, "XML window did not fill while bulk rsync was held")
         (project.source / "release-rsync").touch()
-        wait_for_fixture(collector, lambda: "fixture TXT parsed before XML for RFC 100" in stderr.read_text(),
-                         "TXT parsing did not finish while RFCXML was held")
-        assert rsync_and_window(), "XML exceeded the document window before the first commit"
+        wait_for_fixture(collector, made_progress, "TXT sealing and slot refill stalled behind RFC 100 XML")
         (project.source / "release-xml").touch()
         assert collector.wait(timeout=30) == 0, stderr.read_text()
         report = json.loads(stdout.read_text().strip().splitlines()[-1])
     assert report["state"] == "ready" and report["metrics"]["xml_window_peak"] == 3, report
     assert_pipeline_bounds(report, http_limit=2)
-    print("RFCXML starts during bulk rsync and TXT parses during an XML response wait", flush=True)
+    assert report["metrics"]["out_of_order"] > 0, report
+    print("TXT sealed, later membership committed, and the slot refilled while RFC 100 XML was held", flush=True)
     return report
 
 
+def unused_sealed_versions(project, rfc):
+    return project.sql(
+        "SELECT count(*) FROM rfc.document_versions JOIN rfc.unused_document_versions USING (identity)"
+        f" WHERE sealed AND rfc_id={rfc}"
+    )
+
+
 def exercise_xml_cancellation(project, *, options, settings, active):
+    rsync = project.source / "rsync/rfc100.txt"
+    https = project.source / "https/rfc100.txt"
+    original = rsync.read_bytes()
+    changed = original + b"\nEarly seal cancellation fixture.\n"
+    try:
+        rsync.write_bytes(changed)
+        https.write_bytes(changed)
+        with xml_collector(project, "xml-stop-response", options=options, settings=settings) as run:
+            collector, name, stdout, stderr = run
+            wait_for_fixture(collector, lambda: unused_sealed_versions(project, 100) == "1",
+                             "changed TXT did not seal while RFC 100 XML was held")
+            phase1.run([*project.docker, "kill", "--signal", "TERM", name], stdout=subprocess.DEVNULL)
+            assert collector.wait(timeout=10) == 1, stderr.read_text()
+            report = json.loads(stdout.read_text().strip().splitlines()[-1])
+            assert report["error"] == "reconciliation cancelled" and report["metrics"]["retries"] == 0, report
+            assert project.sql(f"SELECT state FROM rfc.generations WHERE id={int(report['generation_id'])}") == "failed"
+    finally:
+        rsync.write_bytes(original)
+        https.write_bytes(original)
+    phase1.capture(project.app("sync", args=("--phase3-recover",)), env=project.env)
+    assert unused_sealed_versions(project, 100) == "0"
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
+
     for scenario, retries_exhausted in (
-        ("xml-stop-response", 0), ("xml-stop-retry", 0), ("xml-stop-cooldown", 1),
+        ("xml-stop-retry", 0), ("xml-stop-cooldown", 1),
     ):
         with xml_collector(project, scenario, options=options, settings=settings) as run:
             collector, name, stdout, stderr = run
-            marker = "request" if scenario == "xml-stop-response" else "cooldown"
-            wait_for_fixture(collector, lambda: f"fixture {marker} {scenario} /rfc/rfc100.xml" in fixture_logs(project),
+            wait_for_fixture(collector, lambda: f"fixture cooldown {scenario} /rfc/rfc100.xml" in fixture_logs(project),
                              f"RFC 100 did not reach {scenario}")
             if retries_exhausted:
                 wait_for_fixture(collector, lambda: project.sql(
@@ -632,22 +672,32 @@ printf 'cancelled and reaped\n'
 
 
 def exercise_transaction_failure(project):
+    rsync = project.source / "rsync/rfc101.txt"
+    https = project.source / "https/rfc101.txt"
+    original = rsync.read_bytes()
     project.sql("""CREATE FUNCTION rfc.fixture_fail_member() RETURNS trigger LANGUAGE plpgsql
         AS $$ BEGIN RAISE EXCEPTION 'fixture member transaction failure'; END $$;
         REVOKE EXECUTE ON FUNCTION rfc.fixture_fail_member() FROM PUBLIC;
         CREATE TRIGGER fixture_fail_member BEFORE INSERT ON rfc.generation_documents
         FOR EACH ROW WHEN (NEW.rfc_id = 101) EXECUTE FUNCTION rfc.fixture_fail_member()""")
     try:
+        changed = original + b"\nMembership failure fixture.\n"
+        rsync.write_bytes(changed)
+        https.write_bytes(changed)
         failure = project.reconcile(expected="db error")
         generation = int(failure["generation_id"])
-        assert project.sql(f"SELECT string_agg(rfc_id::text,',' ORDER BY rfc_id)"
-                           f" FROM rfc.generation_documents WHERE generation_id={generation}") == "100"
+        assert project.sql(f"SELECT count(*) FROM rfc.generation_documents"
+                           f" WHERE generation_id={generation} AND rfc_id=101") == "0"
+        assert unused_sealed_versions(project, 101) == "1"
     finally:
+        rsync.write_bytes(original)
+        https.write_bytes(original)
         project.sql("""DROP TRIGGER fixture_fail_member ON rfc.generation_documents;
                        DROP FUNCTION rfc.fixture_fail_member()""")
     retry = project.reconcile()
     assert retry["verified_txt"] == retry["reused_txt"] == 6
     project.verify_manifest(retry)
+    assert unused_sealed_versions(project, 101) == "0"
     assert project.sql("SELECT count(*) FROM rfc.generations WHERE state='building'") == "0"
     assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
     assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "0"
@@ -668,11 +718,17 @@ def exercise_resources(project):
     (source / "catalog.xml").write_text(
         '<rfc-index xmlns="https://www.rfc-editor.org/rfc-index">' + "".join(entries) + "</rfc-index>"
     )
+    xml_prefix = b'<rfc number="100"><middle/>'
+    xml_suffix = b"</rfc>"
+    (source / "https/rfc100.xml").write_bytes(
+        xml_prefix + b" " * (8 * 1024**2 - len(xml_prefix) - len(xml_suffix)) + xml_suffix
+    )
     project.start()
     project.migrate()
     project.run("up", "-d", "--wait", "fixtures", timeout=35)
     result = project.reconcile(settings=("RFC_SYNC_HTTP_CONCURRENCY=2", "RFC_SYNC_PARSE_CONCURRENCY=2"))
     assert result["verified_txt"] == result["contains_nul"] == 33
+    assert result["rfcxml"]["captured"] == 2, result
     assert result["metrics"]["rsync"]["calls"] == 2
     assert_pipeline_bounds(result, http_limit=2)
     metrics = result["metrics"]
@@ -742,6 +798,7 @@ def prepare_benchmark(project, size):
         entries.append(catalog_entry(rfc, f"Benchmark {rfc}"))
     catalog.write_text(catalog.read_text().replace("</rfc-index>", "".join(entries) + "</rfc-index>"))
     (project.source / "mode").write_text("benchmark")
+    return sources
 
 
 @contextmanager
@@ -871,6 +928,10 @@ def exercise_bootstrap(project):
         assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
         assert project.sql(f"SELECT state FROM rfc.generations WHERE id={stale}") == "ready"
         exercise_xml_cancellation(project, options=options, settings=settings, active=active)
+        project.reconcile(expected="fixture RFCXML parser panic", options=options,
+                          settings=(*settings, "RFC_PHASE2_PANIC_XML=9110"))
+        assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
+        assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "1"
 
         rsync = project.source / "rsync/rfc100.txt"
         https = project.source / "https/rfc100.txt"
@@ -974,7 +1035,7 @@ def benchmark(args, docker, work, driver):
             with ExitStack() as cleanup:
                 project = Project(work / f"{work.name}-{size}-{repeat}", driver, args.image_prefix, docker, False)
                 cleanup.callback(project.close)
-                prepare_benchmark(project, size)
+                sources = prepare_benchmark(project, size)
                 project.start()
                 project.migrate()
                 project.run("up", "-d", "--wait", "fixtures", timeout=35)
@@ -982,6 +1043,12 @@ def benchmark(args, docker, work, driver):
                 assert report["verified_txt"] == size and report["reused_txt"] == 0
                 assert report["metrics"]["https_requests"] == 2 * size + 2
                 project.verify_manifest(report)
+                if size == len(sources):
+                    verify_ranges(project, report, sources)
+                    report["manifest_hex"] = project.sql(
+                        "SELECT encode(manifest_bytes, 'hex') FROM rfc.generations"
+                        f" WHERE id={int(report['generation_id'])}"
+                    )
                 runs.append({"size": size, "repeat": repeat, **report})
     receipt = {"image_prefix": args.image_prefix, "paced": not args.unpaced,
                "configured_https_concurrency": args.http_concurrency, "runs": runs,
@@ -994,6 +1061,8 @@ def benchmark(args, docker, work, driver):
             original = expected[item["size"], item["repeat"]]
             for key in ("manifest_digest", "catalog_digest", "verified_txt", "accepted_bytes"):
                 assert item[key] == original[key], (key, item, original)
+            if "manifest_hex" in original:
+                assert item["manifest_hex"] == original["manifest_hex"]
             assert item["metrics"]["https_requests"] == original["metrics"]["https_requests"]
     if args.receipt:
         args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")

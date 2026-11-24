@@ -507,6 +507,11 @@ impl Candidate<'_> {
 
     /// Freezes the candidate with the deterministic serialization of its inputs.
     pub async fn ready(self) -> Result<(GenerationId, BlobDigest)> {
+        let digest = self.prepare_readiness().await?;
+        self.commit_readiness(digest).await
+    }
+
+    async fn prepare_readiness(&self) -> Result<BlobDigest> {
         rfc_storage::fixture_boundary("before_readiness");
         let generation = self.generation();
         self.tx.query_one("SELECT id FROM rfc.generations WHERE id = $1 AND state = 'building' FOR NO KEY UPDATE",
@@ -518,6 +523,10 @@ impl Candidate<'_> {
             "UPDATE rfc.generations SET state = 'ready', manifest_format = $2, manifest_bytes = $3, manifest_digest = $4::bytea WHERE id = $1",
             &[&generation, &format, &bytes, &digest.as_bytes().as_slice()],
         ).await?;
+        Ok(digest)
+    }
+
+    async fn commit_readiness(self, digest: BlobDigest) -> Result<(GenerationId, BlobDigest)> {
         self.tx.commit().await?;
         rfc_storage::fixture_boundary("after_readiness");
         Ok((self.id, digest))

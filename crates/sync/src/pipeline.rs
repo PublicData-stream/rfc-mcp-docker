@@ -1,4 +1,4 @@
-//! Bounded producer tasks supervised by the ordered ingestion coordinator.
+//! Bounded producer tasks supervised by the ingestion coordinator.
 
 use crate::{
     bulk,
@@ -9,14 +9,14 @@ use crate::{
     upstream::{Capture, Download, MissingXml, RsyncBatch, Source, Upstream, XmlFailure},
     xml::{self, XmlReferences},
 };
-use rfc_core::{BlobDigest, RfcNumber};
+use rfc_core::{BlobDigest, GenerationId, RfcNumber};
 use rfc_storage::{
     blob::{BlobReader, BlobWriter},
     postgres::Result,
 };
 use std::{collections::VecDeque, io::Read, sync::Arc, time::Instant};
 use tokio::{
-    sync::{Semaphore, oneshot, watch},
+    sync::{Semaphore, mpsc, oneshot, watch},
     task::{self, JoinSet},
 };
 
@@ -43,6 +43,19 @@ impl Shutdown {
     pub(crate) async fn cancelled(&self) {
         let _ = self.0.subscribe().wait_for(|cancelled| *cancelled).await;
     }
+
+    pub(crate) async fn until<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        work: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::select! {
+            biased;
+            _ = self.cancelled() => Err("reconciliation cancelled".into()),
+            _ = tokio::time::sleep_until(deadline) => Err("reconciliation deadline exceeded".into()),
+            result = work => result,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -57,12 +70,19 @@ pub(crate) struct Prepared {
     pub digest: BlobDigest,
     pub txt_evidence: TxtEvidence,
     pub queued_at: Instant,
-    pub parsed: Option<Parsed>,
+    pub parsed: Option<OwnedText>,
 }
 
-pub(crate) struct Parsed {
-    pub txt: OwnedText,
-    pub xml: PreparedXml,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub generation: GenerationId,
+    pub catalog: BlobDigest,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkId {
+    pub selection: Selection,
+    pub rfc: RfcNumber,
 }
 
 pub(crate) enum PreparedXml {
@@ -81,8 +101,9 @@ pub(crate) enum TxtEvidence {
 
 pub(crate) enum Event {
     Staged(Result<StagedTxt>),
-    XmlFetched,
-    Document(RfcNumber, Result<Box<Prepared>>),
+    Txt(WorkId, Box<Prepared>),
+    Xml(WorkId, PreparedXml),
+    Failed(WorkId, Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub(crate) enum StagedTxt {
@@ -121,13 +142,14 @@ impl StagedTxt {
 }
 
 pub(crate) struct Pipeline {
-    tasks: JoinSet<Event>,
-    xml_tasks: JoinSet<()>,
+    tasks: JoinSet<Option<Event>>,
+    results: mpsc::Receiver<Event>,
+    send_result: mpsc::Sender<Event>,
     upstream: Upstream,
     shutdown: Shutdown,
     parser: Parser,
     xml_enqueued: usize,
-    xml_waiting: VecDeque<(RfcNumber, oneshot::Receiver<XmlFetch>)>,
+    xml_waiting: VecDeque<(WorkId, oneshot::Receiver<XmlFetch>)>,
 }
 
 type XmlFetch = std::result::Result<Download, XmlFailure>;
@@ -170,9 +192,12 @@ impl Parser {
 impl Pipeline {
     pub(crate) fn new(upstream: Upstream) -> Result<Self> {
         let shutdown = Shutdown::new();
+        let (send_result, results) =
+            mpsc::channel(2 * upstream.config().ingestion.pipeline.max_pending_documents);
         Ok(Self {
             tasks: JoinSet::new(),
-            xml_tasks: JoinSet::new(),
+            results,
+            send_result,
             parser: Parser {
                 slots: Arc::new(Semaphore::new(
                     upstream.config().ingestion.pipeline.parser_workers,
@@ -188,26 +213,33 @@ impl Pipeline {
         })
     }
 
-    pub(crate) fn prefetch_xml(&mut self, ids: impl Iterator<Item = RfcNumber>, committed: usize) {
-        let limit = committed
-            + self
-                .upstream
-                .config()
-                .ingestion
-                .pipeline
-                .max_pending_documents;
-        for id in ids.skip(self.xml_enqueued).take(limit - self.xml_enqueued) {
+    pub(crate) fn prefetch_xml(
+        &mut self,
+        selection: Selection,
+        ordered: &[RfcNumber],
+        committed: usize,
+    ) {
+        let capacity = self
+            .upstream
+            .config()
+            .ingestion
+            .pipeline
+            .max_pending_documents;
+        let limit = (committed + capacity).min(ordered.len());
+        for &rfc in &ordered[self.xml_enqueued..limit] {
+            let id = WorkId { selection, rfc };
             let (send, receive) = oneshot::channel();
             self.xml_waiting.push_back((id, receive));
             self.xml_enqueued += 1;
             let upstream = self.upstream.clone();
             let shutdown = self.shutdown.clone();
-            self.xml_tasks.spawn(async move {
+            self.tasks.spawn(async move {
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {}
-                    result = upstream.fetch_xml(id) => { let _ = send.send(result); }
+                    result = upstream.fetch_xml(id.rfc) => { let _ = send.send(result); }
                 }
+                None
             });
         }
         let reserved = self.xml_enqueued - committed;
@@ -228,13 +260,13 @@ impl Pipeline {
                         .map(StagedTxt::Bulk)
                 }
             };
-            Event::Staged(result)
+            Some(Event::Staged(result))
         });
     }
 
     pub(crate) fn prepare(
         &mut self,
-        id: RfcNumber,
+        id: WorkId,
         body: StagedBody,
         prior: Option<PriorTxt>,
         rsync_bootstrap: bool,
@@ -249,80 +281,106 @@ impl Pipeline {
         let upstream = self.upstream.clone();
         let shutdown = self.shutdown.clone();
         let parser = self.parser.clone();
+        let send = self.send_result.clone();
         upstream.metrics().admitted(admitted);
         self.tasks.spawn(async move {
             let result = async {
                 let mut prepared = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => Err("document verification cancelled".into()),
-                    result = prepare_document(&upstream, id, body, prior, rsync_bootstrap, &reader) => result,
+                    result = verify_txt(&upstream, id.rfc, body, prior, rsync_bootstrap, &reader) => result,
                 }?;
-                if !matches!(prepared.txt_evidence, TxtEvidence::Mismatch(_)) {
-                    let bytes = prepared.bytes.clone();
-                    let txt = parser.parse(move |budget| OwnedText::parse(&bytes, budget)).await?;
-                    let retained = txt.data.retained_bytes;
-                    #[cfg(feature = "phase2-fixtures")]
-                    if upstream.is_fixture()
-                        && xml_fetch.is_empty()
-                        && std::env::var("RFC_PHASE2_TRACE_TXT_PARSE").as_deref() == Ok("1")
-                    {
-                        eprintln!("fixture TXT parsed before XML for RFC {}", id.get());
-                    }
-                    let fetched = tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => return Err("RFCXML join cancelled".into()),
-                        result = xml_fetch => result?,
-                    };
-                    let xml = match fetched {
-                        Ok(Download::Captured(capture)) => parser.parse(move |budget| {
-                            let budget = Budget {
-                                bytes: budget.bytes.checked_sub(retained).ok_or(BudgetExceeded)?,
-                                shutdown: budget.shutdown,
-                            };
-                            let result = xml::references(&capture.bytes, id, &budget);
-                            budget.shutdown.check()?;
-                            match result {
-                                Ok(references) => Ok(PreparedXml::Captured(capture, references)),
-                                Err(error) if error.is::<BudgetExceeded>() => Err(error),
-                                Err(error) => Ok(PreparedXml::Malformed(capture, error)),
-                            }
-                        }).await?,
-                        Ok(Download::Missing(status)) => PreparedXml::Missing(status),
-                        Err(failure) => PreparedXml::Failed(failure),
-                    };
-                    prepared.parsed = Some(Parsed { txt, xml });
-                    prepared.queued_at = Instant::now();
+                if matches!(prepared.txt_evidence, TxtEvidence::Mismatch(_)) {
+                    send.send(Event::Txt(id, Box::new(prepared))).await?;
+                    return Ok(());
                 }
-                Ok(prepared)
+                let bytes = prepared.bytes.clone();
+                let txt = parser.parse(move |budget| OwnedText::parse(&bytes, budget)).await?;
+                let retained = txt.data.retained_bytes;
+                prepared.parsed = Some(txt);
+                prepared.queued_at = Instant::now();
+                send.send(Event::Txt(id, Box::new(prepared))).await?;
+
+                // Delivery of TXT precedes XML for this key. The CPU slot and
+                // the TXT payload have both been handed back before the wait.
+                let fetched = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Err("RFCXML join cancelled".into()),
+                    result = xml_fetch => result?,
+                };
+                let xml = match fetched {
+                    Ok(Download::Captured(capture)) => parser.parse(move |budget| {
+                        let budget = Budget {
+                            bytes: budget.bytes.checked_sub(retained).ok_or(BudgetExceeded)?,
+                            shutdown: budget.shutdown,
+                        };
+                        #[cfg(feature = "phase2-fixtures")]
+                        if upstream.is_fixture()
+                            && std::env::var("RFC_PHASE2_PANIC_XML")
+                                .ok()
+                                .and_then(|value| value.parse().ok()) == Some(id.rfc.get())
+                        {
+                            panic!("fixture RFCXML parser panic");
+                        }
+                        let result = xml::references(&capture.bytes, id.rfc, &budget);
+                        budget.shutdown.check()?;
+                        match result {
+                            Ok(references) => Ok(PreparedXml::Captured(capture, references)),
+                            Err(error) if error.is::<BudgetExceeded>() => Err(error),
+                            Err(error) => Ok(PreparedXml::Malformed(capture, error)),
+                        }
+                    }).await?,
+                    Ok(Download::Missing(status)) => PreparedXml::Missing(status),
+                    Err(failure) => PreparedXml::Failed(failure),
+                };
+                send.send(Event::Xml(id, xml)).await?;
+                Ok(())
             }
             .await;
-            Event::Document(id, result.map(Box::new))
+            result.err().map(|error| Event::Failed(id, error))
         });
         Ok(())
     }
 
     pub(crate) async fn next(&mut self) -> Result<Event> {
-        tokio::select! {
-            biased;
-            Some(result) = self.xml_tasks.join_next() => {
-                result?;
-                Ok(Event::XmlFetched)
+        loop {
+            if self.tasks.is_empty() && self.results.is_empty() {
+                return Err("ingestion pipeline stalled".into());
             }
-            result = self.tasks.join_next(), if !self.tasks.is_empty() => Ok(
-                result.ok_or("ingestion pipeline stalled")??
-            ),
-            else => Err("ingestion pipeline stalled".into()),
+            tokio::select! {
+                biased;
+                Some(result) = self.tasks.join_next() => {
+                    if let Some(event) = result? {
+                        return Ok(event);
+                    }
+                }
+                Some(event) = self.results.recv() => return Ok(event),
+            }
         }
+    }
+
+    pub(crate) async fn finish(&mut self) -> Result<()> {
+        while let Some(result) = self.tasks.join_next().await {
+            if result?.is_some() {
+                return Err("unexpected task result after ingestion".into());
+            }
+        }
+        if !self.results.is_empty() || !self.xml_waiting.is_empty() {
+            return Err("unexpected document result after ingestion".into());
+        }
+        Ok(())
     }
 
     pub(crate) async fn drain(&mut self) {
         self.shutdown.stop();
+        self.results.close();
+        self.xml_waiting.clear();
         while self.tasks.join_next().await.is_some() {}
-        while self.xml_tasks.join_next().await.is_some() {}
+        while self.results.try_recv().is_ok() {}
     }
 }
 
-async fn prepare_document(
+async fn verify_txt(
     upstream: &Upstream,
     id: RfcNumber,
     body: StagedBody,

@@ -519,3 +519,20 @@ Sync schedules RFCXML as soon as the starting catalog selects RFC IDs. The bound
 - A fixed-clock, unpaced six-RFC comparison against the Phase 2 images reproduced the manifest `ca0734a5fe6b5a3c700344a0695dd3756e8935a64357f8f48e2a31a393f6fb5e`, 32,113 accepted bytes, and 14 HTTPS starts. The one run per version took 9.323 s before the change and 10.101 s after it. This comparison verifies manifest equivalence at fixture scale. Logs and receipts are under `/tmp/rfc-dual-phase3` on the qualification host.
 
 Verification used private fixtures. At the official one-second start interval, 9,861 RFCXML requests plus two catalog requests require at least 2 h 44 min 22 s between the first and last dispatch. A full official bootstrap through publication and readiness remains unmeasured. [Cold-start measurement contract](decisions/0009-cold-rfc-bootstrap.md#900-second-gate)
+
+## Dual-queue bootstrap implementation Phase 4
+
+Sync seals each accepted TXT index while its RFCXML request can still be pending. The join matches the generation, starting catalog digest and RFC number. A later RFC can commit membership, evidence and coverage and free its slot while an earlier XML request is held. Both commits use the single corpus writer, and the existing manifest serialization determines output order. [Pipeline and recovery](ingestion.md#pipeline-and-recovery)
+
+### Verification on 2026-11-24
+
+- `cargo fetch --locked`, `scripts/phase0/check-rust.sh`, and all-feature Clippy and tests passed with Rust 1.100.0 and Cargo target directory `/tmp/rust/target`.
+- The offline Phase 0 Compose probes passed on rootful and rootless Docker Engine 29.10.0, Compose 5.8.0, and Linux amd64.
+- The rootless Phase 2 standard suite verified the XML outcome matrix, candidate-only reconciliation, original bytes and evidence ranges, and recovery after an injected membership transaction error. The 33-RFC resource fixture processed 4 MiB TXT bodies and an 8 MiB RFCXML response. It used three slots and two parser workers, with 48 MiB reserved for payloads, 32.0 MiB peak Sync RSS, and 152.6 MiB peak cgroup memory. The one-slot profile reserved 16 MiB for payloads. The default paced fixture recorded a minimum HTTPS start spacing of 1,000,909 µs.
+- While the private fixture held RFC 100's XML response, PostgreSQL showed its sealed TXT index, RFC 101's committed membership, and the candidate still building. The HTTP fixture also recorded the newly admitted RFC 2119 request before RFC 100 was released.
+- The rootless Phase 2 strict bulk and bulk bootstrap suites passed. Bulk bootstrap preserved the active generation and outbox across a parser panic, catalog drift and SIGTERM after early TXT sealing. Recovery pruned the unreferenced sealed index. The rootful Phase 3 suite passed publication, interrupted reconciliation, reader fencing and restore.
+- The rootful Phase 6 standard and bulk bootstrap suites passed. The bulk daemon published its first fixture generation, delivered the authenticated outbox event, returned a successful `/ready`, and served original bytes over MCP revision `2026-07-28`.
+- The rootful Phase 7 probes verified the hardened Compose deployment, worker saturation and reaping, and fail-closed behavior with simulated missing Landlock.
+- The six-RFC fixed-clock comparison with `3d03dc7` matched all 3,847 manifest bytes, 32,113 accepted bytes, and 14 HTTPS starts. Both runs independently checked original bytes and evidence ranges. Collector wall time was 8.780 s on Phase 3 and 13.143 s on Phase 4 in single, unpaced trials during local qualification. Cumulative CAS installation time was 0.894 s and 6.493 s respectively. These timings characterize the local fixture runs.
+
+Logs and fixture receipts are under `/tmp/rfc-dual-phase4` on the qualification host.
