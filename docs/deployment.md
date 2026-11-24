@@ -24,7 +24,7 @@ Set `RFC_NOTIFY_DYNAMIC_RANGE` and `RFC_CONTROL_DYNAMIC_RANGE` to ranges within 
 
 ### Bulk rsync staging
 
-To enable `ingestion.rsync.mode = "persistent_bulk"`, provision a dedicated ext4 filesystem with at most 5 GiB and 24,576 inodes. Leave room for one replacement file and the small sample tree. Set the mounted filesystem root to mode `0700` and map its owner to Sync's container UID 10002. Mount with `nosuid,nodev,noexec`. Use distinct filesystems for staging, the canonical mirror, and PostgreSQL. The staging tree is private to Sync and can be regenerated from upstream.
+To enable `ingestion.rsync.mode = "persistent_bulk"`, provision a dedicated ext4 filesystem with at most 5 GiB and 24,576 inodes. Set an explicit inode count when formatting and use `--check-config` to check the resulting capacity. Leave room for one replacement file and the small sample tree. Set the mounted filesystem root to mode `0700` and map its owner to Sync's container UID 10002. Mount with `nosuid,nodev,noexec`. Use distinct filesystems for staging, the canonical mirror, and PostgreSQL. The staging tree is private to Sync and can be regenerated from upstream.
 
 Set `RFC_SYNC_RSYNC_STAGE_DIR` to the filesystem's host mountpoint. Use the overlay for Sync startup and manual reconciliation. Run the preflight after the host mount is active.
 
@@ -36,6 +36,8 @@ docker compose -f compose.yml -f deploy/compose.bulk-rsync.yml --env-file /path/
 ## Initialize or upgrade
 
 For a new cluster, run the roles script and set the two role passwords interactively to match their provisioned files. For upgrades, start with existing roles. Back up the database and mirror as described in the [publication runbook](publication.md) before changing schema or images.
+
+For schema 7, drain Serve and Sync, take a matched database and mirror backup, apply the migration, and restart both services with schema 7 binaries. Existing configurations continue using strict batched ingestion. To turn off rsync-only trust after opt-in, stop Sync and set `txt_provenance = "dual_source"` on schema 7. Set `mode = "batched"` and drop the overlay to stop using persistent staging. Returning to a schema 6 binary requires restoring the matched pre-upgrade backup.
 
 ```sh
 docker compose --env-file /path/to/rfc.env exec postgres psql -X -U postgres -d rfc -f /migrations/roles.sql

@@ -38,10 +38,18 @@ pub(crate) struct SyncConfig {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Ingestion {
+    pub(crate) txt_provenance: TxtProvenance,
     pub(crate) https: Https,
     pub(crate) rsync: Rsync,
     pub(crate) pipeline: Pipeline,
     pub(crate) max_accepted_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TxtProvenance {
+    DualSource,
+    RsyncBootstrap,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -87,6 +95,7 @@ impl Default for SyncConfig {
 impl Default for Ingestion {
     fn default() -> Self {
         Self {
+            txt_provenance: TxtProvenance::DualSource,
             https: Https::default(),
             rsync: Rsync::default(),
             pipeline: Pipeline::default(),
@@ -231,6 +240,7 @@ impl SyncConfig {
 
     fn validate(&self) -> Result<()> {
         let Ingestion {
+            txt_provenance,
             https,
             rsync,
             pipeline,
@@ -256,6 +266,11 @@ impl SyncConfig {
         }
         if !(30..=900).contains(&rsync.bulk_transfer_timeout_seconds) {
             return Err("bulk_transfer_timeout_seconds must be 30 through 900".into());
+        }
+        if txt_provenance == TxtProvenance::RsyncBootstrap
+            && rsync.mode != RsyncMode::PersistentBulk
+        {
+            return Err("rsync_bootstrap requires persistent_bulk rsync mode".into());
         }
         if !(1..=MAX_PENDING_DOCUMENTS).contains(&pipeline.max_pending_documents) {
             return Err("max_pending_documents must be 1 through 3".into());

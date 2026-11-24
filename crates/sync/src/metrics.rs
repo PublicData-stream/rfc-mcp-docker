@@ -129,15 +129,16 @@ impl Metrics {
         StageLease(self.clone())
     }
 
-    pub(crate) fn staged(&self, bytes: u64, scratch: Option<u64>) {
+    pub(crate) fn staged(
+        &self,
+        bytes: u64,
+        scratch: Option<u64>,
+        transferred: usize,
+        unchanged: usize,
+    ) {
         let mut record = self.0.lock().unwrap();
         record.rsync_peak_bytes = record.rsync_peak_bytes.max(bytes);
         record.scratch_peak_bytes = record.scratch_peak_bytes.max(scratch);
-    }
-
-    pub(crate) fn bulk_staged(&self, bytes: u64, transferred: usize, unchanged: usize) {
-        let mut record = self.0.lock().unwrap();
-        record.rsync_peak_bytes = record.rsync_peak_bytes.max(bytes);
         record.rsync_transferred_files += transferred;
         record.rsync_checksum_hits += unchanged;
         #[cfg(feature = "phase2-fixtures")]
@@ -145,13 +146,6 @@ impl Metrics {
             record.rsync_files += transferred + unchanged;
             record.rsync_payload_bytes += bytes;
         }
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn record_rsync_payload(&self, files: usize, bytes: u64) {
-        let mut record = self.0.lock().unwrap();
-        record.rsync_files += files;
-        record.rsync_payload_bytes += bytes;
     }
 
     pub(crate) fn out_of_order(&self) {

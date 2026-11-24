@@ -4,7 +4,9 @@ use crate::{
     ingest::Scope,
     metrics::{Stage, StageLease},
     pipeline::Shutdown,
-    upstream::{MAX_CATALOG_ENTRIES, ProcessGroup, TXT_LIMIT, Upstream, filename, read_staged},
+    upstream::{
+        MAX_CATALOG_ENTRIES, ProcessGroup, TXT_LIMIT, Upstream, filename, now_us, read_staged,
+    },
 };
 use rfc_core::RfcNumber;
 use rfc_storage::{blob::BlobWriter, postgres::Result};
@@ -106,21 +108,35 @@ fn create_private(path: &Path, device: u64) -> Result<File> {
     Ok(directory)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Proof {
+    pub(crate) observed_us: i64,
+    pub(crate) fetched_us: Option<i64>,
+}
+
 pub(crate) struct Snapshot {
     inventory: PathBuf,
     files: BTreeMap<String, Received>,
+    observed_us: i64,
     _lock: File,
     _lease: StageLease,
 }
 
 impl Snapshot {
-    pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<Vec<u8>> {
+    pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<(Vec<u8>, Proof)> {
         let name = filename(id);
         let file = self
             .files
             .get(&name)
             .ok_or("RFC is outside the rsync snapshot")?;
-        read_staged(store, &self.inventory, &name, Some(file.length))
+        let bytes = read_staged(store, &self.inventory, &name, Some(file.length))?;
+        Ok((
+            bytes,
+            Proof {
+                observed_us: self.observed_us,
+                fetched_us: file.transferred.then_some(self.observed_us),
+            },
+        ))
     }
 }
 
@@ -198,7 +214,14 @@ pub(crate) async fn stage(
         .kill_on_drop(true);
     unsafe {
         command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+                || libc::getppid() != parent
             {
                 return Err(io::Error::other("cannot supervise bulk rsync child"));
             }
@@ -247,6 +270,7 @@ pub(crate) async fn stage(
         return Err(format!("bulk rsync failed ({status})").into());
     }
     group.0 = None;
+    let observed_us = now_us()?;
     let files = parse_receipt(&receipt, &names, accepted_remaining)?;
     let mut count = 0;
     for entry in fs::read_dir(&inventory)? {
@@ -267,10 +291,11 @@ pub(crate) async fn stage(
     }
     let bytes = files.values().map(|file| file.length as u64).sum();
     let transferred = files.values().filter(|file| file.transferred).count();
-    metrics.bulk_staged(bytes, transferred, files.len() - transferred);
+    metrics.staged(bytes, None, transferred, files.len() - transferred);
     Ok(Snapshot {
         inventory,
         files,
+        observed_us,
         _lock: lock,
         _lease: lease,
     })

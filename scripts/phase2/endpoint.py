@@ -118,6 +118,8 @@ class Rsync(socketserver.BaseRequestHandler):
         scenario = mode()
         if scenario == "hold-rsync":
             time.sleep(15)
+        if scenario == "hold-rsync-timeout":
+            time.sleep(45)
         if scenario in ("benchmark", "cold-bootstrap"):
             time.sleep(0.20)
         with socket.create_connection(("127.0.0.1", 9873), 3) as upstream:

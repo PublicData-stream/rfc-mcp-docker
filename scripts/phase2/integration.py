@@ -158,10 +158,10 @@ COMMIT;
     assert project.sql("SELECT version FROM rfc.schema_migrations") == "1"
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7"
 
 
-def verify_ranges(project, report, sources):
+def verify_ranges(project, report, sources, txt_verification="verified"):
     generation = int(report["generation_id"])
     rows = project.sql(
         "SELECT json_build_array(g.rfc_id, encode(d.txt_digest, 'hex'), d.line_starts, d.encoding, d.notice_policy)"
@@ -217,7 +217,7 @@ def verify_ranges(project, report, sources):
                 f"SELECT count(*) FROM rfc.document_lexemes WHERE document_version={version}", phase1.SERVE,
             ) == "0"
         if rfc == NUL_RFC:
-            verify_nul_document(project, generation, version, digest, raw)
+            verify_nul_document(project, generation, version, digest, raw, txt_verification)
         if rfc == 100:
             assert b"boundarytoken" in recovered
             assert project.sql(
@@ -253,7 +253,7 @@ def verify_ranges(project, report, sources):
     ) == "partial"
 
 
-def verify_nul_document(project, generation, version, digest, raw):
+def verify_nul_document(project, generation, version, digest, raw, txt_verification):
     assert raw.decode("utf-8").count("\x00") == 1
     assert project.sql(
         "SELECT byte_length,sealed,indexing_state,section_state,notice_state"
@@ -269,7 +269,7 @@ def verify_nul_document(project, generation, version, digest, raw):
         " JOIN rfc.source_observations t ON t.identity=g.txt_observation"
         " JOIN rfc.source_observations x ON x.identity=g.rfcxml_observation"
         f" WHERE g.generation_id={generation} AND g.rfc_id={NUL_RFC}", phase1.SERVE,
-    ) == "NUL bytes with RFCXML|verified|t|rfcxml|verified"
+    ) == f"NUL bytes with RFCXML|{txt_verification}|t|rfcxml|verified"
     assert project.sql(
         "SELECT r.method FROM rfc.edge_evidence e JOIN rfc.relation_evidence r ON r.identity=e.evidence"
         f" WHERE e.generation_id={generation} AND e.source_rfc={NUL_RFC}"
@@ -440,7 +440,7 @@ max_pending_documents = 1
     print("Sync TOML defaults and tuned reconciliation bounds passed", flush=True)
 
 
-def exercise_cancellation(project):
+def exercise_cancellation(project, *, options=(), settings=(), active="|0"):
     mode = project.source / "mode"
     mode.write_text("hold-rsync")
     name = f"{project.name}-cancel"
@@ -453,10 +453,13 @@ status=$?
 if [ "$status" -gt 128 ]; then wait "$child"; status=$?; fi
 test "$status" -eq 1 || exit 2
 test -z "$(find /tmp -name 'rfc-rsync-*')" || exit 3
+temporary=/rfc-rsync-txt/full/temporary
+if [ -d "$temporary" ]; then test -z "$(ls -A "$temporary")" || exit 5; fi
 if pidof rsync >/dev/null; then exit 4; fi
 printf 'cancelled and reaped\n'
 """
-    command = project.reconcile_command(False, "full", options=("--name", name), prelude=script)
+    command = project.reconcile_command(False, "full", settings=settings,
+                                        options=("--name", name, *options), prelude=script)
     with subprocess.Popen(command, env=project.env, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True) as collector:
         try:
@@ -479,7 +482,7 @@ printf 'cancelled and reaped\n'
                            stderr=subprocess.DEVNULL, timeout=15)
             mode.write_text("normal")
     assert project.sql("SELECT state FROM rfc.generations ORDER BY id DESC LIMIT 1") == "failed"
-    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
 
 
 def exercise_transaction_failure(project):
@@ -565,9 +568,9 @@ def exercise_timeout(project):
 
 
 
-def fixture_driver(docker, prefix, target):
+def fixture_driver(docker, prefix, target, *, prebuilt=False):
     image = f"{prefix}-ingestion-fixture"
-    phase1.phase0.prepare_fixture_image(docker, REPO, "phase2-fixture", image)
+    phase1.phase0.prepare_fixture_image(docker, REPO, "phase2-fixture", image, skip_build=prebuilt)
     container = phase1.capture([*docker, "create", *phase1.phase0.local_image_args(), image,
                                 "/rfc-phase2-fixture"])
     try:
@@ -606,7 +609,7 @@ def capped_stage(project):
     run(["sudo", "-n", "mount", "-o", "loop,nosuid,nodev,noexec", str(image), str(mountpoint)])
     try:
         maps = phase1.capture([
-            *project.docker, "run", "--rm", "--network", "none",
+            *project.docker, "run", "--rm", *phase1.phase0.local_image_args(), "--network", "none",
             "--entrypoint", "/bin/sh", project.env["PHASE1_IMAGE_PREFIX"] + "-sync",
             "-c", "cat /proc/self/uid_map; echo :; cat /proc/self/gid_map",
         ])
@@ -624,9 +627,12 @@ def capped_stage(project):
         run(["sudo", "-n", "umount", str(mountpoint)])
 
 
-def bulk_options(project, mountpoint):
+def bulk_options(project, mountpoint, *, bootstrap=False, seconds=900):
     config = project.directory / "bulk.toml"
-    config.write_text("schema_version = 1\n[ingestion.rsync]\nmode = 'persistent_bulk'\n")
+    config.write_text("schema_version = 1\n"
+                      + ("[ingestion]\ntxt_provenance = 'rsync_bootstrap'\n" if bootstrap else "")
+                      + "[ingestion.rsync]\nmode = 'persistent_bulk'\n"
+                        f"bulk_transfer_timeout_seconds = {seconds}\n")
     return ("-v", f"{mountpoint}:/rfc-rsync-txt",
             "-v", f"{config}:/phase2/bulk.toml:ro")
 
@@ -671,6 +677,144 @@ def exercise_bulk(project):
         assert recovered["metrics"]["rsync_checksum_hits"] == size
         assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
         assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "0"
+
+
+def activate(project, generation, expected, *, rollback=False, error=None):
+    operation = "--phase3-rollback" if rollback else "--phase3-publish"
+    command = project.app("sync", "-T", args=(operation, str(generation), "--expect-sequence", str(expected)))
+    result = subprocess.run(command, env=project.env, text=True, capture_output=True, timeout=90)
+    if error:
+        assert result.returncode != 0 and error in result.stderr, result
+    else:
+        assert result.returncode == 0, result
+        assert json.loads(result.stdout)["publication_sequence"] == str(expected + 1)
+
+
+def exercise_bootstrap(project):
+    sources = prepare(project, include_nul=True)
+    count = len(sources)
+    with capped_stage(project) as mountpoint:
+        settings = ("RFC_SYNC_CONFIG_FILE=/phase2/bulk.toml",)
+        options = bulk_options(project, mountpoint, bootstrap=True)
+        check = project.app("sync", *options, "-e", settings[0], args=("--check-config",))
+        config = json.loads(phase1.capture(check, env=project.env))
+        assert config["resources"]["bulk_filesystem"]["inodes"] <= 512
+        project.start()
+        project.migrate()
+        project.run("up", "-d", "--wait", "fixtures", timeout=35)
+        first = project.reconcile(options=options, settings=settings)
+        assert first["verified_txt"] == 0 and first["rsync_only_txt"] == count
+        assert first["metrics"]["txt"]["calls"] == 0 and first["metrics"]["https_requests"] == count + 2
+        first_id = int(first["generation_id"])
+        verify_ranges(project, first, sources, "unverified")
+        project.verify_manifest(first)
+        def provenance(generation):
+            return project.sql(
+                "SELECT o.source_transport, o.https_verification, o.fetched_at IS NULL, "
+                "o.source_url = 'rsync://rsync.rfc-editor.org/rfcs-text-only/rfc' || d.rfc_id || '.txt' "
+                "FROM rfc.generation_documents d JOIN rfc.source_observations o ON o.identity = d.txt_observation "
+                f"WHERE d.generation_id = {generation} ORDER BY d.rfc_id"
+            ).splitlines()
+        assert provenance(first_id) == ["rsync|unverified|f|t"] * count
+        stale = int(project.reconcile(options=options, settings=settings)["generation_id"])
+        assert provenance(stale) == ["rsync|unverified|t|t"] * count
+        assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
+        activate(project, first_id, 0)
+        activate(project, stale, 1, error="rsync-only TXT observation outside active membership")
+        active = f"{first_id}|1"
+        assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
+        assert project.sql(f"SELECT state FROM rfc.generations WHERE id={stale}") == "ready"
+
+        rsync = project.source / "rsync/rfc100.txt"
+        https = project.source / "https/rfc100.txt"
+        original = rsync.read_bytes()
+        rsync.unlink()
+        project.reconcile(expected="bulk rsync failed", options=options, settings=settings)
+        rsync.write_bytes(b"x" * (4 * 1024**2 + 1))
+        project.reconcile(expected="bulk rsync", options=options, settings=settings)
+        rsync.write_bytes(original)
+        mode = project.source / "mode"
+        mode.write_text("catalog-drift")
+        project.reconcile(expected="catalog changed", options=options, settings=settings)
+        exercise_cancellation(project, options=options, settings=settings, active=active)
+        mode.write_text("hold-rsync-timeout")
+        options = bulk_options(project, mountpoint, bootstrap=True, seconds=30)
+        project.reconcile(expected="bulk rsync", options=options, settings=settings, timeout=50)
+        mode.write_text("normal")
+
+        changed = original + b"\nChanged after publication.\n"
+        rsync.write_bytes(changed)
+        project.reconcile(expected="rsync and HTTPS TXT disagree", options=options, settings=settings)
+        https.write_bytes(changed)
+        def shell(command):
+            return phase1.capture(project.app("sync", options[0], options[1], "--entrypoint", "/bin/sh",
+                                              args=("-ec", command)), env=project.env)
+        for fill in (
+            "for i in $(seq 1 600); do touch /rfc-rsync-txt/quota/$i 2>/dev/null || exit 0; done; exit 1",
+            "dd if=/dev/zero of=/rfc-rsync-txt/quota/full bs=1M 2>/dev/null && exit 1; "
+            "dd if=/dev/zero of=/rfc-rsync-txt/quota/tail bs=1K 2>/dev/null && exit 1; exit 0",
+        ):
+            shell("mkdir /rfc-rsync-txt/quota; " + fill)
+            # The prior mismatch populated the cache with changed bytes. Change
+            # the source again so rsync must allocate a replacement in the cap.
+            changed += b"\n"
+            rsync.write_bytes(changed)
+            https.write_bytes(changed)
+            try:
+                project.reconcile(expected="bulk rsync", options=options, settings=settings)
+            finally:
+                shell("rm -rf /rfc-rsync-txt/quota")
+        assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
+        assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "1"
+        repaired = project.reconcile(options=options, settings=settings)
+        assert repaired["metrics"]["txt"]["calls"] == 1 and repaired["reused_txt"] == count - 1
+        assert repaired["verified_txt"] == 1 and repaired["rsync_only_txt"] == count - 1
+        activate(project, repaired["generation_id"], 1)
+        activate(project, first_id, 2, rollback=True)
+        strict = project.reconcile(options=bulk_options(project, mountpoint), settings=settings)
+        assert strict["verified_txt"] == count and strict["rsync_only_txt"] == 0
+        sample = project.reconcile(scope="sample", options=bulk_options(project, mountpoint, bootstrap=True),
+                                   settings=settings)
+        assert sample["rsync_only_txt"] == 0 and sample["verified_txt"] == 3
+        assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == f"{first_id}|3"
+        print("Bulk bootstrap provenance, capped failures, promotion fencing and rollback passed", flush=True)
+
+
+def exercise_schema7_upgrade(project, old_prefix, old_driver):
+    sources = prepare(project, include_nul=True)
+    project.start()
+    migrations = (REPO / "migrations/migrate.sql").read_text()
+    boundary = "SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 7)"
+    old_sql, _ = migrations.split(boundary, 1)
+    run([*project.psql(), "-f", "/dev/stdin"], env=project.env,
+        input=old_sql.replace("\\ir ", "\\i /migrations/") + "COMMIT;\n")
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "6"
+    project.run("up", "-d", "--wait", "fixtures", timeout=35)
+    current = {key: project.env[key] for key in ("PHASE1_IMAGE_PREFIX", "PHASE2_DRIVER")}
+    project.env.update(PHASE1_IMAGE_PREFIX=old_prefix, PHASE2_DRIVER=str(old_driver))
+    try:
+        first = project.reconcile()
+        activate(project, first["generation_id"], 0)
+    finally:
+        project.env.update(current)
+    query = ("SELECT encode(identity, 'hex'), source_url, observed_at, fetched_at, https_verification "
+             "FROM rfc.source_observations ORDER BY identity")
+    before = project.sql(query)
+    project.migrate()
+    project.migrate()
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "7"
+    assert project.sql(query) == before
+    assert project.sql("SELECT count(*) FROM rfc.source_observations WHERE source_transport <> 'https'") == "0"
+    assert project.sql(
+        "SELECT encode(manifest_digest,'hex') FROM rfc.generations WHERE state = 'published'"
+    ) == first["manifest_digest"]
+    verify_ranges(project, first, sources)
+    next_candidate = project.reconcile()
+    assert next_candidate["reused_txt"] == first["verified_txt"]
+    assert next_candidate["metrics"]["txt"]["calls"] == 0
+    project.verify_manifest(next_candidate)
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == f"{first['generation_id']}|1"
+    print("Schema 6 published data, source identities and strict reuse survived schema 7 upgrade", flush=True)
 
 
 def benchmark(args, docker, work, driver):
@@ -718,6 +862,9 @@ def main():
     parser.add_argument("--image-prefix", default="rfc-phase2-regression")
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--bulk", action="store_true", help="exercise persistent rsync with a disposable ext4 mount")
+    parser.add_argument("--bulk-bootstrap", action="store_true", help="exercise bulk trust, promotion and capped faults")
+    parser.add_argument("--upgrade-from", metavar="SCHEMA6_IMAGE_PREFIX",
+                        help="upgrade a published fixture built by preloaded schema 6 images")
     parser.add_argument("--benchmark", type=int, choices=(6, 96), nargs="+")
     parser.add_argument("--repeats", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--http-concurrency", type=int, choices=(1, 2), default=1)
@@ -725,8 +872,8 @@ def main():
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--reference-receipt", type=Path)
     args = parser.parse_args()
-    if sum(map(bool, (args.live, args.bulk, args.benchmark))) > 1:
-        parser.error("select only one of --live, --bulk and --benchmark")
+    if sum(map(bool, (args.live, args.bulk, args.bulk_bootstrap, args.benchmark, args.upgrade_from))) > 1:
+        parser.error("select only one live, bulk, bulk-bootstrap, benchmark or upgrade profile")
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-phase2-", dir="/tmp") as root:
         work = Path(root)
@@ -765,11 +912,17 @@ def main():
                 print(json.dumps({"txt_observations": observations}, sort_keys=True), flush=True)
             elif args.bulk:
                 exercise_bulk(project)
+            elif args.bulk_bootstrap:
+                exercise_bootstrap(project)
+            elif args.upgrade_from:
+                old_driver = work / "schema6-driver"
+                fixture_driver(docker, args.upgrade_from, old_driver, prebuilt=True)
+                exercise_schema7_upgrade(project, args.upgrade_from, old_driver)
             else:
                 exercise(project)
         finally:
             project.close()
-        if args.live or args.bulk:
+        if args.live or args.bulk or args.bulk_bootstrap or args.upgrade_from:
             return 0
         for name, exercise_case in (("resources", exercise_resources), ("timeout", exercise_timeout)):
             with ExitStack() as cleanup:

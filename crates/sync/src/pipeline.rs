@@ -49,12 +49,13 @@ impl Shutdown {
 pub(crate) struct PriorTxt {
     pub digest: BlobDigest,
     pub observation: BlobDigest,
+    pub rsync_only: bool,
 }
 
 pub(crate) struct Prepared {
     pub bytes: Arc<Vec<u8>>,
     pub digest: BlobDigest,
-    pub verified: VerifiedTxt,
+    pub txt_evidence: TxtEvidence,
     pub xml: Result<Download>,
     pub queued_at: Instant,
     pub parsed: Option<Parsed>,
@@ -65,9 +66,10 @@ pub(crate) struct Parsed {
     pub references: Option<Result<XmlReferences>>,
 }
 
-pub(crate) enum VerifiedTxt {
-    Prior(BlobDigest),
-    Fresh(Capture),
+pub(crate) enum TxtEvidence {
+    Prior(PriorTxt),
+    HttpsMatch(Capture),
+    Rsync(bulk::Proof),
     Mismatch(Capture),
 }
 
@@ -81,11 +83,25 @@ pub(crate) enum StagedTxt {
     Bulk(bulk::Snapshot),
 }
 
+pub(crate) struct StagedBody {
+    bytes: Vec<u8>,
+    rsync: Option<bulk::Proof>,
+}
+
 impl StagedTxt {
-    pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<Vec<u8>> {
+    pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<StagedBody> {
         match self {
-            Self::Batch(batch) => batch.take(store, id),
-            Self::Bulk(snapshot) => snapshot.take(store, id),
+            Self::Batch(batch) => Ok(StagedBody {
+                bytes: batch.take(store, id)?,
+                rsync: None,
+            }),
+            Self::Bulk(snapshot) => {
+                let (bytes, rsync) = snapshot.take(store, id)?;
+                Ok(StagedBody {
+                    bytes,
+                    rsync: Some(rsync),
+                })
+            }
         }
     }
 
@@ -137,8 +153,9 @@ impl Pipeline {
     pub(crate) fn prepare(
         &mut self,
         id: RfcNumber,
-        bytes: Vec<u8>,
+        body: StagedBody,
         prior: Option<PriorTxt>,
+        rsync_bootstrap: bool,
         reader: Arc<BlobReader>,
         admitted: usize,
     ) {
@@ -153,9 +170,9 @@ impl Pipeline {
                 let mut prepared = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => Err("document verification cancelled".into()),
-                    result = verify(&upstream, id, bytes, prior, &reader) => result,
+                    result = prepare_document(&upstream, id, body, prior, rsync_bootstrap, &reader) => result,
                 }?;
-                if !matches!(prepared.verified, VerifiedTxt::Mismatch(_)) {
+                if !matches!(prepared.txt_evidence, TxtEvidence::Mismatch(_)) {
                     let queue = metrics.span(Stage::Queue);
                     let slot = tokio::select! {
                         biased;
@@ -217,20 +234,22 @@ impl Pipeline {
     }
 }
 
-async fn verify(
+async fn prepare_document(
     upstream: &Upstream,
     id: RfcNumber,
-    bytes: Vec<u8>,
+    body: StagedBody,
     prior: Option<PriorTxt>,
+    rsync_bootstrap: bool,
     reader: &BlobReader,
 ) -> Result<Prepared> {
+    let StagedBody { bytes, rsync } = body;
     let digest = BlobDigest::hash(&bytes);
-    let prior = match prior.filter(|prior| prior.digest == digest) {
-        Some(prior) if revalidate(reader, &bytes, digest)? => Some(prior),
-        _ => None,
-    };
-    let verified = if let Some(prior) = prior {
-        VerifiedTxt::Prior(prior.observation)
+    let txt_evidence = if rsync_bootstrap {
+        TxtEvidence::Rsync(rsync.ok_or("rsync bootstrap requires a completed bulk snapshot")?)
+    } else if let Some(prior) = prior.filter(|prior| prior.digest == digest)
+        && revalidate(reader, &bytes, digest)?
+    {
+        TxtEvidence::Prior(prior)
     } else {
         let Download::Captured(mut capture) = upstream.fetch(Source::Txt(id)).await? else {
             return Err("required HTTPS TXT is unavailable".into());
@@ -239,20 +258,20 @@ async fn verify(
             return Ok(Prepared {
                 bytes: Arc::new(bytes),
                 digest,
-                verified: VerifiedTxt::Mismatch(capture),
+                txt_evidence: TxtEvidence::Mismatch(capture),
                 xml: Ok(Download::Unavailable),
                 queued_at: Instant::now(),
                 parsed: None,
             });
         }
         capture.bytes = Arc::default();
-        VerifiedTxt::Fresh(capture)
+        TxtEvidence::HttpsMatch(capture)
     };
     let xml = upstream.fetch(Source::Xml(id)).await;
     Ok(Prepared {
         bytes: Arc::new(bytes),
         digest,
-        verified,
+        txt_evidence,
         xml,
         queued_at: Instant::now(),
         parsed: None,

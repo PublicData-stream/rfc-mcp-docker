@@ -96,7 +96,7 @@ class Project(phase5.Project):
         self.sql("INSERT INTO rfc.sync_jobs (state, outcome) VALUES ('failed', 'schema-five-fixture')")
         self.migrate()
         self.migrate()
-        assert self.sql("SELECT max(version) FROM rfc.schema_migrations") == "6"
+        assert self.sql("SELECT max(version) FROM rfc.schema_migrations") == "7"
         assert self.sql("SELECT count(*) FROM rfc.sync_jobs WHERE outcome = 'schema-five-fixture'") == "1"
 
     def publication(self):
@@ -541,12 +541,54 @@ def fixture_binaries(docker, prefix, work):
         run([*docker, "rm", container])
 
 
+def exercise_bulk_bootstrap(project):
+    sources = phase2.prepare(project, include_nul=True)
+    project.start()
+    project.migrate()
+    project.run("up", "-d", "--wait", "fixtures")
+    with phase2.capped_stage(project) as mountpoint:
+        _, stage_mount, _, config_mount = phase2.bulk_options(project, mountpoint, bootstrap=True)
+        project.ingestion_overlay = project.directory / "ingestion-compose.json"
+        project.ingestion_overlay.write_text(json.dumps({"services": {"sync": {
+            "environment": {"RFC_SYNC_CONFIG_FILE": "/phase2/bulk.toml"},
+            "volumes": [stage_mount, config_mount],
+        }}}))
+        try:
+            client = project.start_mcp()
+            project.restart_sync(PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782")
+            wait(lambda: project.publication() == 1)
+            wait(lambda: project.admin("/ready").returncode == 0)
+            wait(lambda: project.sql(
+                "SELECT count(*) FROM rfc.notification_outbox WHERE delivery_state = 'delivered'"
+            ) == "1")
+            tools = client.rpc("tools/list")[0]["tools"]
+            client.schemas = {tool["name"]: phase5.Draft202012Validator(tool["outputSchema"]) for tool in tools}
+            document = client.call("get", id=2119)[0]
+            assert document["publication_sequence"] == "1"
+            assert phase5.bytes_from(document["original"]) == sources[2119]
+            assert project.sql(
+                "SELECT count(*) FROM rfc.generation_documents d "
+                "JOIN rfc.active_generation a ON a.generation_id = d.generation_id "
+                "JOIN rfc.source_observations o ON o.identity = d.txt_observation "
+                "WHERE o.source_transport = 'rsync' AND o.https_verification = 'unverified'"
+            ) == str(len(sources))
+            assert all("/rfc/rfc" not in line or ".txt" not in line
+                       for line in project.capture("logs", "--no-color", "fixtures").splitlines())
+            print("Bulk daemon bootstrap published and delivered; /ready and MCP original bytes passed", flush=True)
+        except Exception:
+            project.run("logs", "--no-color", "--tail", "25", "sync")
+            raise
+        finally:
+            project.run("rm", "--stop", "--force", "sync")
+
+
 def main():
     if not __debug__:
         raise RuntimeError("Phase 6 requires assertions")
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", default="rfc-phase6-final")
+    parser.add_argument("--bulk-bootstrap", action="store_true")
     args = parser.parse_args()
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-phase6-", dir="/tmp") as directory:
@@ -557,7 +599,10 @@ def main():
         project = Project(work / work.name, driver, args.image_prefix, docker)
         try:
             project.prepare_phase6(work)
-            exercise(project)
+            if args.bulk_bootstrap:
+                exercise_bulk_bootstrap(project)
+            else:
+                exercise(project)
         except Exception:
             project.run("logs", "--no-color", "--tail", "25")
             raise

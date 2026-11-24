@@ -17,7 +17,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSIONS: [i32; 6] = [1, 2, 3, 4, 5, 6];
+const SCHEMA_VERSIONS: [i32; 7] = [1, 2, 3, 4, 5, 6, 7];
 const READ_DEADLINE: Duration = Duration::from_secs(15);
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",

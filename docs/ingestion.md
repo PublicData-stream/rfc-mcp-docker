@@ -29,6 +29,7 @@ Production Compose mounts the [ingestion TOML](../deploy/ingestion.toml.example)
 | `ingestion.pipeline.max_pending_documents` | 3 | 1–3 |
 | `ingestion.pipeline.parser_workers` | 1 | 1–2 |
 | `ingestion.max_accepted_bytes` | 4294967296 | 1–4294967296 |
+| `ingestion.txt_provenance` | `dual_source` | `dual_source`, `rsync_bootstrap` |
 
 The pending-document window must fit both concurrency settings. The HTTPS request timeout includes the fixed five-second connect timeout. The rsync timeouts apply to one batch or one bulk session, each with a fixed 30-second inactivity timeout. The accepted-byte cap is cumulative across the two catalog captures, accepted TXT and captured RFCXML. The 12-hour run deadline applies independently.
 
@@ -42,8 +43,8 @@ Bulk mode runs one rsync session for the selected RFCs. It keeps full and sample
 
 ```mermaid
 flowchart LR
-    A[Initial catalog and selected RFC IDs] --> B[One private rsync batch]
-    B --> C[TXT byte comparison or verified baseline reuse]
+    A[Initial catalog and selected RFC IDs] --> B[Private rsync staging]
+    B --> C[TXT provenance check]
     C --> D[Optional RFCXML and bounded parsing]
     D --> E[Ordered blob and database commits]
     E --> F[End catalog digest and candidate validation]
@@ -51,22 +52,28 @@ flowchart LR
     C --> H[Quarantine on byte disagreement]
 ```
 
-At most 32 TXT files of up to 4 MiB each are staged per batch. Sync takes a document out of staging only after admitting it to the pending-document window. The next batch starts after the previous staging directory has been removed. The default three slots reserve at most 48 MiB for document payloads. Each admitted document has a 128 MiB application parse budget, with the existing TXT and RFCXML input caps and XML node limits. Catalog processing runs outside the document window and has a 20,000-entry cap.
+In batched mode, Sync stages at most 32 TXT files of up to 4 MiB each and starts the next batch after removing the previous staging directory. In both modes the pending-document window admits files as capacity becomes available. The default three slots reserve at most 48 MiB for document payloads. Each admitted document has a 128 MiB application parse budget, with the existing TXT and RFCXML input caps and XML node limits. Catalog processing runs outside the document window and has a 20,000-entry cap.
 
 - The shared HTTPS start gate spaces catalog, TXT, and RFCXML dispatches by the configured interval even when two responses overlap. Hourly catalog probes and reconciliations sharing the mirror also share the corpus fence. Each new lock holder waits for the configured interval before starting HTTPS.
 - The writer commits in ascending RFC order and ends each document transaction before taking the next prepared result. One supervised blocking task at a time performs blob installation and fsync so transfers can continue while the writer waits.
 - On failure, timeout, or SIGTERM, sync stops admission, cancels HTTPS work, reaps rsync, and joins parsing and any active blob install before releasing the corpus fence. Phase 3 recovery handles unfinished generations and orphaned blobs after an abrupt interruption. Existing optional RFCXML handling still records partial coverage for unavailable or invalid reference evidence as appropriate. [Publication and recovery](publication.md)
-- To reduce overlap, set both concurrency settings to `1` in TOML. To roll back the code, stop Sync gracefully and use the previous Compose definition and Sync image with the existing database schema and mirror.
+- To reduce overlap, set both concurrency settings to `1` in TOML. For policy or schema rollback, follow the [deployment upgrade procedure](deployment.md#initialize-or-upgrade).
 
-### Verified TXT reuse
+### TXT provenance and reuse
 
-A full ready, published, or retained baseline may supply a prior TXT observation. The observed source URL and verification state, staged digest, and full canonical bytes must agree. A missing canonical file requires fresh HTTPS verification. A conflicting canonical file fails the run for investigation.
+The default `dual_source` policy checks new TXT against the HTTPS body. A full ready, published, or retained baseline may supply a prior HTTPS-verified observation when the staged digest and full canonical bytes agree. A missing canonical file requires fresh HTTPS verification. A conflicting canonical file fails the run for investigation.
 
-A future failed-run cache could retain one independent proof per RFC ID, exact TXT digest, and official source URL.
+With `persistent_bulk`, an operator can opt in to `rsync_bootstrap`. A full run at publication sequence zero then accepts TXT from the official rsync module with local checksum and CAS integrity checks. The rsync transport lacks the authentication supplied by HTTPS. The stored observation records the rsync URL and marks HTTPS verification as `unverified`. Its fetch time is the successful session completion for a transferred file. A checksum-confirmed cache hit has a new observation time and a null fetch time. Sample runs remain strict.
+
+After the first publication, `rsync_bootstrap` requires an HTTPS comparison for new or changed TXT. An unchanged TXT can reuse its active generation observation only after rechecking the staged bytes against the canonical blob and its digest. A candidate prepared before a different first publication must still pass the active provenance check at promotion. The report counts HTTPS-verified and rsync-only TXT separately. The reused count includes both kinds of prior proof.
+
+The rsync metrics report session count, transferred file count, checksum hits and maximum validated inventory bytes. On a warm bulk run the validated inventory includes files whose content rsync confirmed without transferring.
+
+A future checkpoint cache could retain eligible proofs independently of a generation.
 
 ```mermaid
 flowchart LR
-    A[Staged TXT] --> B[Exact HTTPS agreement]
+    A[Staged TXT] --> B[Eligible TXT proof]
     B --> C[Canonical install and rehash]
     C --> D[Successful parse and committed provenance]
     D --> E[Independent reusable proof]
@@ -83,7 +90,7 @@ A proof would pin its canonical blob through a reference independent of candidat
 - Manifest format 2 extends format 1 with the scope, the two catalog observation identities, the policy registry version, and catalog entries without TXT. A generation records the exact publication date or its available month precision.
 - The document version stores LF-based line starts and section coverage. Section IDs are scoped to the document version. Raw headings, section bodies, and notices are half-open original byte ranges. Use the original blob to reconstruct matches and snippets.
 - PostgreSQL chunks hold consecutive raw UTF-8 slices of at most 16 KiB. Document lexemes come from the intact TXT under pg_catalog.simple, so terms in separate chunks and terms split by a chunk boundary remain searchable together.
-- Verified TXT with invalid UTF-8 or a NUL byte is stored byte for byte in bytes mode. It retains LF line offsets, with text indexing and parsed TXT sections, notices, and references unavailable. Catalog metadata and independently verified RFCXML evidence are still available. The reconciliation report counts `invalid_utf8` and `contains_nul` independently. A body with both conditions contributes to both counters.
+- Accepted TXT with invalid UTF-8 or a NUL byte is stored byte for byte in bytes mode. It retains LF line offsets, with text indexing and parsed TXT sections, notices, and references unavailable. Catalog metadata and independently verified RFCXML evidence are still available. The reconciliation report counts `invalid_utf8` and `contains_nul` independently. A body with both conditions contributes to both counters.
 - Catalog and RFCXML evidence locators encode half-open byte ranges in their respective XML observation blobs. TXT evidence uses original TXT offsets. Global reference coverage is partial where sources are excluded, unavailable, or incomplete.
 - A complete notice extraction describes the parser's result. Redistribution review comes from the [notice registry](../crates/sync/src/policy.json). The reviewed fixture digests permit whole-document reproduction. Other documents default to metadata-only policy.
 
@@ -97,3 +104,5 @@ python3 scripts/phase2/integration.py
 ~~~
 
 The fixture profile uses synthetic sources and the two reviewed RFC originals. The benchmark uses disposable projects and fixed fixture observation timestamps. Compare with `--benchmark 6 96 --http-concurrency 1` and again with `--http-concurrency 2`. Use `--receipt /tmp/benchmark.json` for the per-run results and `--reference-receipt /tmp/serial.json` for comparison against the instrumented serial revision. The fixture pace matches the official dispatch interval by default. Run `--live` only with explicit upstream authorization.
+
+Use Phase 2's `--bulk` for strict cold and warm bulk reconciliation and `--bulk-bootstrap` for rsync-only provenance, faults and promotion. Phase 6's `--bulk-bootstrap` exercises daemon publication and an MCP read. These offline profiles require `mkfs.ext4` and permission to mount a disposable loop filesystem under `/tmp`. For the published-data upgrade drill, pass `--upgrade-from` with the prefix of prebuilt schema 6 Sync and ingestion fixture images.

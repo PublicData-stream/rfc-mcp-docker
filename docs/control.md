@@ -1,6 +1,6 @@
 # Phase 6 control plane
 
-Run one feed process, one sync daemon, and one serve process per Compose deployment. Coordinate the [schema 6 migration](storage.md) and application restart in one maintenance window. The sync and feed binaries start their daemons with no arguments. The existing storage, fixture, promotion, recovery, and garbage-collection commands remain available. The [Phase 6 Compose overlay](../scripts/phase6/compose.yml) is an offline test configuration. See [production Compose deployment](deployment.md) for runtime wiring.
+Run one feed process, one sync daemon, and one serve process per Compose deployment. Coordinate the [schema migration and application restart](deployment.md#initialize-or-upgrade) in one maintenance window. The sync and feed binaries start their daemons with no arguments. The existing storage, fixture, promotion, recovery, and garbage-collection commands remain available. The [Phase 6 Compose overlay](../scripts/phase6/compose.yml) is an offline test configuration. See [production Compose deployment](deployment.md) for runtime wiring.
 
 ## Private listeners and credentials
 

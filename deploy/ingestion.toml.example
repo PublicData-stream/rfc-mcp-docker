@@ -2,6 +2,9 @@ schema_version = 1
 
 [ingestion]
 max_accepted_bytes = 4294967296
+# Set to "rsync_bootstrap" with persistent_bulk only if you accept rsync-only
+# TXT evidence for the first full publication.
+txt_provenance = "dual_source"
 
 [ingestion.https]
 max_in_flight_requests = 2

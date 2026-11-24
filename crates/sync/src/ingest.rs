@@ -1,8 +1,8 @@
 use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
-    config::{RsyncMode, SyncConfig},
+    config::{RsyncMode, SyncConfig, TxtProvenance},
     metrics::{Record, Stage},
-    pipeline::{Event, Pipeline, Prepared, PriorTxt, Shutdown, StagedTxt, VerifiedTxt},
+    pipeline::{Event, Pipeline, Prepared, PriorTxt, Shutdown, StagedTxt, TxtEvidence},
     policy::Registry,
     recovery::recover_before_ingestion,
     upstream::{self, Capture, Download, Source, Upstream},
@@ -45,6 +45,13 @@ impl Scope {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TxtPolicy {
+    Strict,
+    Bootstrap,
+    Published(i64),
+}
+
 #[derive(Serialize)]
 struct Report {
     scope: &'static str,
@@ -55,6 +62,7 @@ struct Report {
     current_rfc: Option<u32>,
     expected_txt: usize,
     verified_txt: usize,
+    rsync_only_txt: usize,
     reused_txt: usize,
     catalog_only: usize,
     invalid_utf8: usize,
@@ -85,6 +93,7 @@ impl Report {
             current_rfc: None,
             expected_txt: 0,
             verified_txt: 0,
+            rsync_only_txt: 0,
             reused_txt: 0,
             catalog_only: 0,
             invalid_utf8: 0,
@@ -302,6 +311,7 @@ struct Run<'a> {
 
 impl Run<'_> {
     async fn collect(&mut self, pipeline: &mut Pipeline) -> Result<(GenerationId, BlobDigest)> {
+        let txt_policy = self.txt_policy().await?;
         let start = self.catalog_capture().await?;
         let catalog = {
             let _parse = self.upstream.metrics().span(Stage::Parse);
@@ -330,7 +340,7 @@ impl Run<'_> {
         {
             return Err("catalog lacks an expected TXT entry".into());
         }
-        let baseline = self.baseline().await?;
+        let baseline = self.baseline(txt_policy).await?;
         if self.scope == Scope::Full
             && let Some(missing) = baseline.keys().find(|id| !selected.contains(id))
         {
@@ -351,7 +361,7 @@ impl Run<'_> {
         self.store_catalog_graph(&catalog, &selected, before)
             .await?;
 
-        self.collect_documents(pipeline, &catalog, &selected, &baseline, before)
+        self.collect_documents(pipeline, &catalog, &selected, &baseline, before, txt_policy)
             .await?;
 
         let end = self.catalog_capture().await?;
@@ -408,16 +418,18 @@ impl Run<'_> {
             &[&candidate.generation(), &self.scope.as_str(), &before.as_bytes().as_slice(),
               &after.as_bytes().as_slice(), &self.registry.version, &serde_json::to_string(&catalog_only)?],
         ).await?;
+        let expected: Vec<_> = selected.iter().map(|id| id.get() as i32).collect();
         let validated: bool = candidate.tx.query_one(
             "SELECT count(*) = $2 AND coalesce(bool_and(
                 gd.catalog_observation = $3::bytea AND d.sealed AND d.section_state IS NOT NULL
                 AND d.parser_version = $4 AND d.index_version = $5
+                AND gd.rfc_id = ANY($6::integer[])
                 AND (SELECT count(*) FROM rfc.relation_coverage c
                      WHERE c.generation_id = gd.generation_id AND c.scope = 'document' AND c.rfc_id = gd.rfc_id) = 4
              ), false)
              FROM rfc.generation_documents gd JOIN rfc.document_versions d ON d.identity = gd.document_version
              WHERE gd.generation_id = $1",
-            &[&candidate.generation(), &i64::try_from(selected.len())?, &before.as_bytes().as_slice(), &PARSER, &INDEX],
+            &[&candidate.generation(), &i64::try_from(selected.len())?, &before.as_bytes().as_slice(), &PARSER, &INDEX, &expected],
         ).await?.try_get(0)?;
         if !validated {
             return Err("candidate failed membership or coverage validation".into());
@@ -430,8 +442,9 @@ impl Run<'_> {
         pipeline: &mut Pipeline,
         catalog: &xml::Catalog,
         selected: &BTreeSet<RfcNumber>,
-        baseline: &BTreeMap<RfcNumber, PriorTxt>,
+        baseline: &BTreeMap<RfcNumber, Option<PriorTxt>>,
         before: BlobDigest,
+        txt_policy: TxtPolicy,
     ) -> Result<()> {
         let ordered: Vec<_> = selected.iter().copied().collect();
         let config = self.upstream.config().ingestion;
@@ -467,7 +480,8 @@ impl Run<'_> {
                     pipeline.prepare(
                         id,
                         bytes,
-                        baseline.get(&id).copied(),
+                        baseline.get(&id).copied().flatten(),
+                        matches!(txt_policy, TxtPolicy::Bootstrap),
                         self.reader.clone(),
                         admitted - committed,
                     );
@@ -508,7 +522,7 @@ impl Run<'_> {
                     }
                     failed |= result.is_err();
                     if let Ok(document) = &result {
-                        failed |= matches!(document.verified, VerifiedTxt::Mismatch(_));
+                        failed |= matches!(document.txt_evidence, TxtEvidence::Mismatch(_));
                     }
                     completed.insert(id, result);
                 }
@@ -518,28 +532,60 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn baseline(&self) -> Result<BTreeMap<RfcNumber, PriorTxt>> {
+    async fn txt_policy(&self) -> Result<TxtPolicy> {
+        if self.scope == Scope::Sample
+            || self.upstream.config().ingestion.txt_provenance == TxtProvenance::DualSource
+        {
+            return Ok(TxtPolicy::Strict);
+        }
+        let row = self.writer.client.query_one(
+            "SELECT generation_id, publication_sequence FROM rfc.active_generation WHERE singleton",
+            &[],
+        ).await?;
+        match (row.try_get::<_, Option<i64>>(0)?, row.try_get::<_, i64>(1)?) {
+            (None, 0) => Ok(TxtPolicy::Bootstrap),
+            (Some(id), 1..) => Ok(TxtPolicy::Published(id)),
+            _ => Err("invalid active publication state for TXT provenance policy".into()),
+        }
+    }
+
+    async fn baseline(&self, policy: TxtPolicy) -> Result<BTreeMap<RfcNumber, Option<PriorTxt>>> {
+        let active = match policy {
+            TxtPolicy::Published(id) => Some(id),
+            _ => None,
+        };
         let rows = self.writer.client.query(
-            "SELECT d.rfc_id::integer, encode(o.raw_digest, 'hex'), encode(o.identity, 'hex')
+            "SELECT d.rfc_id::integer, encode(o.raw_digest, 'hex'), encode(o.identity, 'hex'),
+                CASE WHEN o.https_verification = 'verified'
+                         AND o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || d.rfc_id || '.txt'
+                     THEN false
+                     WHEN $1::bigint IS NOT NULL AND o.source_transport = 'rsync'
+                         AND o.source_url = 'rsync://rsync.rfc-editor.org/rfcs-text-only/rfc' || d.rfc_id || '.txt'
+                     THEN true
+                END
              FROM rfc.generation_documents d JOIN rfc.source_observations o ON o.identity = d.txt_observation
-             WHERE d.generation_id = (SELECT g.id FROM rfc.generations g
+             WHERE o.kind = 'txt' AND d.generation_id = coalesce($1, (SELECT g.id FROM rfc.generations g
                  JOIN rfc.generation_ingestion i ON i.generation_id = g.id
                  WHERE i.scope = 'full' AND g.state IN ('ready', 'published', 'retained')
-                 ORDER BY g.id DESC LIMIT 1)
-               AND o.kind = 'txt' AND o.https_verification = 'verified'
-               AND o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || d.rfc_id || '.txt'",
-            &[],
+                 ORDER BY g.id DESC LIMIT 1))",
+            &[&active],
         ).await?;
         rows.into_iter()
             .map(|row| {
-                Ok((
-                    RfcNumber::new(row.try_get(0)?).ok_or("invalid baseline RFC number")?,
-                    PriorTxt {
+                let prior = if let Some(rsync_only) = row.try_get::<_, Option<bool>>(3)? {
+                    Some(PriorTxt {
                         digest: BlobDigest::from_hex(row.try_get(1)?)
                             .ok_or("invalid baseline TXT digest")?,
                         observation: BlobDigest::from_hex(row.try_get(2)?)
                             .ok_or("invalid baseline observation")?,
-                    },
+                        rsync_only,
+                    })
+                } else {
+                    None
+                };
+                Ok((
+                    RfcNumber::new(row.try_get(0)?).ok_or("invalid baseline RFC number")?,
+                    prior,
                 ))
             })
             .collect()
@@ -699,7 +745,7 @@ impl Run<'_> {
         let Prepared {
             bytes,
             digest,
-            verified,
+            txt_evidence,
             xml,
             parsed,
             ..
@@ -709,12 +755,12 @@ impl Run<'_> {
             self.upstream.config().ingestion.max_accepted_bytes,
         )?;
         let source = Source::Txt(id);
-        if let VerifiedTxt::Mismatch(capture) = &verified {
+        if let TxtEvidence::Mismatch(capture) = &txt_evidence {
             self.store
                 .quarantine_mismatch(&bytes, &capture.bytes, source.limit())?;
             return Err(format!("RFC {} rsync and HTTPS TXT disagree", id.get()).into());
         }
-        let parsed = parsed.ok_or("missing verified parser output")?;
+        let parsed = parsed.ok_or("missing TXT parser output")?;
         let mut indexed = parsed.txt.data.into_view(&bytes, &parsed.txt.headings)?;
         let durable = self.install_durable(source, bytes.clone()).await?;
         {
@@ -740,11 +786,29 @@ impl Run<'_> {
             };
         let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
-        let reused = matches!(verified, VerifiedTxt::Prior(_));
-        let txt = match verified {
-            VerifiedTxt::Prior(observation) => observation,
-            VerifiedTxt::Fresh(capture) => observe(&candidate, source, &capture, digest).await?,
-            VerifiedTxt::Mismatch(_) => unreachable!("mismatches are quarantined before commit"),
+        let (txt, reused, rsync_only) = match txt_evidence {
+            TxtEvidence::Prior(prior) => (prior.observation, true, prior.rsync_only),
+            TxtEvidence::HttpsMatch(capture) => (
+                observe(&candidate, source, &capture, digest).await?,
+                false,
+                false,
+            ),
+            TxtEvidence::Rsync(proof) => {
+                let observation = candidate
+                    .observe(&Observation {
+                        kind: "txt",
+                        url: &format!("{}{}", upstream::OFFICIAL_RSYNC, upstream::filename(id)),
+                        observed_us: proof.observed_us,
+                        fetched_us: proof.fetched_us,
+                        etag: None,
+                        last_modified: None,
+                        raw_digest: digest,
+                        https_verification: "unverified",
+                    })
+                    .await?;
+                (observation, false, true)
+            }
+            TxtEvidence::Mismatch(_) => unreachable!("mismatches are quarantined before commit"),
         };
         let xml_observation = match &optional.capture {
             Some((capture, digest)) => {
@@ -858,7 +922,8 @@ impl Run<'_> {
         self.report.unclassified_or_incomplete += usize::from(classified != Coverage::Complete);
         candidate.commit().await?;
         self.report.reused_txt += usize::from(reused);
-        self.report.verified_txt += 1;
+        self.report.verified_txt += usize::from(!rsync_only);
+        self.report.rsync_only_txt += usize::from(rsync_only);
         Ok(())
     }
 
@@ -925,7 +990,7 @@ async fn observe(
             kind: source.kind(),
             url: &source.url(),
             observed_us: capture.observed_us,
-            fetched_us: capture.fetched_us,
+            fetched_us: Some(capture.fetched_us),
             etag: capture.etag.as_deref(),
             last_modified: capture.last_modified.as_deref(),
             raw_digest: digest,

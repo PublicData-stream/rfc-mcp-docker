@@ -413,9 +413,8 @@ impl Upstream {
         if !status.success() {
             return Err(format!("rsync batch failed ({status})").into());
         }
-        self.metrics.staged(staged_bytes, scratch_used());
-        #[cfg(feature = "phase2-fixtures")]
-        self.metrics.record_rsync_payload(seen.len(), staged_bytes);
+        self.metrics
+            .staged(staged_bytes, scratch_used(), seen.len(), 0);
         Ok(RsyncBatch {
             temp,
             incoming,

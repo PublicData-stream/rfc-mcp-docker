@@ -144,7 +144,7 @@ pub struct Observation<'a> {
     pub kind: &'a str,
     pub url: &'a str,
     pub observed_us: i64,
-    pub fetched_us: i64,
+    pub fetched_us: Option<i64>,
     pub etag: Option<&'a str>,
     pub last_modified: Option<&'a str>,
     pub raw_digest: BlobDigest,
