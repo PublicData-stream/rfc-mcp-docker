@@ -360,8 +360,21 @@ async fn reconcile(job: i64, config: SyncConfig, shutdown: &Shutdown) -> Result<
         }
     };
     shutdown.check()?;
-    promote_locked(&mut writer, candidate, sequence, false, Some(job)).await?;
-    Ok(())
+    let started = Instant::now();
+    let result = promote_locked(&mut writer, candidate, sequence, false, Some(job)).await;
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "publication",
+            "state": if result.is_ok() { "published" } else { "failed" },
+            "job_id": job.to_string(),
+            "generation_id": candidate.get().to_string(),
+            "expected_publication_sequence": sequence.to_string(),
+            "publication_sequence": result.as_ref().ok().map(i64::to_string),
+            "elapsed_seconds": started.elapsed().as_secs_f64(),
+        })
+    );
+    result.map(|_| ())
 }
 
 async fn catalog_changed(config: SyncConfig) -> Result<bool> {

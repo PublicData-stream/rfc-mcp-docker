@@ -2,7 +2,7 @@ use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
     checkpoint::{self, Context, Kind, SavedSources},
     config::{RsyncMode, SyncConfig, TxtProvenance},
-    metrics::{Record, Stage},
+    metrics::{Metrics, Record, Stage},
     pipeline::{
         Event, Pipeline, Prepared, PreparedXml, PriorTxt, Selection, Shutdown, StagedTxt,
         TxtEvidence, TxtVerification, WorkId,
@@ -73,6 +73,8 @@ impl TxtPolicy {
 struct Report {
     scope: &'static str,
     state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
     generation_id: Option<String>,
     manifest_digest: Option<String>,
     catalog_digest: Option<String>,
@@ -126,6 +128,7 @@ impl Report {
         Self {
             scope: scope.as_str(),
             state: "failed",
+            job_id: None,
             generation_id: None,
             manifest_digest: None,
             catalog_digest: None,
@@ -254,6 +257,7 @@ pub(crate) async fn ingest_locked(
     shutdown: &Shutdown,
 ) -> Result<(GenerationId, BlobDigest)> {
     let mut report = Report::new(scope);
+    report.job_id = job.map(|id| id.to_string());
     let result = match upstream {
         Ok(upstream) => {
             run(
@@ -297,6 +301,13 @@ async fn run(
 ) -> Result<(GenerationId, BlobDigest)> {
     let started = Instant::now();
     let metrics = upstream.metrics();
+    let cadence = Duration::from_secs(60);
+    #[cfg(feature = "phase2-fixtures")]
+    let cadence = if upstream.is_fixture() {
+        Duration::from_secs(1)
+    } else {
+        cadence
+    };
     let root = mirror_root();
     let store = BlobWriter::open(&root)?;
     shutdown.check()?;
@@ -320,8 +331,9 @@ async fn run(
         report,
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12 * 60 * 60);
-    let result = async {
+    let reconciliation = async {
         let candidate = shutdown.until(deadline, run.collect(&mut pipeline)).await?;
+        let _validation = metrics.span(Stage::Validation);
         let digest = shutdown
             .until(deadline, candidate.prepare_readiness())
             .await?;
@@ -331,8 +343,12 @@ async fn run(
         }
         // Once submitted, observe the COMMIT outcome before releasing the fence.
         candidate.commit_readiness(digest).await
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        biased;
+        result = reconciliation => result,
+        _ = log_progress(&metrics, started, cadence, scope, id, job) => unreachable!(),
+    };
     pipeline.drain().await;
     run.drain_install().await;
     if result.is_err()
@@ -343,6 +359,35 @@ async fn run(
     }
     run.report.metrics = Some(metrics.snapshot(started.elapsed()));
     result
+}
+
+async fn log_progress(
+    metrics: &Metrics,
+    started: Instant,
+    cadence: Duration,
+    scope: Scope,
+    id: GenerationId,
+    job: Option<i64>,
+) -> ! {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + cadence, cadence);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let generation_id = id.get().to_string();
+    let job_id = job.map(|id| id.to_string());
+    loop {
+        ticks.tick().await;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "ingestion_progress",
+                "scope": scope.as_str(),
+                "state": "building",
+                "generation_id": generation_id,
+                "job_id": job_id,
+                "elapsed_seconds": started.elapsed().as_secs_f64(),
+                "progress": metrics.progress(),
+            })
+        );
+    }
 }
 
 struct Run<'a> {
@@ -455,6 +500,7 @@ impl Run<'_> {
             .collect();
         self.report.catalog_only = catalog_only.len();
         self.report.expected_txt = selected.len();
+        self.upstream.metrics().selected(selected.len());
         let start_digest = self.install(Source::Catalog, start.bytes.clone()).await?;
         if start_digest != selection.catalog {
             return Err("installed catalog differs from selected catalog".into());
@@ -566,6 +612,7 @@ impl Run<'_> {
         work: CatalogWork,
     ) -> Result<()> {
         let config = self.upstream.config().ingestion;
+        let metrics = self.upstream.metrics();
         let mut batch: Option<StagedTxt> = None;
         let mut stage_end = 0;
         let mut admitted = 0;
@@ -638,6 +685,7 @@ impl Run<'_> {
                         )
                         .await?,
                     );
+                    metrics.txt_completed();
                 }
                 Event::Xml(id, xml) => {
                     let out_of_order = pending
@@ -657,8 +705,9 @@ impl Run<'_> {
                     )
                     .await?;
                     pending.remove(&id.rfc);
+                    metrics.xml_completed(pending.len());
                     if out_of_order {
-                        self.upstream.metrics().out_of_order();
+                        metrics.out_of_order();
                     }
                     committed += 1;
                 }

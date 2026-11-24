@@ -289,7 +289,18 @@ pub(crate) async fn stage(
     }
     let bytes = files.values().map(|file| file.length as u64).sum();
     let transferred = files.values().filter(|file| file.transferred).count();
-    metrics.staged(bytes, None, transferred, files.len() - transferred);
+    let transferred_payload = files
+        .values()
+        .filter(|file| file.transferred)
+        .map(|file| file.length as u64)
+        .sum();
+    metrics.staged(
+        bytes,
+        transferred_payload,
+        None,
+        transferred,
+        files.len() - transferred,
+    );
     Ok(Snapshot {
         inventory,
         files,

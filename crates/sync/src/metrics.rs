@@ -15,6 +15,7 @@ pub(crate) enum Stage {
     Parse,
     Install,
     Database,
+    Validation,
     Queue,
 }
 
@@ -27,6 +28,17 @@ pub(crate) struct Timing {
 #[derive(Clone, Default)]
 pub(crate) struct Metrics(Arc<Mutex<Record>>);
 
+#[derive(Clone, Copy, Default, Serialize)]
+pub(crate) struct Progress {
+    selected: usize,
+    txt_completed: usize,
+    xml_completed: usize,
+    txt_remaining: usize,
+    xml_remaining: usize,
+    admitted: usize,
+    xml_reserved: usize,
+}
+
 #[derive(Clone, Default, Serialize)]
 pub(crate) struct Record {
     pub catalog: Timing,
@@ -36,11 +48,13 @@ pub(crate) struct Record {
     pub parse: Timing,
     pub install: Timing,
     pub database: Timing,
+    pub validation: Timing,
     pub queue: Timing,
     pub wall_us: u64,
     pub cpu_us: Option<u64>,
     pub memory_peak: Option<u64>,
     pub received_bytes: u64,
+    pub rsync_transferred_payload_bytes: u64,
     pub https_requests: u64,
     pub https_peak: u64,
     pub minimum_start_spacing_us: Option<u64>,
@@ -55,6 +69,7 @@ pub(crate) struct Record {
     pub parse_peak: u64,
     pub staged_peak: u64,
     pub retries: u64,
+    pub progress: Progress,
     #[cfg(feature = "phase2-fixtures")]
     pub rsync_files: usize,
     #[cfg(feature = "phase2-fixtures")]
@@ -133,12 +148,14 @@ impl Metrics {
     pub(crate) fn staged(
         &self,
         bytes: u64,
+        transferred_payload: u64,
         scratch: Option<u64>,
         transferred: usize,
         unchanged: usize,
     ) {
         let mut record = self.0.lock().unwrap();
         record.rsync_peak_bytes = record.rsync_peak_bytes.max(bytes);
+        record.rsync_transferred_payload_bytes += transferred_payload;
         record.scratch_peak_bytes = record.scratch_peak_bytes.max(scratch);
         record.rsync_transferred_files += transferred;
         record.rsync_checksum_hits += unchanged;
@@ -155,17 +172,44 @@ impl Metrics {
 
     pub(crate) fn admitted(&self, entries: usize) {
         let mut record = self.0.lock().unwrap();
+        record.progress.admitted = entries;
         record.admitted_peak = record.admitted_peak.max(entries as u64);
     }
 
     pub(crate) fn xml_reserved(&self, entries: usize, raw_bytes: usize) {
         let mut record = self.0.lock().unwrap();
+        record.progress.xml_reserved = entries;
         record.xml_window_peak = record.xml_window_peak.max(entries as u64);
         record.raw_reserved_peak = record.raw_reserved_peak.max(raw_bytes as u64);
     }
 
     pub(crate) fn xml_retry(&self) {
         self.0.lock().unwrap().retries += 1;
+    }
+
+    pub(crate) fn selected(&self, count: usize) {
+        let mut record = self.0.lock().unwrap();
+        record.progress.selected = count;
+        record.progress.txt_remaining = count;
+        record.progress.xml_remaining = count;
+    }
+
+    pub(crate) fn txt_completed(&self) {
+        let mut record = self.0.lock().unwrap();
+        record.progress.txt_completed += 1;
+        record.progress.txt_remaining -= 1;
+    }
+
+    pub(crate) fn xml_completed(&self, admitted: usize) {
+        let mut record = self.0.lock().unwrap();
+        record.progress.xml_completed += 1;
+        record.progress.xml_remaining -= 1;
+        record.progress.xml_reserved -= 1;
+        record.progress.admitted = admitted;
+    }
+
+    pub(crate) fn progress(&self) -> Progress {
+        self.0.lock().unwrap().progress
     }
 
     pub(crate) fn queue_wait(&self, elapsed: Duration) {
@@ -229,6 +273,7 @@ impl Drop for Span {
             Stage::Parse => &mut record.parse,
             Stage::Install => &mut record.install,
             Stage::Database => &mut record.database,
+            Stage::Validation => &mut record.validation,
             Stage::Queue => &mut record.queue,
         };
         timing.calls += 1;

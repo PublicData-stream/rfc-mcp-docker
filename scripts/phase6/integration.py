@@ -102,6 +102,14 @@ class Project(phase5.Project):
     def publication(self):
         return int(self.sql("SELECT publication_sequence FROM rfc.active_generation WHERE singleton"))
 
+    def use_bulk_bootstrap(self, mountpoint):
+        _, stage_mount, _, config_mount = phase2.bulk_options(self, mountpoint, bootstrap=True)
+        self.ingestion_overlay = self.directory / "ingestion-compose.json"
+        self.ingestion_overlay.write_text(json.dumps({"services": {"sync": {
+            "environment": {"RFC_SYNC_CONFIG_FILE": "/phase2/bulk.toml"},
+            "volumes": [stage_mount, config_mount],
+        }}}))
+
     def restart_sync(self, crash="", **settings):
         self.env.update(PHASE6_CRASH=crash, **settings)
         self.run("up", "-d", "--no-deps", "--force-recreate", "sync")
@@ -547,12 +555,7 @@ def exercise_bulk_bootstrap(project):
     project.migrate()
     project.run("up", "-d", "--wait", "fixtures")
     with phase2.capped_stage(project) as mountpoint:
-        _, stage_mount, _, config_mount = phase2.bulk_options(project, mountpoint, bootstrap=True)
-        project.ingestion_overlay = project.directory / "ingestion-compose.json"
-        project.ingestion_overlay.write_text(json.dumps({"services": {"sync": {
-            "environment": {"RFC_SYNC_CONFIG_FILE": "/phase2/bulk.toml"},
-            "volumes": [stage_mount, config_mount],
-        }}}))
+        project.use_bulk_bootstrap(mountpoint)
         try:
             client = project.start_mcp()
             project.restart_sync(PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782")
@@ -572,6 +575,21 @@ def exercise_bulk_bootstrap(project):
                 "JOIN rfc.source_observations o ON o.identity = d.txt_observation "
                 "WHERE o.source_transport = 'rsync' AND o.https_verification = 'unverified'"
             ) == str(len(sources))
+            job_id = project.sql("SELECT id FROM rfc.sync_jobs WHERE outcome = 'published'")
+            generation = document["generation_id"]
+            entries = [json.loads(line) for line in
+                       project.capture("logs", "--no-color", "--no-log-prefix", "sync").splitlines()
+                       if line.startswith("{")]
+            ready, = [entry for entry in entries if entry.get("state") == "ready"]
+            published, = [entry for entry in entries if entry.get("event") == "publication"]
+            assert ready["job_id"] == published["job_id"] == job_id
+            assert ready["generation_id"] == published["generation_id"] == generation
+            assert published["state"] == "published" and published["publication_sequence"] == "1"
+            assert published["expected_publication_sequence"] == "0"
+            assert ready["metrics"]["progress"] == {
+                "selected": len(sources), "txt_completed": len(sources), "xml_completed": len(sources),
+                "txt_remaining": 0, "xml_remaining": 0, "admitted": 0, "xml_reserved": 0,
+            }
             assert all("/rfc/rfc" not in line or ".txt" not in line
                        for line in project.capture("logs", "--no-color", "fixtures").splitlines())
             print("Bulk daemon bootstrap published and delivered; /ready and MCP original bytes passed", flush=True)

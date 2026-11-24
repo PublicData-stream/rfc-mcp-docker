@@ -565,7 +565,7 @@ impl Upstream {
             return Err(format!("rsync batch failed ({status})").into());
         }
         self.metrics
-            .staged(staged_bytes, scratch_used(), seen.len(), 0);
+            .staged(staged_bytes, staged_bytes, scratch_used(), seen.len(), 0);
         Ok(RsyncBatch {
             temp,
             incoming,
