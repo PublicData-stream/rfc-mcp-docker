@@ -1,5 +1,9 @@
 # Cold RFC bootstrap and first publication
 
+The collector and rate-budget discussion below describes the historical
+dual-queue design. The HTTPS-first decision supersedes its proposed source
+policy and retains the cold-start timing contract. [HTTPS-first RFC synchronization](0010-https-first-rfc-synchronization.md)
+
 Phase 0 measures the current collector and defines the acceptance gate for the proposed dual-queue collector. The implementation baseline is `db38619e8b3011b0e93aa5e7ec9e3b6928e2ab72`, which already overlaps some HTTPS and parsing work, commits in RFC order, and preserves NUL-containing TXT in bytes mode. The earlier serial and bounded-pipeline results end at a ready candidate. [Implementation status](../implementation-status.md#bounded-reconciliation-pipeline)
 
 ## Timing contract

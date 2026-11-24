@@ -736,3 +736,190 @@ For the 9,861-RFC planning case, persistent bulk TXT still leaves 9,863 HTTPS st
 - On 2026-11-24, `scripts/phase0/check-rust.sh` passed with the pinned Rust toolchain and the existing locked dependency cache. The gate covered formatting, the frozen build, Clippy, workspace and documentation tests, documentation warnings, and the Phase 0 MCP wire probe. Cargo artifacts used `/tmp/rust/target`.
 - Checked the guide links and anchors, shell example syntax, and referenced repository paths. The Codex Security resolver discovered the root policy and applied it to the repository root, `apps/`, and `crates/`.
 - This documentation change used the offline gate. Runtime Compose probes apply when runtime dependencies, images, or isolation change.
+
+## HTTPS-first RFC synchronization Phase 0
+
+The baseline is `376fdc65c37c331ea433ebdb57ef70e7afbfdfbe` with PostgreSQL
+schema 9 and ingestion TOML schema 1. The future collector uses HTTPS for
+normal acquisition and mandatory rsync checksum audits for required TXT.
+The first publication under that policy needs eligible HTTPS and audit
+evidence for every required TXT. The new ADR records how to handle old
+proofs, checkpoints, configuration and schema rollback.
+[HTTPS-first decision](decisions/0010-https-first-rfc-synchronization.md)
+
+### Current execution paths
+
+| Area | Baseline behavior and source |
+| --- | --- |
+| Entry points and coordination | Sync without arguments loads config once, takes scheduler leadership (advisory lock `-3`), and queues startup work. The daemon schedules a daily full reconcile and an hourly catalog change check. One-shot `--phase2-reconcile --full\|--sample` calls the same collector. The daemon, manual execution, promotion and recovery share the corpus coordinator lock (`-1`). [CLI](../crates/sync/src/main.rs) · [Daemon](../crates/sync/src/daemon.rs) · [Coordinator](../crates/sync/src/lib.rs) |
+| Feed hints and notifications | Feed polls RSS or Atom with conditional validators and a nominal 900 s interval, using its own HTTPS client and backoff. Private HMAC control messages carry stable event identity, observation digest, time and reason. Sync records event IDs and coalesces jobs under the queue transaction lock (`-4`). Serve receives generation, sequence and manifest hints via a separate authenticated link. [Feed](../apps/src/feed.rs) · [Schemas](../apps/src/control/mod.rs) · [Wire and authentication](../apps/src/control/wire.rs) |
+| Selection and acquisition | Sync selects from its starting HTTPS catalog, stages TXT through rsync, and starts bounded RFCXML lookahead. Config v1 selects batched or persistent staging and eligible TXT proof. The Sync start gate covers catalog, TXT, RFCXML and retries. Parse and durable installation precede TXT sealing, and classified RFCXML is joined by RFC identity for membership. [Config](../crates/sync/src/config.rs) · [Upstream](../crates/sync/src/upstream.rs) · [Bulk](../crates/sync/src/bulk.rs) · [Pipeline](../crates/sync/src/pipeline.rs) · [Ingest](../crates/sync/src/ingest.rs) |
+| Bytes, checkpoints and recovery | TXT parsing preserves original bytes and indexes byte ranges, including bytes mode for NUL-bearing originals. Catalog and RFCXML parsing apply separate outcome and coverage rules. Bounded restart checkpoints pin original observations and bind to catalog digest, scope, policy, sequence and parser, index and registry versions. Recovery reclaims abandoned candidate work and honors retained readers. [TXT](../crates/sync/src/text.rs) · [XML](../crates/sync/src/xml.rs) · [Checkpoints](../crates/sync/src/checkpoint.rs) · [Recovery](../crates/sync/src/recovery.rs) |
+| Readiness and publication | Ending catalog equality and candidate validation precede manifest freeze. Manual full reconcile stops at `ready`. Explicit publish or daemon promotion verifies the sequence and commits the active pointer and outbox together. Serve checks the active generation on `/ready` and reads through generation guards. [Publication](../crates/sync/src/publication.rs) · [Serve routes](../apps/src/public.rs) |
+
+The [migration runner](../migrations/migrate.sql) holds advisory lock
+`-2` and executes as the schema owner. Migrations 0001–0006 cover storage,
+ingestion, publication, search, reviewed pagination and control. Migration
+0007 records rsync provenance and guards promotion of rsync-only proofs.
+Migration 0008 guards the pairing of byte-matched HTTPS and rsync
+observations. Migration 0009 adds bounded ingestion checkpoints and their
+blob references. [Migration inventory](../migrations/) ·
+[Storage schema check](../crates/storage/src/postgres.rs)
+
+[Production Compose](../compose.yml) requires a read-only Sync config file
+mount. The [bulk overlay](../deploy/compose.bulk-rsync.yml) adds a private
+writable staging bind to Sync. The [runtime image targets](../Dockerfile)
+use the default Rust features. The `phase6-fixture` target builds separate
+Sync and Feed binaries with fixture features. Sync's fixture features
+include the private origin and pacing controls used by the benchmark.
+The [deployment examples](../deploy/) describe the current v1 config and
+service-scoped secrets.
+
+### Paced private baseline on 2026-11-24
+
+Six cold trials ran serially on an amd64 KVM guest with 18 vCPUs and
+34.2 GiB RAM, Linux `7.0.0-44-generic`, rootful Docker `29.10.0`, Compose
+`5.8.0`, and PostgreSQL `19.0`. Sync used 2 CPUs, 2 GiB RAM, and 512 MiB
+scratch. The preloaded stock Sync image was
+`sha256:4aad68653aec90a555cea17b17af285bbda621a23f340bc4fdfe76975db956c6`.
+The control fixture image was
+`sha256:c2990a19b6d5c0ea0909a84f718e71eb5bb46619b4a3e7d794da61c4c83497b6`.
+The runtime source inputs matched `35c6523` by Git diff, and the image
+IDs matched the original build and qualification receipts. Image checks
+and fixture binary extraction took 3.734 s outside T0–T1. Legacy bulk
+staging setup took 0.308, 0.327 and 2.874 s before T0.
+
+The fixture used the same 96 RFCs and source bytes across all six trials.
+`--check-config` reported v1 defaults for strict batched `dual_source` and
+a v1 file for persistent bulk `rsync_bootstrap`. Both reported two
+in-flight HTTPS permits, 1,000 ms start spacing, three pending documents,
+one parser worker, a 30 s HTTPS timeout and up to three RFCXML attempts.
+Strict batched required 136 MiB of scratch and 1,080 MiB of memory in
+preflight. Legacy bulk required 8 MiB of scratch and 952 MiB of memory,
+plus a separate capped staging filesystem.
+
+| Profile | Trial | Collector (s) | Published observed (s) | Ready observed (s) | T1 MCP read (s) | Outbox delivered (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Strict batched | 1 | 196.699 | 213.537 | 213.635 | 213.675 | 213.751 |
+| Strict batched | 2 | 201.268 | 224.495 | 224.591 | 224.637 | 225.053 |
+| Strict batched | 3 | 197.299 | 218.911 | 219.026 | 219.066 | 219.806 |
+| Legacy bulk | 1 | 103.795 | 115.732 | 115.832 | 115.870 | 115.949 |
+| Legacy bulk | 2 | 103.527 | 119.752 | 119.925 | 120.035 | 120.236 |
+| Legacy bulk | 3 | 100.450 | 120.225 | 120.323 | 120.362 | 120.441 |
+
+The collector column measures reconciliation wall time. The other columns
+measure from fresh-volume initialization. Each trial published all 96 RFCs
+at sequence 1, passed loopback `/ready`, served the exact RFC 2119 bytes
+over HTTPS at MCP revision `2026-07-28`, and delivered its authenticated
+outbox event. The database publication timestamps and observed milestones
+are in the receipts. Manifests reproduced within each policy. Strict's
+T1 median and worst were 219.066 and 224.637 s. Legacy bulk's were 120.035
+and 120.362 s.
+
+| Measurement | Strict batched | Legacy bulk |
+| --- | ---: | ---: |
+| HTTPS starts per trial (catalog / TXT / RFCXML) | 194 (2 / 96 / 96) | 98 (2 / 0 / 96) |
+| Minimum HTTPS start spacing (µs) | 1,000,243 | 1,000,284 |
+| Peak in-flight HTTPS | 2 | 2 |
+| HTTPS payload bytes per trial | 2,935,483 | 48,928 |
+| Rsync sessions per trial | 3 | 1 |
+| Rsync transferred TXT files and payload bytes per trial | 96 / 2,886,555 | 96 / 2,886,555 |
+| Peak validated staging inventory bytes | 1,127,680 | 2,886,555 |
+| Median durably sealed TXT per collector second | 0.487 | 0.927 |
+| Median cumulative catalog / TXT HTTPS / RFCXML HTTPS spans (s) | 2.406 / 63.632 / 115.316 | 2.406 / 0.000 / 115.318 |
+| Median cumulative rsync / parse / CAS install spans (s) | 0.935 / 0.021 / 27.379 | 1.251 / 0.020 / 26.389 |
+| Median cumulative database / candidate validation / queue spans (s) | 5.557 / 0.007 / 607.220 | 9.491 / 0.009 / 152.491 |
+| Mean DB span latency by trial (ms) | 24.163 / 60.814 / 19.034 | 31.569 / 73.362 / 41.267 |
+| Peak Sync process and child CPU (s) / RSS (MiB) | 0.733 / 12.414 | 0.633 / 12.242 |
+| Peak Sync cgroup CPU (s) / memory (MiB) | 1.707 / 15.668 | 0.669 / 17.277 |
+| Peak scratch / bulk staging allocation (MiB) | 1.098 / inapplicable | unreported / 2.980 |
+| Sampled mirror / PostgreSQL allocation peaks (MiB) | 3.402 / 67.188 | 3.402 / 66.898 |
+
+Each trial classified 33 RFCXML captures, 62 HTTP 404s and one HTTP 410.
+Admission and XML lookahead both peaked at three, with 48 MiB reserved
+for raw bodies. The paced strict case spent about 196–201 s in the
+collector, consistent with its 194 starts at the one-second floor. Stage
+spans can overlap. The DB latency is mean elapsed time across 230
+instrumented application operations per trial. PostgreSQL-only commit
+timing is outside this baseline. The receipts include individual setup
+phases, fixture and manifest digests, and per-service cgroup maxima.
+
+### Archived full-size capacity
+
+The archived receipt records source base
+`eb8cdd96de6178502eac40459f5a6df5c80c8bd5` with a working-tree probe
+correction. It used the same preloaded image IDs on rootful Docker with
+fixture-only acceleration. Its three 9,861-RFC legacy bulk cold trials reached
+sequence 1 and a byte-exact MCP read in 1,364.022, 1,313.921 and 1,339.594 s.
+The median was 1,339.594 s and the worst was 1,364.022 s. The corresponding
+incremental trials changed ten RFCs, verified sequence 2, and completed
+in 584.257, 462.585 and 460.715 s. Their median was 462.585 s and the worst
+was 584.257 s. These are historical capacity measurements for the legacy
+policy. Phase 8 of the HTTPS-first plan owns full-size qualification of
+the replacement. [Archived dual-queue results](#full-size-private-fixture)
+
+### Other Phase 0 observations
+
+- A one-shot stock Sync service ran `--check-config` with the example
+  file mounted read-only by Compose and networking disabled. It
+  reported source `file`, the same strict v1 values as the timed
+  default profile, and the 2 GiB cgroup limit.
+- Host rsync was `3.4.1` (protocol 32). The packaged Alpine client was
+  `3.5.2` (protocol 33), with checksum choices xxh128, xxh3, xxh64, MD5
+  and MD4 plus `none`. Both advertised `--list-only`, `--checksum` and
+  `--checksum-choice`. The packaged binary listed both files in a private
+  daemon module. The first dry run skipped the module directory. With an
+  explicit two-file list, `--dry-run --checksum --checksum-choice=auto`
+  reported only the changed RFC despite matching sizes and mtimes, and
+  preserved both local files. The trial establishes local compatibility.
+  RFC Editor's rsync version, negotiated checksum, and availability of an
+  equivalent RFCXML module remain unverified. All RFC acquisition in
+  Phase 0 used private fixtures.
+- The six-RFC manual and daemon rehearsal produced identical manifest
+  bytes. The daemon reached T1 at 21.113 s and delivered the notification at
+  21.524 s. Manual reconciliation reached a ready candidate at 35.307 s
+  with sequence zero, `/ready` 503, and an empty outbox. Explicit promotion
+  reached T1 at 36.586 s with one pending notification. The strict
+  disagreement control failed at sequence zero without an outbox entry.
+- The schema 9 strict rollback rehearsal kept sequence 1 ready and
+  byte-readable through a deliberate TXT disagreement. After the
+  fixture sources agreed, the daemon verified all six HTTPS TXT matches,
+  published sequence 2, and delivered a new notification. Both manifests
+  remained readable and the historical TXT observation IDs matched the
+  pre-rollback snapshot.
+- The Phase 0 Compose probes passed on rootful and rootless Docker. They
+  exercised the packaged runtime images, MCP wire behavior, exact rsync
+  transfer, TLS and PostgreSQL roles, and ripgrep with Landlock and
+  seccomp. The cached locked dependency check and offline Rust gate
+  passed, including formatting, frozen builds, Clippy, workspace and
+  documentation tests, and the local MCP wire probe.
+
+The host-local receipts and logs are under
+`/tmp/rfc-https-first-phase0.Rd25Kx0h`. The paced summary, parity and
+rollback summaries, image identities, stock config check, and both
+rsync attempts are saved there.
+
+### Reproduce the private checks
+
+Use a verified native image set and a host that supports disposable ext4
+staging. Run the timed trials serially. The existing harness names refer
+to phases of the dual-queue implementation.
+
+```sh
+export TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target RFC_E2E_PRELOADED=1
+evidence=$(mktemp -d /tmp/rfc-https-first-phase0.XXXXXXXX)
+image_prefix=rfc-dual-phase7-rebuilt
+
+python3 -B scripts/bootstrap/baseline.py --phase8 paced --context default \
+    --image-prefix "$image_prefix" --evidence "$evidence/paced"
+python3 -B scripts/bootstrap/baseline.py --phase6 --context default \
+    --image-prefix "$image_prefix" --evidence "$evidence/parity"
+python3 -B scripts/bootstrap/baseline.py --phase8 rollback --context default \
+    --image-prefix "$image_prefix" --evidence "$evidence/rollback"
+for context in default rootless; do
+    python3 -B scripts/phase0/integration.py --context "$context" \
+        --project "$image_prefix" --skip-build
+done
+cargo fetch --locked --offline
+scripts/phase0/check-rust.sh
+```
