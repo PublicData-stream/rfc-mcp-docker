@@ -587,3 +587,83 @@ The daemon job finished without retries and its authenticated notification was o
 - The preloaded Phase 0 Compose probes passed on both Docker engines. Rootless Phase 1 storage, Phase 2 ingestion, Phase 6 daemon and control, and Phase 7 production isolation passed. The standalone rootful Phase 6 `--bulk-bootstrap` probe passed, including the job, generation and publication-log assertions. The original timed runner also passed its six-RFC strict fixture and disagreement control.
 - The first rootless Phase 3 run failed an assertion on the result of terminating a fixture reader's PostgreSQL session. The same suite passed on rootful Docker, including candidate-only sample rejection, publication, reader and GC fencing, restore, and checkpoint recovery.
 - The native image receipt, exact probe invocations, logs and final timing receipts are under `/tmp/rfc-phase6-checks.JLVfUB8l`. The bundle was built from the working tree before the Sync commit was signed, so its revision field names the parent. The `cold-final/` timing receipts record the signed Sync commit and the same image IDs.
+
+## Dual-queue bootstrap implementation Phase 7
+
+The existing Compose gates cover configuration preflight, original-byte ingestion, request and queue bounds, failure recovery, authenticated publication, and service confinement. The local profiles add a 3,072-RFC cold bootstrap, populated historical upgrades, and a paced comparison with the original serial collector.
+
+### Reproduce the local qualification
+
+Use the preloaded native application and fixture images, PostgreSQL image, and Python dependencies from the earlier gates. Build the `sync` and `phase2-fixture` targets from signed revisions `e2e5a41` and `968673e` for the historical profiles. Use the matching Sync and ingestion-fixture tags under each historical prefix. The capped staging probes require a host that can make and mount disposable ext4 images with `sudo -n`.
+
+Use a separate BuildKit builder for each checkout revision when building the comparison images on one host. With a shared builder, give each revision a separate Cargo target-cache ID and force the affected compilation stages to run. Changing the mount ID alone can reuse a previously built layer.
+
+```sh
+export RFC_E2E_PRELOADED=1 TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target
+evidence=$(mktemp -d /tmp/rfc-dual-phase7.XXXXXXXX)
+
+cargo fetch --locked
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+python3 -B scripts/phase8/http-smoke.py
+actionlint
+docker compose --env-file deploy/compose.env.example config --quiet
+RFC_SYNC_RSYNC_STAGE_DIR="$evidence/render-stage" docker compose -f compose.yml \
+    -f deploy/compose.bulk-rsync.yml --env-file deploy/compose.env.example config --quiet
+
+for context in rootless default; do
+    python3 -B scripts/phase0/integration.py --context "$context" --project "$IMAGE_PREFIX"
+    python3 -B scripts/phase7/integration.py --context "$context" --image-prefix "$IMAGE_PREFIX"
+done
+for phase in 1 2 6; do
+    python3 -B "scripts/phase${phase}/integration.py" --context rootless --image-prefix "$IMAGE_PREFIX"
+done
+python3 -B scripts/phase3/integration.py --context default --image-prefix "$IMAGE_PREFIX"
+python3 -B scripts/phase2/integration.py --context default --image-prefix "$IMAGE_PREFIX" --bulk
+python3 -B scripts/phase2/integration.py --context default --image-prefix "$IMAGE_PREFIX" --bulk-bootstrap
+python3 -B scripts/phase2/integration.py --context default --image-prefix "$IMAGE_PREFIX" \
+    --upgrade-from "$SCHEMA6_PREFIX"
+python3 -B scripts/phase2/integration.py --context default --image-prefix "$IMAGE_PREFIX" \
+    --upgrade-from-schema7 "$SCHEMA7_PREFIX"
+python3 -B scripts/phase6/integration.py --context default --image-prefix "$IMAGE_PREFIX" --bulk-bootstrap
+python3 -B scripts/bootstrap/baseline.py --phase6 --context default --image-prefix "$IMAGE_PREFIX" \
+    --evidence "$evidence/cold"
+python3 -B scripts/bootstrap/baseline.py --phase7-scale --context default --image-prefix "$IMAGE_PREFIX" \
+    --evidence "$evidence/scale"
+python3 -B scripts/phase2/integration.py --context default --image-prefix "$IMAGE_PREFIX" \
+    --benchmark 96 --repeats 3 --serial-image-prefix "$SCHEMA6_PREFIX" --receipt "$evidence/benchmark.json"
+```
+
+The scale profile accelerates requests inside the isolated fixture and preserves production TOML validation. The serial comparison uses the one-second request-start interval for all three profiles and ends at a validated candidate. Retain the scale and benchmark receipts separately when evaluating the Phase 8 first-publication objective.
+
+### Private 3,072-RFC bootstrap on 2026-11-24
+
+The preloaded rootful Compose stack published at sequence 1. The collector finished in 639.409 s, `/ready` responded after 687.992 s, and the byte-exact MCP `get` completed at 688.037 s from initialization. Authenticated notification delivery was observed at 688.792 s. The same host ran other disposable qualification workloads during this trial.
+
+One rsync session transferred 3,072 TXT originals totaling 97,261,467 bytes. The fixture recorded zero TXT HTTPS requests and 3,074 total HTTPS starts at an observed 4.81 starts/s. RFCXML returned 1,025 captures, 2,046 HTTP 404s, and one HTTP 410. Every selected RFC had the expected original and XML association. The read-only verifier rehashed 4,098 blobs and checked 3,155,147 ranges and line starts. The queue peaked at three documents with 48 MiB reserved for raw bodies and two in-flight HTTPS requests. Peak Sync cgroup memory was 313.2 MiB at candidate completion. The sampled staging, mirror, and PostgreSQL peaks were 94.6 MiB, 100.1 MiB, and 184.0 MiB respectively.
+
+The accelerated trial measures only the private fixture. The official HTTPS schedule and the full-corpus 900-second gate remain Phase 8 work.
+
+### Offline regression on 2026-11-24
+
+- The host used native amd64, 18 vCPUs, 34.2 GiB RAM, cgroup v2, Docker Engine 29.10.0 in both contexts, Compose 5.8.0, and Rust 1.100.0. Locked Cargo checks, all-feature Clippy and tests, 258 seeded HTTP mutations, workflow lint, and both production Compose renders passed.
+- Offline Phase 0 and Phase 7 confinement passed on both engines with rebuilt stock Sync image `sha256:4aad68653aec90a555cea17b17af285bbda621a23f340bc4fdfe76975db956c6`. An earlier stock build reused historical Cargo artifacts and failed the schema check. A separate target cache and forced compilation resolved the mismatch. Rootless Phase 1 storage, Phase 2 ingestion, and Phase 6 control passed. Rootful Phase 3 verified publication, retained readers, recovery, checkpoint expiry and corruption, GC, and restore.
+- The ingestion gate measured 1,000,814 µs minimum request-start spacing. Its 33-RFC resource case staged 128 MiB, used 128.004 MiB of scratch, and peaked at 152.3 MiB of Sync cgroup memory. The writer-gated run filled three XML slots with 48 MiB reserved, kept further XML requests waiting, and reproduced the control manifest. The first attempt hit the Sync role's advisory-lock permission boundary. The test now acquires its lock inside a restricted trigger in the disposable database, using the existing runtime grants.
+- The rebuilt fixture CLI left the six-RFC manual candidate at `ready` with sequence zero, an empty outbox, and `/ready` returning 503. Explicit promotion then served the exact original bytes and matched the daemon's manifest byte for byte. The daemon delivered its authenticated notification. The strict TXT disagreement control kept sequence zero and scheduled a retry.
+- Rootful strict bulk and bulk bootstrap passed. The fault cases included a mid-transfer rsync disconnect, invalid staged names, unselected files, empty and oversized TXT, binary signatures, exhausted staging bytes and inodes, parser panic, SIGTERM, and catalog drift. Releasing rsync and RFCXML on different schedules reproduced the same manifest. Rollback restored the first generation and its byte-exact reads.
+- Populated schema 6 and 7 stores migrated to schema 9 twice. Both preserved legacy observation IDs, timestamps, manifest bytes, and guarded reads of published and retained generations. An unchanged run reused all six legacy TXT proofs. A changed RFC with differing source bytes was rejected. Once both sources agreed, Sync recorded a new paired rsync and HTTPS proof and reused the other five legacy proofs.
+
+### Paced 96-RFC comparison on 2026-11-24
+
+Three cold candidates per profile used identical synthetic bytes, request delays, host limits, and one-second start pacing. The historical collector used revision `e2e5a41`, schema 6, and its pinned Rust 1.99.1. Both current profiles used schema 9 and Rust 1.100.0. Other qualification workloads ran on the host during some trials.
+
+| Profile | Collector wall trials (s) | Median wall (s) | RFCs/s at median | Median CPU (s) | Peak Sync cgroup memory (MiB) | Max PostgreSQL / mirror allocation (MiB) |
+|---|---:|---:|---:|---:|---:|---:|
+| Historical serial | 322.338, 269.029, 305.979 | 305.979 | 0.314 | 0.486 | 12.04 | 66.78 / 3.40 |
+| Current one-slot | 325.807, 248.832, 261.883 | 261.883 | 0.367 | 0.634 | 8.05 | 67.16 / 3.40 |
+| Current pipelined | 205.206, 211.341, 195.711 | 205.206 | 0.468 | 0.625 | 9.62 | 67.18 / 3.40 |
+
+All nine runs made 194 HTTPS starts and accepted 2,935,483 bytes. The shortest start interval was 1,000,208 µs. The current one-slot and pipelined profiles reserved 16 MiB and 48 MiB of raw payload capacity respectively. The read-only verifier validated each manifest. The two current profiles produced byte-identical manifests. Across both schemas, the comparison matched RFC membership, originals, byte ranges, relation evidence, and coverage.
+
+The receipts and logs are under `/tmp/rfc-dual-phase7.peGcsqOy` on the qualification host. `benchmark.json` holds the nine runs and their image IDs. `scale/summary.json` and `cold-cli/summary.json` hold the cold publication evidence. `compose-results.txt` and `forced-image.log` record the probe exit statuses and the final image identities.
