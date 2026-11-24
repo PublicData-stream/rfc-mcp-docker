@@ -2,6 +2,7 @@
 
 use crate::{
     bulk,
+    checkpoint::{Kind, Saved, SavedSources},
     config::{RAW_PER_DOCUMENT, RsyncMode},
     ingest::Scope,
     metrics::{Metrics, Stage},
@@ -66,6 +67,12 @@ pub(crate) struct PriorTxt {
     pub legacy: bool,
 }
 
+pub(crate) struct TxtVerification {
+    pub baseline: Option<PriorTxt>,
+    pub checkpoint: Option<Saved>,
+    pub bootstrap: bool,
+}
+
 pub(crate) struct Prepared {
     pub bytes: Arc<Vec<u8>>,
     pub digest: BlobDigest,
@@ -88,6 +95,7 @@ pub(crate) struct WorkId {
 
 pub(crate) enum PreparedXml {
     Captured(Capture, XmlReferences),
+    Reused(Saved, XmlReferences),
     Malformed(Capture, Box<dyn std::error::Error + Send + Sync>),
     Missing(MissingXml),
     Failed(XmlFailure),
@@ -95,6 +103,7 @@ pub(crate) enum PreparedXml {
 
 pub(crate) enum TxtEvidence {
     Prior(PriorTxt),
+    Checkpoint(Saved),
     HttpsMatch(Capture, bulk::Proof),
     Rsync(bulk::Proof),
     Mismatch(Capture),
@@ -104,6 +113,7 @@ pub(crate) enum Event {
     Staged(Result<StagedTxt>),
     Txt(WorkId, Box<Prepared>),
     Xml(WorkId, PreparedXml),
+    Invalidated(WorkId, Kind),
     Failed(WorkId, Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -153,7 +163,12 @@ pub(crate) struct Pipeline {
     xml_waiting: VecDeque<(WorkId, oneshot::Receiver<XmlFetch>)>,
 }
 
-type XmlFetch = std::result::Result<Download, XmlFailure>;
+enum XmlInput {
+    Upstream(std::result::Result<Download, XmlFailure>),
+    Saved(Saved, Vec<u8>),
+}
+
+type XmlFetch = Result<XmlInput>;
 
 #[derive(Clone)]
 struct Parser {
@@ -219,6 +234,8 @@ impl Pipeline {
         selection: Selection,
         ordered: &[RfcNumber],
         committed: usize,
+        checkpoints: &SavedSources,
+        reader: &Arc<BlobReader>,
     ) {
         let capacity = self
             .upstream
@@ -234,12 +251,28 @@ impl Pipeline {
             self.xml_enqueued += 1;
             let upstream = self.upstream.clone();
             let shutdown = self.shutdown.clone();
+            let events = self.send_result.clone();
+            let cached = checkpoints.xml.get(&rfc).copied();
+            let reader = reader.clone();
             self.tasks.spawn(async move {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {}
-                    result = upstream.fetch_xml(id.rfc) => { let _ = send.send(result); }
+                let result = async {
+                    if let Some(saved) = cached {
+                        let body = task::spawn_blocking(move || saved.read_xml(&reader))
+                            .await?
+                            .map_err(|error| Kind::Xml.invalid(saved, error))?;
+                        if let Some(bytes) = body {
+                            return Ok(XmlInput::Saved(saved, bytes));
+                        }
+                        events.send(Event::Invalidated(id, Kind::Xml)).await?;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => Err("RFCXML acquisition cancelled".into()),
+                        result = upstream.fetch_xml(id.rfc) => Ok(XmlInput::Upstream(result)),
+                    }
                 }
+                .await;
+                let _ = send.send(result);
                 None
             });
         }
@@ -269,8 +302,7 @@ impl Pipeline {
         &mut self,
         id: WorkId,
         body: StagedBody,
-        prior: Option<PriorTxt>,
-        rsync_bootstrap: bool,
+        verification: TxtVerification,
         reader: Arc<BlobReader>,
         admitted: usize,
     ) -> Result<()> {
@@ -289,7 +321,7 @@ impl Pipeline {
                 let mut prepared = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => Err("document verification cancelled".into()),
-                    result = verify_txt(&upstream, id.rfc, body, prior, rsync_bootstrap, &reader) => result,
+                    result = verify_txt(&upstream, id, body, verification, &reader, &send) => result,
                 }?;
                 if matches!(prepared.txt_evidence, TxtEvidence::Mismatch(_)) {
                     send.send(Event::Txt(id, Box::new(prepared))).await?;
@@ -307,10 +339,24 @@ impl Pipeline {
                 let fetched = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => return Err("RFCXML join cancelled".into()),
-                    result = xml_fetch => result?,
+                    result = xml_fetch => result??,
+                };
+                let fetched = match fetched {
+                    XmlInput::Saved(saved, _) if !saved.fresh()? => {
+                        send.send(Event::Invalidated(id, Kind::Xml)).await?;
+                        let result = tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => return Err("RFCXML acquisition cancelled".into()),
+                            result = upstream.fetch_xml(id.rfc) => result,
+                        };
+                        XmlInput::Upstream(result)
+                    }
+                    input => input,
                 };
                 let xml = match fetched {
-                    Ok(Download::Captured(capture)) => parser.parse(move |budget| {
+                    XmlInput::Upstream(Ok(Download::Missing(status))) => PreparedXml::Missing(status),
+                    XmlInput::Upstream(Err(failure)) => PreparedXml::Failed(failure),
+                    body => parser.parse(move |budget| {
                         let budget = Budget {
                             bytes: budget.bytes.checked_sub(retained).ok_or(BudgetExceeded)?,
                             shutdown: budget.shutdown,
@@ -323,16 +369,24 @@ impl Pipeline {
                         {
                             panic!("fixture RFCXML parser panic");
                         }
-                        let result = xml::references(&capture.bytes, id.rfc, &budget);
+                        let bytes = match &body {
+                            XmlInput::Upstream(Ok(Download::Captured(capture))) => capture.bytes.as_slice(),
+                            XmlInput::Saved(_, bytes) => bytes.as_slice(),
+                            _ => unreachable!("only captured RFCXML bodies reach the parser"),
+                        };
+                        let result = xml::references(bytes, id.rfc, &budget);
                         budget.shutdown.check()?;
-                        match result {
-                            Ok(references) => Ok(PreparedXml::Captured(capture, references)),
-                            Err(error) if error.is::<BudgetExceeded>() => Err(error),
-                            Err(error) => Ok(PreparedXml::Malformed(capture, error)),
+                        match (body, result) {
+                            (_, Err(error)) if error.is::<BudgetExceeded>() => Err(error),
+                            (XmlInput::Upstream(Ok(Download::Captured(capture))), Ok(references)) =>
+                                Ok(PreparedXml::Captured(capture, references)),
+                            (XmlInput::Upstream(Ok(Download::Captured(capture))), Err(error)) =>
+                                Ok(PreparedXml::Malformed(capture, error)),
+                            (XmlInput::Saved(saved, _), Ok(references)) => Ok(PreparedXml::Reused(saved, references)),
+                            (XmlInput::Saved(saved, _), Err(error)) => Err(Kind::Xml.invalid(saved, error).into()),
+                            _ => unreachable!("only captured RFCXML bodies reach the parser"),
                         }
                     }).await?,
-                    Ok(Download::Missing(status)) => PreparedXml::Missing(status),
-                    Err(failure) => PreparedXml::Failed(failure),
                 };
                 send.send(Event::Xml(id, xml)).await?;
                 Ok(())
@@ -383,35 +437,52 @@ impl Pipeline {
 
 async fn verify_txt(
     upstream: &Upstream,
-    id: RfcNumber,
+    id: WorkId,
     body: StagedBody,
-    prior: Option<PriorTxt>,
-    rsync_bootstrap: bool,
+    verification: TxtVerification,
     reader: &BlobReader,
+    events: &mpsc::Sender<Event>,
 ) -> Result<Prepared> {
     let StagedBody { bytes, rsync } = body;
     let digest = BlobDigest::hash(&bytes);
-    let txt_evidence = if rsync_bootstrap {
-        TxtEvidence::Rsync(rsync)
-    } else if let Some(prior) = prior.filter(|prior| prior.digest == digest)
+    let prior = if let Some(prior) = verification
+        .baseline
+        .filter(|prior| !verification.bootstrap && prior.digest == digest)
         && revalidate(reader, &bytes, digest)?
     {
-        TxtEvidence::Prior(prior)
+        Some(TxtEvidence::Prior(prior))
     } else {
-        let Download::Captured(mut capture) = upstream.fetch(Source::Txt(id)).await? else {
-            return Err("required HTTPS TXT is unavailable".into());
-        };
-        if bytes.as_slice() != capture.bytes.as_slice() {
-            return Ok(Prepared {
-                bytes: Arc::new(bytes),
-                digest,
-                txt_evidence: TxtEvidence::Mismatch(capture),
-                queued_at: Instant::now(),
-                parsed: None,
-            });
+        None
+    };
+    let mut evidence = prior;
+    if let Some(saved) = verification
+        .checkpoint
+        .filter(|saved| evidence.is_none() && saved.rsync_only == verification.bootstrap)
+    {
+        if saved.digest == digest
+            && saved.fresh()?
+            && revalidate(reader, &bytes, digest)
+                .map_err(|error| Kind::Txt.invalid(saved, error))?
+        {
+            evidence = Some(TxtEvidence::Checkpoint(saved));
+        } else {
+            events.send(Event::Invalidated(id, Kind::Txt)).await?;
         }
-        capture.bytes = Arc::default();
-        TxtEvidence::HttpsMatch(capture, rsync)
+    }
+    let txt_evidence = match evidence {
+        Some(evidence) => evidence,
+        None if verification.bootstrap => TxtEvidence::Rsync(rsync),
+        None => {
+            let Download::Captured(mut capture) = upstream.fetch(Source::Txt(id.rfc)).await? else {
+                return Err("required HTTPS TXT is unavailable".into());
+            };
+            if bytes.as_slice() == capture.bytes.as_slice() {
+                capture.bytes = Arc::default();
+                TxtEvidence::HttpsMatch(capture, rsync)
+            } else {
+                TxtEvidence::Mismatch(capture)
+            }
+        }
     };
     Ok(Prepared {
         bytes: Arc::new(bytes),

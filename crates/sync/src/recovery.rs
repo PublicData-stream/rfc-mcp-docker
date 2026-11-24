@@ -135,6 +135,8 @@ async fn recover(
 
     let tx = writer.client.transaction().await?;
     tx.batch_execute(DURABLE_TRANSACTION).await?;
+    tx.query_one("SELECT rfc.prune_ingestion_checkpoints(NULL, NULL)", &[])
+        .await?;
     tx.query_one("SELECT rfc.mark_unreachable_blobs()", &[])
         .await?;
     tx.commit().await?;

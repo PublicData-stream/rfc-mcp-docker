@@ -7,9 +7,10 @@ use rfc_storage::{
     postgres::{Result, RuntimeRole, connect, load_manifest, mirror_root},
 };
 use std::os::fd::OwnedFd;
-use tokio_postgres::{Client, Transaction};
+use tokio_postgres::{Client, GenericClient, Transaction};
 
 mod bulk;
+mod checkpoint;
 mod config;
 mod daemon;
 mod ingest;
@@ -47,20 +48,7 @@ impl Writer {
 
     /// Registers an already durable blob and checks an existing row before reusing it.
     pub async fn register_blob(&self, blob: DurableBlob) -> Result<BlobDigest> {
-        let digest = blob.digest();
-        let length = blob.byte_length();
-        self.client.execute(
-            "INSERT INTO rfc.blobs (digest, byte_length) VALUES ($1::bytea, $2::bigint) ON CONFLICT DO NOTHING",
-            &[&digest.as_bytes().as_slice(), &length],
-        ).await?;
-        let row = self.client.query_one(
-            "SELECT byte_length::bigint, integrity_state FROM rfc.blobs WHERE digest = $1::bytea",
-            &[&digest.as_bytes().as_slice()],
-        ).await?;
-        if row.try_get::<_, i64>(0)? != length || row.try_get::<_, &str>(1)? != "verified" {
-            return Err("registry has an incompatible blob record".into());
-        }
-        Ok(digest)
+        register_blob(&self.client, blob).await
     }
 
     /// Starts a candidate transaction. Dropping it rolls back all candidate rows.
@@ -138,6 +126,25 @@ impl Writer {
             .await?;
         Ok(())
     }
+}
+
+async fn register_blob(db: &impl GenericClient, blob: DurableBlob) -> Result<BlobDigest> {
+    let digest = blob.digest();
+    let length = blob.byte_length();
+    db.execute(
+        "INSERT INTO rfc.blobs (digest, byte_length) VALUES ($1::bytea, $2::bigint) ON CONFLICT DO NOTHING",
+        &[&digest.as_bytes().as_slice(), &length],
+    ).await?;
+    let row = db
+        .query_one(
+            "SELECT byte_length::bigint, integrity_state FROM rfc.blobs WHERE digest = $1::bytea",
+            &[&digest.as_bytes().as_slice()],
+        )
+        .await?;
+    if row.try_get::<_, i64>(0)? != length || row.try_get::<_, &str>(1)? != "verified" {
+        return Err("registry has an incompatible blob record".into());
+    }
+    Ok(digest)
 }
 
 pub struct Observation<'a> {

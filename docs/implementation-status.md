@@ -536,3 +536,19 @@ Sync seals each accepted TXT index while its RFCXML request can still be pending
 - The six-RFC fixed-clock comparison with `3d03dc7` matched all 3,847 manifest bytes, 32,113 accepted bytes, and 14 HTTPS starts. Both runs independently checked original bytes and evidence ranges. Collector wall time was 8.780 s on Phase 3 and 13.143 s on Phase 4 in single, unpaced trials during local qualification. Cumulative CAS installation time was 0.894 s and 6.493 s respectively. These timings characterize the local fixture runs.
 
 Logs and fixture receipts are under `/tmp/rfc-dual-phase4` on the qualification host.
+
+## Dual-queue bootstrap implementation Phase 5
+
+Schema 8 binds new dual-source TXT matches to separate HTTPS and rsync observations. Schema 9 retains bounded restart checkpoints for verified TXT and successfully parsed RFCXML. Reuse preserves the original observation identities and timestamps. Known catalog drift invalidates the attempt's checkpoints, and readiness clears them atomically. Sync starts HTTPS requests at least one second apart by default and limits new rsync-only TXT to first publication. Public MCP continues to serve the existing `2026-07-28` wire schema. [Ingestion](ingestion.md#interrupted-reconciliation) · [Upgrade and rollback](deployment.md#initialize-or-upgrade)
+
+### Verification on 2026-11-24
+
+- The locked Rust gate and all-feature Clippy and tests passed with Rust 1.100.0 and Cargo artifacts under `/tmp/rust/target`.
+- The offline Phase 0 probes passed on rootful and rootless Docker Engine 29.10.0, Compose 5.8.0, and Linux 7.0.0-44-generic amd64. Rootless storage, search, and MCP passed. Rootful daemon and confinement suites passed. The bulk daemon fixture delivered the authenticated publication event, reached `/ready`, and served the original bytes over MCP.
+- The populated schema 7 upgrade and migration rerun preserved exact observation IDs, timestamps and manifest bytes. Guarded Serve reads confirmed the active and retained generations. A subsequent strict candidate reused all six legacy TXT proofs without a TXT HTTPS request.
+- The rootful strict bulk and bulk bootstrap fixtures passed. The strict warm run reused 36 TXT proofs and reproduced the cold fixture manifest. Changing one staged TXT required one new byte comparison. The bootstrap fixture exercised rsync-only provenance, capped staging faults, promotion fencing and retained-generation rollback.
+- The isolated rootful standard ingestion suite passed, including the 33-RFC resource fixture with 4 MiB TXT and an 8 MiB RFCXML response. The HTTPS timeout fixture reused five saved TXT proofs and made one TXT HTTPS request on retry. Earlier rootless runs exposed assertions that assumed no checkpoint reuse and a transient Docker exec timeout in the rsync cancellation poll.
+- The isolated rootful publication and recovery suite passed after the concurrent rootless run timed out waiting for a fixture reader in the advisory-lock queue. The checkpoint probe covered crash boundaries, pinning, forced synchronous commits, both cache limits, expiry, catalog drift and corruption. A six-RFC retry reused five TXT proofs and one RFCXML capture, fetched the changed TXT again, recovered the missing XML, and recorded a fresh 404 for expired XML. The corruption case kept the suspect file for repair and preserved the published original bytes.
+- The rootful destructive restore rehearsal passed after creating the required evidence directory under `/tmp`. It verified both readable generations, the active pointer at sequence 2, canonical blobs, pinned MCP reads and the restored runtime role boundaries.
+
+Verification used disposable Compose projects and private upstream fixtures. Logs and native image receipts are under `/tmp/rfc-phase5-checks`. Official full-corpus startup through publication and readiness remains unmeasured.

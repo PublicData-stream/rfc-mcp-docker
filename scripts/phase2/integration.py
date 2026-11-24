@@ -158,7 +158,7 @@ COMMIT;
     assert project.sql("SELECT version FROM rfc.schema_migrations") == "1"
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8\n9"
 
 
 def verify_ranges(project, report, sources, txt_verification="verified"):
@@ -494,7 +494,7 @@ def exercise_xml_statuses(project):
             "RFC_SYNC_HTTP_CONCURRENCY=1", "RFC_PHASE2_HTTP_TIMEOUT_MS=1000",
         ))
         assert report["rfcxml"] == {
-            "captured": 1, "malformed": 1, "retries_exhausted": 1, **expected,
+            "captured": 1, "reused": 0, "malformed": 1, "retries_exhausted": 1, **expected,
         }, report
         assert report["xml_unavailable"] == 4 and report["metrics"]["retries"] == 3, report
         verify_xml_observation(project, report, 100, b'<rfc number="100"><middle/></rfc>')
@@ -673,9 +673,12 @@ printf 'cancelled and reaped\n'
         try:
             until = time.monotonic() + 12
             while time.monotonic() < until:
-                result = subprocess.run([*project.docker, "exec", name, "pidof", "rsync"],
-                                        capture_output=True, timeout=3)
-                if result.returncode == 0:
+                try:
+                    result = subprocess.run([*project.docker, "exec", name, "pidof", "rsync"],
+                                            capture_output=True, timeout=3)
+                except subprocess.TimeoutExpired:
+                    result = None
+                if result is not None and result.returncode == 0:
                     break
                 assert collector.poll() is None
                 time.sleep(0.1)
@@ -784,21 +787,26 @@ def exercise_timeout(project):
         project.reconcile(expected=expected)
     mode.write_text("slow-txt")
     project.reconcile(expected="txt HTTPS transport", settings=("RFC_PHASE2_HTTP_TIMEOUT_MS=500",))
+    saved = int(project.sql("SELECT count(*) FROM rfc.ingestion_checkpoints WHERE kind='txt'"))
     mode.write_text("normal")
     result = project.reconcile()
-    assert result["verified_txt"] == 6 and result["reused_txt"] == 0
+    assert 0 <= saved < 6
+    assert result["verified_txt"] == 6 and result["reused_txt"] == result["checkpoint_txt"] == saved, result
+    assert result["metrics"]["txt"]["calls"] == 6 - saved, result
     project.verify_manifest(result)
     assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
 
 
 
-def fixture_driver(docker, prefix, target, *, prebuilt=False):
-    image = f"{prefix}-ingestion-fixture"
-    phase1.phase0.prepare_fixture_image(docker, REPO, "phase2-fixture", image, skip_build=prebuilt)
+def fixture_driver(docker, prefix, target, *, prebuilt=False, publication=False):
+    phase, purpose = (3, "publication") if publication else (2, "ingestion")
+    image = f"{prefix}-{purpose}-fixture"
+    executable = f"/rfc-phase{phase}-fixture"
+    phase1.phase0.prepare_fixture_image(docker, REPO, f"phase{phase}-fixture", image, skip_build=prebuilt)
     container = phase1.capture([*docker, "create", *phase1.phase0.local_image_args(), image,
-                                "/rfc-phase2-fixture"])
+                                executable])
     try:
-        run([*docker, "cp", f"{container}:/rfc-phase2-fixture", str(target)])
+        run([*docker, "cp", f"{container}:{executable}", str(target)])
     finally:
         run([*docker, "rm", container], stdout=subprocess.DEVNULL)
     target.chmod(0o755)
@@ -1010,41 +1018,58 @@ def exercise_bootstrap(project):
         print("Bulk bootstrap provenance, capped failures, promotion fencing and rollback passed", flush=True)
 
 
-def exercise_schema7_upgrade(project, old_prefix, old_driver):
+def exercise_provenance_upgrade(project, old_prefix, old_driver, old_schema, reader):
     sources = prepare(project, include_nul=True)
     project.start()
     migrations = (REPO / "migrations/migrate.sql").read_text()
-    boundary = "SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 7)"
+    boundary = f"SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = {old_schema+1})"
     old_sql, _ = migrations.split(boundary, 1)
     run([*project.psql(), "-f", "/dev/stdin"], env=project.env,
         input=old_sql.replace("\\ir ", "\\i /migrations/") + "COMMIT;\n")
-    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "6"
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == str(old_schema)
     project.run("up", "-d", "--wait", "fixtures", timeout=35)
     current = {key: project.env[key] for key in ("PHASE1_IMAGE_PREFIX", "PHASE2_DRIVER")}
     project.env.update(PHASE1_IMAGE_PREFIX=old_prefix, PHASE2_DRIVER=str(old_driver))
     try:
         first = project.reconcile()
         activate(project, first["generation_id"], 0)
+        second = project.reconcile()
+        activate(project, second["generation_id"], 1)
     finally:
         project.env.update(current)
     query = ("SELECT encode(identity, 'hex'), source_url, observed_at, fetched_at, https_verification "
              "FROM rfc.source_observations ORDER BY identity")
     before = project.sql(query)
+    manifests = ("SELECT id,encode(manifest_bytes,'hex') FROM rfc.generations"
+                 " WHERE state IN ('published','retained') ORDER BY id")
+    before_manifests = project.sql(manifests)
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "8"
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "9"
     assert project.sql(query) == before
+    assert project.sql(manifests) == before_manifests
     assert project.sql("SELECT count(*) FROM rfc.source_observations WHERE source_transport <> 'https'") == "0"
+    for state, selector, report in (("retained", first["generation_id"], first),
+                                    ("published", "active", second)):
+        assert project.sql(
+            f"SELECT encode(manifest_digest,'hex') FROM rfc.generations WHERE state = '{state}'"
+        ) == report["manifest_digest"]
+        command = project.app("serve", "-T", "-v", f"{reader}:/phase2/upgrade-reader:ro",
+                              "--entrypoint", "/phase2/upgrade-reader", args=("read", selector))
+        guarded = json.loads(phase1.capture(command, env=project.env))
+        assert guarded["generation"] == int(report["generation_id"])
+        assert guarded["manifest"] == report["manifest_digest"] and bytes(guarded["body"]) == sources[101]
     assert project.sql(
-        "SELECT encode(manifest_digest,'hex') FROM rfc.generations WHERE state = 'published'"
-    ) == first["manifest_digest"]
+        "SELECT count(*) FROM rfc.source_observations WHERE verification_method='legacy_https_verified'"
+    ) == str(first["verified_txt"])
     verify_ranges(project, first, sources)
     next_candidate = project.reconcile()
     assert next_candidate["reused_txt"] == first["verified_txt"]
+    assert next_candidate["txt_audit"]["reused_legacy"] == first["verified_txt"]
     assert next_candidate["metrics"]["txt"]["calls"] == 0
     project.verify_manifest(next_candidate)
-    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == f"{first['generation_id']}|1"
-    print("Schema 6 published data, source identities and strict reuse survived schema 7 upgrade", flush=True)
+    assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == f"{second['generation_id']}|2"
+    print(f"Schema {old_schema} retained and published data, source identities and strict reuse survived schema 9 upgrade", flush=True)
 
 
 def benchmark(args, docker, work, driver):
@@ -1103,6 +1128,8 @@ def main():
     parser.add_argument("--bulk-bootstrap", action="store_true", help="exercise bulk trust, promotion and capped faults")
     parser.add_argument("--upgrade-from", metavar="SCHEMA6_IMAGE_PREFIX",
                         help="upgrade a published fixture built by preloaded schema 6 images")
+    parser.add_argument("--upgrade-from-schema7", metavar="SCHEMA7_IMAGE_PREFIX",
+                        help="upgrade a published fixture built by preloaded schema 7 images")
     parser.add_argument("--benchmark", type=int, choices=(6, 96), nargs="+")
     parser.add_argument("--repeats", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--http-concurrency", type=int, choices=(1, 2), default=1)
@@ -1110,7 +1137,8 @@ def main():
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--reference-receipt", type=Path)
     args = parser.parse_args()
-    if sum(map(bool, (args.live, args.bulk, args.bulk_bootstrap, args.benchmark, args.upgrade_from))) > 1:
+    if sum(map(bool, (args.live, args.bulk, args.bulk_bootstrap, args.benchmark,
+                      args.upgrade_from, args.upgrade_from_schema7))) > 1:
         parser.error("select only one live, bulk, bulk-bootstrap, benchmark or upgrade profile")
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-phase2-", dir="/tmp") as root:
@@ -1152,15 +1180,19 @@ def main():
                 exercise_bulk(project)
             elif args.bulk_bootstrap:
                 exercise_bootstrap(project)
-            elif args.upgrade_from:
-                old_driver = work / "schema6-driver"
-                fixture_driver(docker, args.upgrade_from, old_driver, prebuilt=True)
-                exercise_schema7_upgrade(project, args.upgrade_from, old_driver)
+            elif args.upgrade_from or args.upgrade_from_schema7:
+                old_prefix = args.upgrade_from_schema7 or args.upgrade_from
+                old_schema = 7 if args.upgrade_from_schema7 else 6
+                old_driver = work / "previous-fixture-driver"
+                fixture_driver(docker, old_prefix, old_driver, prebuilt=True)
+                reader = work / "upgrade-reader"
+                fixture_driver(docker, args.image_prefix, reader, publication=True)
+                exercise_provenance_upgrade(project, old_prefix, old_driver, old_schema, reader)
             else:
                 exercise(project)
         finally:
             project.close()
-        if args.live or args.bulk or args.bulk_bootstrap or args.upgrade_from:
+        if args.live or args.bulk or args.bulk_bootstrap or args.upgrade_from or args.upgrade_from_schema7:
             return 0
         for name, exercise_case in (("resources", exercise_resources), ("timeout", exercise_timeout)):
             with ExitStack() as cleanup:

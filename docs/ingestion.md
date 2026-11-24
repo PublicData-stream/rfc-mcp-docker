@@ -78,21 +78,25 @@ After the first publication, `rsync_bootstrap` requires an HTTPS comparison for 
 
 The rsync metrics report session count, transferred file count, checksum hits and maximum validated inventory bytes. On a warm bulk run the validated inventory includes files whose content rsync confirmed without transferring.
 
-A future checkpoint cache could retain eligible proofs independently of a generation.
+### Interrupted reconciliation
 
 ```mermaid
 flowchart LR
     A[Staged TXT] --> B[Eligible TXT proof]
     B --> C[Canonical install and rehash]
     C --> D[Successful parse and committed provenance]
-    D --> E[Independent reusable proof]
+    D --> E[Bounded restart checkpoint]
     D --> F[Building candidate]
     F --> G[Ready]
     F --> H[Failed and recovered normally]
     E --> I[Eviction releases blob reference]
 ```
 
-A proof would pin its canonical blob through a reference independent of candidate state. To reuse it, check current catalog membership and staged bytes, revalidate the blob, and rebuild indexes with the current parser. Normal baseline reuse takes precedence. A proposed starting policy is seven days from verification, 4,096 proofs, and 512 MiB of uniquely referenced TXT. Expire old proofs, then evict least recently used proofs to satisfy both limits. A future additive migration would make proof insertion and removal atomic with the provenance and deletion queue under the coordinator fence. A crash before proof commit leaves the blob eligible for normal recovery. The current implementation uses full-generation baseline reuse.
+New verified TXT and successfully parsed RFCXML get their own committed checkpoints. Each checkpoint pins the original observation and canonical bytes independently of candidate state. A retry creates a new candidate, fetches the current catalog, and matches its exact digest, scope, effective TXT policy, publication sequence, parser and index versions, and registry version. A catalog mismatch at the end invalidates the attempt's checkpoints. Successful readiness clears them in the same transaction as the manifest.
+
+Sync still stages the selected TXT on retry. It uses a completed-generation baseline first where the policy permits, and only reuses a checkpoint when the staged and canonical bytes agree. It reparses TXT with the current parser. Sync rehashes and reparses cached RFCXML and uses the original observation and timestamps. Reports count these as `checkpoint_txt` and `rfcxml.reused`. The `rfcxml.captured` counter counts fresh valid captures. An expired RFCXML checkpoint is fetched through the regular HTTPS queue, where a fresh 404 or 410 uses normal TXT fallback. Parse errors and failed requests never produce a checkpoint. A missing canonical file can be reacquired. A conflicting canonical file invalidates the checkpoint and stops the attempt for repair.
+
+The cache admits up to 40,000 source records and 4 GiB of recorded body bytes across full and sample runs. Each record counts its length against the budget even when bytes are shared. TXT entries expire seven days after checkpoint creation, and RFCXML entries expire 24 hours after the original HTTPS fetch. Reuse keeps those deadlines. Sync removes expired entries and evicts the oldest remaining entries when space is needed. A crash before a checkpoint commits leaves the newly installed file eligible for ordinary GC.
 
 ## Reading candidate metadata
 
@@ -112,6 +116,6 @@ python3 scripts/phase1/integration.py --image-prefix rfc-phase2-regression
 python3 scripts/phase2/integration.py
 ~~~
 
-The fixture profile uses synthetic sources and the two reviewed RFC originals. The benchmark uses disposable projects and fixed fixture observation timestamps. Compare with `--benchmark 6 96 --http-concurrency 1` and again with `--http-concurrency 2`. Use `--receipt /tmp/benchmark.json` for the per-run results and `--reference-receipt /tmp/serial.json` for comparison against the instrumented serial revision. The fixture pace matches the official dispatch interval by default. Run `--live` only with explicit upstream authorization.
+The fixture profile uses synthetic sources and the two reviewed RFC originals. The benchmark uses disposable projects and fixed fixture observation timestamps. Compare with `--benchmark 6 96 --http-concurrency 1` and again with `--http-concurrency 2`. Use `--receipt /tmp/benchmark.json` for the per-run results and `--reference-receipt /tmp/serial.json` for comparison with a reference that uses the same observation identities. The fixture pace matches the official dispatch interval by default. Run `--live` only with explicit upstream authorization.
 
-Use Phase 2's `--bulk` for strict cold and warm bulk reconciliation and `--bulk-bootstrap` for rsync-only provenance, faults and promotion. Phase 6's `--bulk-bootstrap` exercises daemon publication and an MCP read. These offline profiles require `mkfs.ext4` and permission to mount a disposable loop filesystem under `/tmp`. For the published-data upgrade drill, pass `--upgrade-from` with the prefix of prebuilt schema 6 Sync and ingestion fixture images.
+Use Phase 2's `--bulk` for strict cold and warm bulk reconciliation and `--bulk-bootstrap` for rsync-only provenance, faults and promotion. Phase 6's `--bulk-bootstrap` exercises daemon publication and an MCP read. These offline profiles require `mkfs.ext4` and permission to mount a disposable loop filesystem under `/tmp`. For the populated schema 7 upgrade drill, pass `--upgrade-from-schema7` with the prefix of prebuilt schema 7 Sync and ingestion fixture images. Phase 3's `--checkpoints` runs the restart, expiry, quota and corruption probes.

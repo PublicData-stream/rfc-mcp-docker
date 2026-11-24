@@ -37,7 +37,7 @@ docker compose -f compose.yml -f deploy/compose.bulk-rsync.yml --env-file /path/
 
 For a new cluster, run the roles script and set the two role passwords interactively to match their provisioned files. For upgrades, start with existing roles. Back up the database and mirror as described in the [publication runbook](publication.md) before changing schema or images.
 
-For schema 7, drain Serve and Sync, take a matched database and mirror backup, apply the migration, and restart both services with schema 7 binaries. Existing configurations continue using strict batched ingestion. To turn off rsync-only trust after opt-in, stop Sync and set `txt_provenance = "dual_source"` on schema 7. Set `mode = "batched"` and drop the overlay to stop using persistent staging. Returning to a schema 6 binary requires restoring the matched pre-upgrade backup.
+For schema 9, close public ingress, drain Feed and Sync, and stop Serve. Take a matched database and mirror backup and retain the previous image references. Run the owner migrations, start the schema 9 images, and verify the active sequence, retained snapshots, `/ready` and a pinned MCP read before reopening ingress. Stop Sync and set `txt_provenance = "dual_source"` to turn off rsync-only trust while staying on schema 9. To return to schema 7 binaries, restore the matched pre-upgrade backup into fresh volumes and verify it with the previous images. The restored instance resumes at the backup's publication sequence.
 
 ```sh
 docker compose --env-file /path/to/rfc.env exec postgres psql -X -U postgres -d rfc -f /migrations/roles.sql

@@ -96,7 +96,7 @@ class Project(phase5.Project):
         self.sql("INSERT INTO rfc.sync_jobs (state, outcome) VALUES ('failed', 'schema-five-fixture')")
         self.migrate()
         self.migrate()
-        assert self.sql("SELECT max(version) FROM rfc.schema_migrations") == "8"
+        assert self.sql("SELECT max(version) FROM rfc.schema_migrations") == "9"
         assert self.sql("SELECT count(*) FROM rfc.sync_jobs WHERE outcome = 'schema-five-fixture'") == "1"
 
     def publication(self):

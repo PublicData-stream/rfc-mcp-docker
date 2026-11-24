@@ -17,7 +17,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSIONS: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+const SCHEMA_VERSIONS: [i32; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const READ_DEADLINE: Duration = Duration::from_secs(15);
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",
@@ -67,6 +67,7 @@ impl RuntimeRole {
                     "control_events",
                     "notification_outbox",
                     "blob_deletion_queue",
+                    "ingestion_checkpoints",
                 ] {
                     grants.push(format!("{name}:SELECT"));
                 }
@@ -138,6 +139,9 @@ impl RuntimeRole {
                         "promote_generation(bigint,bigint,boolean):EXECUTE",
                         "retire_generation(bigint,integer,integer,boolean):EXECUTE",
                         "mark_unreachable_blobs():EXECUTE",
+                        "prune_ingestion_checkpoints(text,bytea):EXECUTE",
+                        "remove_ingestion_checkpoints(text,bytea,integer,text):EXECUTE",
+                        "store_ingestion_checkpoint(text,bytea,integer,text,bytea):EXECUTE",
                         "queue_orphan_blobs(bytea[]):EXECUTE",
                         "finish_blob_deletion(bytea):EXECUTE",
                     ]

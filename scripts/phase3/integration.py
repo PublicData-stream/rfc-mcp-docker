@@ -123,7 +123,7 @@ def upgrade(project):
     project.check("sync", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8\n9"
     assert project.sql(f"SELECT state,manifest_format,encode(manifest_bytes,'hex') FROM rfc.generations WHERE id={old}") == "ready|1|0123"
     project.activate(old, 0, error="not eligible")
 
@@ -146,10 +146,133 @@ def check_ingestion_crashes(project, first):
         assert project.sql("SELECT count(*) FROM rfc.generations WHERE state='building'") == "0"
         assert project.sql("SELECT count(*) FROM rfc.blob_deletion_queue") == "0"
         if boundary == "after_readiness":
+            assert not saved_sources(project)
             ready = project.sql("SELECT id FROM rfc.generations ORDER BY id DESC LIMIT 1")
             assert project.state(ready) == "ready"
             project.invoke("sync", "discard", ready)
     print("Candidate and file durability interruptions preserve the active generation", flush=True)
+
+
+def saved_sources(project):
+    return json.loads(project.sql("""
+        SELECT coalesce(json_agg(json_build_object('rfc',c.rfc_id,'kind',c.kind,
+               'proof',encode(c.observation,'hex'),'digest',encode(o.raw_digest,'hex'),
+               'fetched',o.fetched_at,'expires',c.expires_at)), '[]')
+        FROM rfc.ingestion_checkpoints c JOIN rfc.source_observations o ON o.identity=c.observation
+    """))
+
+
+def change_cached_file(project, digest, script):
+    path = f"/mirror/blobs/blake3/{digest[:2]}/{digest}"
+    command = project.app("sync", "-T", "--entrypoint", "/bin/sh", args=("-ec", script, "sh", path))
+    run(command, env=project.env, stdout=subprocess.DEVNULL)
+
+
+def check_checkpoint_quota(project):
+    for entries, length, expected in ((40_000, 1, "40000|50001"), (1024, 4 * 1024**2, "1024|50001")):
+        observed = project.sql(f"""
+            BEGIN;
+            SELECT pg_advisory_xact_lock(-1);
+            DELETE FROM rfc.ingestion_checkpoints;
+            INSERT INTO rfc.ingestion_checkpoints
+                (scope,context,rfc_id,kind,observation,byte_length,recorded_at,expires_at)
+            SELECT 'sample',sha256('quota'::bytea),n,'txt',o.identity,{length},
+                   now()-interval '1 hour'+n*interval '1 microsecond',now()+interval '1 hour'
+            FROM generate_series(50000,{49999 + entries}) n
+            CROSS JOIN rfc.source_observations o
+            WHERE o.source_url='https://www.rfc-editor.org/rfc/rfc100.txt'
+              AND o.verification_method='dual_source';
+            SET LOCAL synchronous_commit = off;
+            SELECT rfc.store_ingestion_checkpoint('full',sha256('quota'::bytea),100,'txt',o.identity)
+            FROM rfc.source_observations o
+            WHERE o.source_url='https://www.rfc-editor.org/rfc/rfc100.txt'
+              AND o.verification_method='dual_source';
+            SHOW synchronous_commit;
+            SELECT u.entries,min(c.rfc_id) FILTER (WHERE c.scope='sample')
+            FROM rfc.ingestion_checkpoints c CROSS JOIN rfc.ingestion_checkpoint_usage u
+            GROUP BY u.entries HAVING u.entries=count(*) AND u.entries<=40000 AND sum(c.byte_length)<=4294967296;
+            ROLLBACK;
+        """)
+        assert observed.splitlines()[-2:] == ["on", expected], observed
+
+
+def exercise_checkpoints(project):
+    sources = phase2.prepare(project, include_nul=True)
+    project.start()
+    project.migrate()
+    project.run("up", "-d", "--wait", "fixtures", timeout=35)
+    project.denied_sql("SELECT * FROM rfc.ingestion_checkpoints", phase1.SERVE)
+    project.denied_sql("DELETE FROM rfc.ingestion_checkpoints", phase1.SYNC)
+    project.denied_sql("SELECT rfc.prune_ingestion_checkpoints(NULL, NULL)", phase1.SYNC, "55000")
+    project.invoke("sync", "full", crash="before_txt_checkpoint_commit")
+    assert not saved_sources(project)
+    project.invoke("sync", "full", crash="after_txt_checkpoint_commit")
+    first, = saved_sources(project)
+    assert first["kind"] == "txt"
+    project.maintain("recover")
+    assert saved_sources(project) == [first]
+    assert project.canonical(first["digest"]).is_file()
+    project.invoke("sync", "full", crash="before_xml_checkpoint_commit")
+    assert all(row["kind"] == "txt" for row in saved_sources(project))
+    project.invoke("sync", "full", crash="after_xml_checkpoint_commit")
+    assert sum(row["kind"] == "rfcxml" for row in saved_sources(project)) == 1
+    project.invoke("sync", "full", crash="before_readiness")
+    saved = {(row["rfc"], row["kind"]): row for row in saved_sources(project)}
+    assert len(saved) == len(sources) + 3, saved
+    assert saved[(first["rfc"], "txt")] == first
+    check_checkpoint_quota(project)
+    change_cached_file(project, saved[(8174, "rfcxml")]["digest"], 'rm -- "$1"')
+    project.sql("UPDATE rfc.ingestion_checkpoints SET expires_at=now()-interval '1 second'"
+                " WHERE rfc_id=102 AND kind='rfcxml'")
+    (project.source / "https/rfc102.xml").unlink()
+    for transport in ("rsync", "https"):
+        (project.source / transport / "rfc101.txt").write_bytes(sources[101] + b"\nUpdated TXT.\n")
+    ready = project.reconcile()
+    assert ready["checkpoint_txt"] == len(sources) - 1 and ready["metrics"]["txt"]["calls"] == 1, ready
+    assert ready["rfcxml"]["reused"] == ready["rfcxml"]["captured"] == 1, ready
+    assert ready["rfcxml"]["not_found"] == len(sources)-2, ready
+    assert not project.canonical(saved[(102, "rfcxml")]["digest"]).exists()
+    generation = int(ready["generation_id"])
+    retained = saved[(9110, "rfcxml")]
+    assert project.sql(
+        f"SELECT encode(txt_observation,'hex') FROM rfc.generation_documents"
+        f" WHERE generation_id={generation} AND rfc_id=101"
+    ) != saved[(101, "txt")]["proof"]
+    assert project.sql(
+        f"SELECT encode(o.identity,'hex'),o.fetched_at::text FROM rfc.generation_documents g"
+        f" JOIN rfc.source_observations o ON o.identity=g.rfcxml_observation"
+        f" WHERE g.generation_id={generation} AND g.rfc_id=9110"
+    ).split("|")[0] == retained["proof"]
+    assert not saved_sources(project) and project.state(generation) == "ready"
+    assert project.sql("SELECT publication_sequence FROM rfc.active_generation") == "0"
+    project.activate(generation, 0)
+    assert project.read()["manifest"] == ready["manifest_digest"]
+
+    changed_catalog(project, "Checkpoint drift probe")
+    project.invoke("sync", "full", crash="before_readiness")
+    assert saved_sources(project)
+    mode = project.source / "mode"
+    mode.write_text("catalog-drift")
+    project.reconcile(expected="catalog changed")
+    assert not saved_sources(project)
+    mode.write_text("normal")
+
+    source = project.source / "https/rfc9110.xml"
+    source.write_bytes(source.read_bytes() + b"\n")
+    project.invoke("sync", "full", crash="before_readiness")
+    suspect = next(row["digest"] for row in saved_sources(project) if row["rfc"] == 9110)
+    change_cached_file(project, suspect,
+                       'chmod u+w "$1"; printf x | dd of="$1" bs=1 conv=notrunc 2>/dev/null; chmod 0444 "$1"')
+    failure = project.reconcile(expected=f"rfcxml checkpoint {suspect} failed verification")
+    assert failure["rfcxml"]["reused"] <= 1
+    assert all(row["digest"] != suspect for row in saved_sources(project))
+    gc = project.maintain("gc")
+    assert gc["blocked_deletions"] == 1 and project.canonical(suspect).is_file(), gc
+    current = project.read()
+    assert current["generation"] == generation
+    assert bytes(current["body"]) == sources[101] + b"\nUpdated TXT.\n"
+    assert project.sql("SELECT publication_sequence FROM rfc.active_generation") == "1"
+    print("Checkpoint commits, retries, expiry, eviction, corruption and GC passed", flush=True)
 
 
 def check_discard_and_unlink(project):
@@ -231,7 +354,9 @@ END
 $observer$;
 """
                 _, observer_error = observer.communicate(watch, timeout=24)
-                assert observer.returncode == 0, observer_error
+                if observer.returncode != 0:
+                    reader_error = reader.communicate()[1] if reader.poll() is not None else "reader still running"
+                    raise AssertionError(f"{observer_error}\n{reader_error}")
                 stdout, stderr = release(collector)
                 assert collector.returncode == 0 and json.loads(stdout)["retired_generations"] == 1, stderr
                 stdout, stderr = reader.communicate(timeout=20)
@@ -356,6 +481,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", default="rfc-phase3-regression")
+    parser.add_argument("--checkpoints", action="store_true", help="run only the durable checkpoint scenarios")
     args = parser.parse_args()
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-phase3-", dir="/tmp") as directory:
@@ -364,6 +490,9 @@ def main():
         fixture_driver(docker, args.image_prefix, driver)
         project = Project(work / f"{work.name}-source", driver, args.image_prefix, docker)
         try:
+            if args.checkpoints:
+                exercise_checkpoints(project)
+                return
             exercise(project)
             fresh = Project(work / f"{work.name}-restore", driver, args.image_prefix, docker)
             try:
@@ -372,6 +501,11 @@ def main():
                 fresh.close()
         finally:
             project.close()
+        checkpoints = Project(work / f"{work.name}-checkpoints", driver, args.image_prefix, docker)
+        try:
+            exercise_checkpoints(checkpoints)
+        finally:
+            checkpoints.close()
 
 
 if __name__ == "__main__":

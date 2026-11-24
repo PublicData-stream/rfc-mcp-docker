@@ -1,13 +1,15 @@
 use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
+    checkpoint::{self, Context, Kind, SavedSources},
     config::{RsyncMode, SyncConfig, TxtProvenance},
     metrics::{Record, Stage},
     pipeline::{
         Event, Pipeline, Prepared, PreparedXml, PriorTxt, Selection, Shutdown, StagedTxt,
-        TxtEvidence, WorkId,
+        TxtEvidence, TxtVerification, WorkId,
     },
     policy::Registry,
     recovery::recover_before_ingestion,
+    register_blob,
     text::TextReference,
     upstream::{self, Capture, Download, MissingXml, Source, Upstream, XmlFailure},
     xml,
@@ -15,6 +17,7 @@ use crate::{
 use rfc_core::{BlobDigest, ByteRange, Coverage, GenerationId, Relation, RelationKind, RfcNumber};
 use rfc_storage::{
     blob::{BlobReader, BlobWriter, DurableBlob},
+    manifest::identity,
     postgres::{Result, mirror_root},
 };
 use serde::Serialize;
@@ -56,6 +59,16 @@ enum TxtPolicy {
     Published(i64),
 }
 
+impl TxtPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "dual_source",
+            Self::Bootstrap => "rsync_bootstrap",
+            Self::Published(_) => "active_rsync_or_dual_source",
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Report {
     scope: &'static str,
@@ -68,6 +81,7 @@ struct Report {
     verified_txt: usize,
     rsync_only_txt: usize,
     reused_txt: usize,
+    checkpoint_txt: usize,
     txt_audit: TxtAudit,
     catalog_only: usize,
     invalid_utf8: usize,
@@ -91,6 +105,7 @@ struct Report {
 #[derive(Default, Serialize)]
 struct XmlCounts {
     captured: usize,
+    reused: usize,
     not_found: usize,
     gone: usize,
     malformed: usize,
@@ -119,6 +134,7 @@ impl Report {
             verified_txt: 0,
             rsync_only_txt: 0,
             reused_txt: 0,
+            checkpoint_txt: 0,
             txt_audit: TxtAudit::default(),
             catalog_only: 0,
             invalid_utf8: 0,
@@ -346,6 +362,7 @@ struct CatalogWork {
     selection: Selection,
     before: BlobDigest,
     txt_policy: TxtPolicy,
+    checkpoint: Context,
 }
 
 struct SealedTxt {
@@ -373,7 +390,7 @@ fn pending_slot(
 
 impl Run<'_> {
     async fn collect(&mut self, pipeline: &mut Pipeline) -> Result<Candidate<'_>> {
-        let txt_policy = self.txt_policy().await?;
+        let (txt_policy, sequence) = self.txt_policy().await?;
         let start = self.catalog_capture().await?;
         let catalog = {
             let _parse = self.upstream.metrics().span(Stage::Parse);
@@ -407,7 +424,23 @@ impl Run<'_> {
             generation: self.id,
             catalog: BlobDigest::hash(&start.bytes),
         };
-        pipeline.prefetch_xml(selection, &ordered, 0);
+        let checkpoint = Context {
+            scope: self.scope.as_str(),
+            key: identity(
+                "rfc-ingestion-checkpoint-v1",
+                &(
+                    self.scope.as_str(),
+                    selection.catalog.to_string(),
+                    txt_policy.as_str(),
+                    sequence,
+                    PARSER,
+                    INDEX,
+                    &self.registry.version,
+                ),
+            )?,
+        };
+        let checkpoints = checkpoint.load(self.writer).await?;
+        pipeline.prefetch_xml(selection, &ordered, 0, &checkpoints, &self.reader);
         let baseline = self.baseline(txt_policy).await?;
         if self.scope == Scope::Full
             && let Some(missing) = baseline.keys().find(|id| !selected.contains(id))
@@ -437,10 +470,12 @@ impl Run<'_> {
             &catalog,
             &ordered,
             &baseline,
+            &checkpoints,
             CatalogWork {
                 selection,
                 before,
                 txt_policy,
+                checkpoint,
             },
         )
         .await?;
@@ -450,6 +485,7 @@ impl Run<'_> {
         let end_digest = self.install(Source::Catalog, end.bytes.clone()).await?;
         let after = self.store_catalog(&end, end_digest).await?;
         if end_digest != start_digest {
+            checkpoint.remove(&self.writer.client, None).await?;
             return Err("RFC catalog changed during reconciliation".into());
         }
         let _database = self.upstream.metrics().span(Stage::Database);
@@ -516,6 +552,7 @@ impl Run<'_> {
         if !validated {
             return Err("candidate failed membership or coverage validation".into());
         }
+        checkpoint.remove(&candidate.tx, None).await?;
         Ok(candidate)
     }
 
@@ -525,6 +562,7 @@ impl Run<'_> {
         catalog: &xml::Catalog,
         ordered: &[RfcNumber],
         baseline: &BTreeMap<RfcNumber, Option<PriorTxt>>,
+        checkpoints: &SavedSources,
         work: CatalogWork,
     ) -> Result<()> {
         let config = self.upstream.config().ingestion;
@@ -534,7 +572,13 @@ impl Run<'_> {
         let mut committed = 0;
         let mut pending = BTreeMap::<RfcNumber, Option<SealedTxt>>::new();
         while committed < ordered.len() {
-            pipeline.prefetch_xml(work.selection, ordered, committed);
+            pipeline.prefetch_xml(
+                work.selection,
+                ordered,
+                committed,
+                checkpoints,
+                &self.reader,
+            );
             if batch.is_none() && admitted == stage_end && admitted < ordered.len() {
                 stage_end = match config.rsync.mode {
                     RsyncMode::Batched => (admitted + config.rsync.batch_size).min(ordered.len()),
@@ -560,8 +604,11 @@ impl Run<'_> {
                             rfc,
                         },
                         bytes,
-                        baseline.get(&rfc).copied().flatten(),
-                        matches!(work.txt_policy, TxtPolicy::Bootstrap),
+                        TxtVerification {
+                            baseline: baseline.get(&rfc).copied().flatten(),
+                            checkpoint: checkpoints.txt.get(&rfc).copied(),
+                            bootstrap: matches!(work.txt_policy, TxtPolicy::Bootstrap),
+                        },
                         self.reader.clone(),
                         pending.len(),
                     )?;
@@ -583,8 +630,13 @@ impl Run<'_> {
                     }
                     self.report.current_rfc = Some(id.rfc.get());
                     *slot = Some(
-                        self.store_txt(id.rfc, &catalog.entries[&id.rfc], *prepared)
-                            .await?,
+                        self.store_txt(
+                            id.rfc,
+                            &catalog.entries[&id.rfc],
+                            *prepared,
+                            work.checkpoint,
+                        )
+                        .await?,
                     );
                 }
                 Event::Xml(id, xml) => {
@@ -598,7 +650,7 @@ impl Run<'_> {
                     self.store_membership(
                         id.rfc,
                         &catalog.entries[&id.rfc],
-                        work.before,
+                        work,
                         txt,
                         xml,
                         ordered,
@@ -610,9 +662,22 @@ impl Run<'_> {
                     }
                     committed += 1;
                 }
+                Event::Invalidated(id, kind) => {
+                    if id.selection != work.selection {
+                        return Err("checkpoint result belongs to another catalog selection".into());
+                    }
+                    work.checkpoint
+                        .remove(&self.writer.client, Some((id.rfc, kind)))
+                        .await?;
+                }
                 Event::Failed(id, error) => {
                     pending_slot(&mut pending, work.selection, id)?;
                     self.report.current_rfc = Some(id.rfc.get());
+                    if let Some(invalid) = error.downcast_ref::<checkpoint::Invalid>() {
+                        work.checkpoint
+                            .remove(&self.writer.client, Some((id.rfc, invalid.kind)))
+                            .await?;
+                    }
                     return Err(error);
                 }
             }
@@ -621,21 +686,23 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn txt_policy(&self) -> Result<TxtPolicy> {
-        if self.scope == Scope::Sample
-            || self.upstream.config().ingestion.txt_provenance == TxtProvenance::DualSource
-        {
-            return Ok(TxtPolicy::Strict);
-        }
+    async fn txt_policy(&self) -> Result<(TxtPolicy, i64)> {
         let row = self.writer.client.query_one(
             "SELECT generation_id, publication_sequence FROM rfc.active_generation WHERE singleton",
             &[],
         ).await?;
-        match (row.try_get::<_, Option<i64>>(0)?, row.try_get::<_, i64>(1)?) {
-            (None, 0) => Ok(TxtPolicy::Bootstrap),
-            (Some(id), 1..) => Ok(TxtPolicy::Published(id)),
-            _ => Err("invalid active publication state for TXT provenance policy".into()),
+        let sequence: i64 = row.try_get(1)?;
+        if self.scope == Scope::Sample
+            || self.upstream.config().ingestion.txt_provenance == TxtProvenance::DualSource
+        {
+            return Ok((TxtPolicy::Strict, sequence));
         }
+        let policy = match (row.try_get::<_, Option<i64>>(0)?, sequence) {
+            (None, 0) => TxtPolicy::Bootstrap,
+            (Some(id), 1..) => TxtPolicy::Published(id),
+            _ => return Err("invalid active publication state for TXT provenance policy".into()),
+        };
+        Ok((policy, sequence))
     }
 
     async fn baseline(&self, policy: TxtPolicy) -> Result<BTreeMap<RfcNumber, Option<PriorTxt>>> {
@@ -826,6 +893,7 @@ impl Run<'_> {
         id: RfcNumber,
         entry: &xml::Entry,
         prepared: Prepared,
+        checkpoint: Context,
     ) -> Result<SealedTxt> {
         self.upstream
             .metrics()
@@ -851,10 +919,6 @@ impl Run<'_> {
         let parsed = parsed.ok_or("missing TXT parser output")?;
         let mut indexed = parsed.data.into_view(&bytes, &parsed.headings)?;
         let durable = self.install_durable(source, bytes.clone()).await?;
-        {
-            let _database = self.upstream.metrics().span(Stage::Database);
-            self.writer.register_blob(durable).await?;
-        }
         let (policy, notices) =
             if let Some(notices) = self.registry.pagination_notices(id, digest, &bytes)? {
                 indexed.notice_state = Coverage::Complete;
@@ -873,6 +937,7 @@ impl Run<'_> {
             };
         let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
+        register_blob(&candidate.tx, durable).await?;
         let (txt, reused, rsync_only) = match txt_evidence {
             TxtEvidence::Prior(prior) => {
                 if prior.legacy {
@@ -881,6 +946,11 @@ impl Run<'_> {
                     self.report.txt_audit.reused_dual_source += 1;
                 }
                 (prior.observation, true, prior.rsync_only)
+            }
+            TxtEvidence::Checkpoint(saved) => {
+                self.report.checkpoint_txt += 1;
+                self.report.txt_audit.reused_dual_source += usize::from(!saved.rsync_only);
+                (saved.observation, true, saved.rsync_only)
             }
             TxtEvidence::HttpsMatch(capture, proof) => {
                 let rsync = observe_rsync(&candidate, id, proof, digest).await?;
@@ -931,7 +1001,14 @@ impl Run<'_> {
                 }),
             )
             .await?;
+        if !reused {
+            checkpoint.record(&candidate.tx, id, Kind::Txt, txt).await?;
+            rfc_storage::fixture_boundary("before_txt_checkpoint_commit");
+        }
         candidate.commit().await?;
+        if !reused {
+            rfc_storage::fixture_boundary("after_txt_checkpoint_commit");
+        }
         Ok(SealedTxt {
             version,
             observation: txt,
@@ -947,26 +1024,21 @@ impl Run<'_> {
         &mut self,
         id: RfcNumber,
         entry: &xml::Entry,
-        catalog: BlobDigest,
+        work: CatalogWork,
         txt: SealedTxt,
         xml: PreparedXml,
         selected: &[RfcNumber],
     ) -> Result<()> {
-        let optional = self.rfcxml(id, xml).await?;
+        let optional = self.rfcxml(id, xml, work.checkpoint).await?;
         let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
-        let xml_observation = match &optional.capture {
-            Some((capture, digest)) => {
-                Some(observe(&candidate, Source::Xml(id), capture, *digest).await?)
-            }
-            None => None,
-        };
+        let xml_observation = optional.observation;
         candidate
             .member_with_sources(
                 &Membership {
                     rfc: id,
                     version: txt.version,
-                    catalog,
+                    catalog: work.before,
                     txt: txt.observation,
                     title: &entry.title,
                     stream: entry.stream.as_deref(),
@@ -1040,13 +1112,28 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn rfcxml(&mut self, id: RfcNumber, xml: PreparedXml) -> Result<OptionalXml> {
+    async fn rfcxml(
+        &mut self,
+        id: RfcNumber,
+        xml: PreparedXml,
+        checkpoint: Context,
+    ) -> Result<OptionalXml> {
         let mut result = OptionalXml::default();
         let capture = match xml {
             PreparedXml::Captured(capture, references) => {
                 self.report.rfcxml.captured += 1;
                 result.references = Some(references);
                 Some(capture)
+            }
+            PreparedXml::Reused(saved, references) => {
+                self.report.rfcxml.reused += 1;
+                self.report.accept(
+                    saved.length,
+                    self.upstream.config().ingestion.max_accepted_bytes,
+                )?;
+                result.observation = Some(saved.observation);
+                result.references = Some(references);
+                None
             }
             PreparedXml::Malformed(capture, error) => {
                 self.report.rfcxml.malformed += 1;
@@ -1086,8 +1173,24 @@ impl Run<'_> {
                 capture.bytes.len(),
                 self.upstream.config().ingestion.max_accepted_bytes,
             )?;
-            let digest = self.install(Source::Xml(id), capture.bytes.clone()).await?;
-            result.capture = Some((capture, digest));
+            let durable = self
+                .install_durable(Source::Xml(id), capture.bytes.clone())
+                .await?;
+            let _database = self.upstream.metrics().span(Stage::Database);
+            let candidate = self.writer.batch(self.id).await?;
+            let digest = register_blob(&candidate.tx, durable).await?;
+            let observation = observe(&candidate, Source::Xml(id), &capture, digest).await?;
+            if result.references.is_some() {
+                checkpoint
+                    .record(&candidate.tx, id, Kind::Xml, observation)
+                    .await?;
+                rfc_storage::fixture_boundary("before_xml_checkpoint_commit");
+            }
+            candidate.commit().await?;
+            if result.references.is_some() {
+                rfc_storage::fixture_boundary("after_xml_checkpoint_commit");
+            }
+            result.observation = Some(observation);
         }
         Ok(result)
     }
@@ -1095,7 +1198,7 @@ impl Run<'_> {
 
 #[derive(Default)]
 struct OptionalXml {
-    capture: Option<(Capture, BlobDigest)>,
+    observation: Option<BlobDigest>,
     references: Option<xml::XmlReferences>,
     failed: bool,
 }
