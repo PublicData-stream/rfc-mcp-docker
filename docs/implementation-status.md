@@ -730,3 +730,9 @@ For the 9,861-RFC planning case, persistent bulk TXT still leaves 9,863 HTTPS st
 
 - `scripts/bootstrap/` contains the added benchmark profiles, image-cache timing, and shared initialization. `scripts/phase2/endpoint.py` generates private per-RFC HTTP timing and outcome receipts. The Docker CI workflows and runner add the paced quick case to native amd64.
 - `deploy/` and the README, ingestion, deployment and storage guides document the recognized configurations, first-publication checks, and backup or rollback procedures. The offline evidence directory is `/tmp/rfc-dual-phase8.kNsyYHym` on the qualification host. It contains `full-final/summary.json`, `paced/summary.json`, `serial.json`, `rollback-final/summary.json`, `image-cache-final/image-cache.json`, `restore/restore.json`, and the individual command logs and exit statuses.
+
+## Contributor and security guidance
+
+- On 2026-11-24, `scripts/phase0/check-rust.sh` passed with the pinned Rust toolchain and the existing locked dependency cache. The gate covered formatting, the frozen build, Clippy, workspace and documentation tests, documentation warnings, and the Phase 0 MCP wire probe. Cargo artifacts used `/tmp/rust/target`.
+- Checked the guide links and anchors, shell example syntax, and referenced repository paths. The Codex Security resolver discovered the root policy and applied it to the repository root, `apps/`, and `crates/`.
+- This documentation change used the offline gate. Runtime Compose probes apply when runtime dependencies, images, or isolation change.
