@@ -1,14 +1,19 @@
 //! Bounded producer tasks supervised by the ordered ingestion coordinator.
 
 use crate::{
-    config::RAW_PER_DOCUMENT,
+    bulk,
+    config::{RAW_PER_DOCUMENT, RsyncMode},
+    ingest::Scope,
     metrics::Stage,
     parse::{Budget, BudgetExceeded, DOCUMENT_BYTES, OwnedText},
     upstream::{Capture, Download, RsyncBatch, Source, Upstream},
     xml::{self, XmlReferences},
 };
 use rfc_core::{BlobDigest, RfcNumber};
-use rfc_storage::{blob::BlobReader, postgres::Result};
+use rfc_storage::{
+    blob::{BlobReader, BlobWriter},
+    postgres::Result,
+};
 use std::{io::Read, sync::Arc, time::Instant};
 use tokio::{
     sync::{Semaphore, watch},
@@ -67,8 +72,29 @@ pub(crate) enum VerifiedTxt {
 }
 
 pub(crate) enum Event {
-    Staged(Result<RsyncBatch>),
+    Staged(Result<StagedTxt>),
     Document(RfcNumber, Result<Box<Prepared>>),
+}
+
+pub(crate) enum StagedTxt {
+    Batch(RsyncBatch),
+    Bulk(bulk::Snapshot),
+}
+
+impl StagedTxt {
+    pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<Vec<u8>> {
+        match self {
+            Self::Batch(batch) => batch.take(store, id),
+            Self::Bulk(snapshot) => snapshot.take(store, id),
+        }
+    }
+
+    pub(crate) fn close(self) -> Result<()> {
+        match self {
+            Self::Batch(batch) => batch.close(),
+            Self::Bulk(_) => Ok(()),
+        }
+    }
 }
 
 pub(crate) struct Pipeline {
@@ -92,11 +118,20 @@ impl Pipeline {
         })
     }
 
-    pub(crate) fn stage(&mut self, ids: Vec<RfcNumber>) {
+    pub(crate) fn stage(&mut self, scope: Scope, ids: Vec<RfcNumber>, accepted_remaining: u64) {
         let upstream = self.upstream.clone();
         let shutdown = self.shutdown.clone();
-        self.tasks
-            .spawn(async move { Event::Staged(upstream.stage(&ids, &shutdown).await) });
+        self.tasks.spawn(async move {
+            let result = match upstream.config().ingestion.rsync.mode {
+                RsyncMode::Batched => upstream.stage(&ids, &shutdown).await.map(StagedTxt::Batch),
+                RsyncMode::PersistentBulk => {
+                    bulk::stage(&upstream, scope, &ids, accepted_remaining, &shutdown)
+                        .await
+                        .map(StagedTxt::Bulk)
+                }
+            };
+            Event::Staged(result)
+        });
     }
 
     pub(crate) fn prepare(

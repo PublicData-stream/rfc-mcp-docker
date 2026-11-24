@@ -2,9 +2,10 @@
 """Exercise source verification and candidate indexing in disposable Compose projects."""
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 from statistics import median
@@ -594,6 +595,84 @@ def prepare_benchmark(project, size):
     (project.source / "mode").write_text("benchmark")
 
 
+@contextmanager
+def capped_stage(project):
+    image = project.directory / "rsync.ext4"
+    mountpoint = project.directory / "rsync-mount"
+    mountpoint.mkdir()
+    with image.open("wb") as disk:
+        disk.truncate(64 * 1024**2)
+    run(["mkfs.ext4", "-q", "-N", "512", "-m", "0", str(image)])
+    run(["sudo", "-n", "mount", "-o", "loop,nosuid,nodev,noexec", str(image), str(mountpoint)])
+    try:
+        maps = phase1.capture([
+            *project.docker, "run", "--rm", "--network", "none",
+            "--entrypoint", "/bin/sh", project.env["PHASE1_IMAGE_PREFIX"] + "-sync",
+            "-c", "cat /proc/self/uid_map; echo :; cat /proc/self/gid_map",
+        ])
+        def host_id(mapping):
+            for line in mapping.strip().splitlines():
+                internal, external, count = map(int, line.split())
+                if internal <= 10002 < internal + count:
+                    return external + 10002 - internal
+            raise AssertionError("Sync UID or GID is outside the Docker namespace mapping")
+        uid, gid = map(host_id, maps.split(":"))
+        run(["sudo", "-n", "chown", f"{uid}:{gid}", str(mountpoint)])
+        run(["sudo", "-n", "chmod", "0700", str(mountpoint)])
+        yield mountpoint
+    finally:
+        run(["sudo", "-n", "umount", str(mountpoint)])
+
+
+def bulk_options(project, mountpoint):
+    config = project.directory / "bulk.toml"
+    config.write_text("schema_version = 1\n[ingestion.rsync]\nmode = 'persistent_bulk'\n")
+    return ("-v", f"{mountpoint}:/rfc-rsync-txt",
+            "-v", f"{config}:/phase2/bulk.toml:ro")
+
+
+def exercise_bulk(project):
+    size = 36
+    prepare_benchmark(project, size)
+    with capped_stage(project) as mountpoint:
+        project.start()
+        project.migrate()
+        project.run("up", "-d", "--wait", "fixtures", timeout=35)
+        options = bulk_options(project, mountpoint)
+        settings = ("RFC_SYNC_CONFIG_FILE=/phase2/bulk.toml", "RFC_PHASE2_FIXED_CLOCK=1")
+        first = project.reconcile(options=options, settings=settings)
+        metrics = first["metrics"]
+        assert metrics["rsync"]["calls"] == 1 and metrics["rsync_transferred_files"] == size, first
+        assert metrics["rsync_checksum_hits"] == 0 and metrics["https_requests"] == 2 * size + 2, first
+        assert first["contains_nul"] == 1 and first["invalid_utf8"] == 1
+        project.verify_manifest(first)
+        warm = project.reconcile(options=options, settings=settings)
+        metrics = warm["metrics"]
+        assert metrics["rsync"]["calls"] == 1 and metrics["rsync_transferred_files"] == 0, warm
+        assert metrics["rsync_checksum_hits"] == size and warm["reused_txt"] == size, warm
+        assert first["manifest_digest"] == warm["manifest_digest"]
+
+        source = project.source / "rsync/rfc10000.txt"
+        payload = source.read_bytes()
+        times = source.stat()
+        edited = payload.replace(b"Synthetic", b"Different", 1)
+        source.write_bytes(edited)
+        os.utime(source, ns=(times.st_atime_ns, times.st_mtime_ns))
+        https = project.source / "https/rfc10000.txt"
+        https.write_bytes(edited)
+        changed = project.reconcile(options=options, settings=settings)
+        assert changed["metrics"]["rsync_transferred_files"] == 1 and changed["reused_txt"] == size - 1
+        source.unlink()
+        source.symlink_to("rfc10001.txt")
+        project.reconcile(expected="bulk rsync", options=options, settings=settings)
+        source.unlink()
+        source.write_bytes(edited)
+        recovered = project.reconcile(options=options, settings=settings)
+        assert recovered["metrics"]["rsync_checksum_hits"] == size
+        assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == "|0"
+        assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "0"
+
+
 def benchmark(args, docker, work, driver):
     settings = ["RFC_PHASE2_FIXED_CLOCK=1", f"RFC_SYNC_HTTP_CONCURRENCY={args.http_concurrency}"]
     if not args.unpaced:
@@ -638,6 +717,7 @@ def main():
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", default="rfc-phase2-regression")
     parser.add_argument("--live", action="store_true")
+    parser.add_argument("--bulk", action="store_true", help="exercise persistent rsync with a disposable ext4 mount")
     parser.add_argument("--benchmark", type=int, choices=(6, 96), nargs="+")
     parser.add_argument("--repeats", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--http-concurrency", type=int, choices=(1, 2), default=1)
@@ -645,8 +725,8 @@ def main():
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--reference-receipt", type=Path)
     args = parser.parse_args()
-    if args.live and args.benchmark:
-        parser.error("the benchmark requires private fixtures")
+    if sum(map(bool, (args.live, args.bulk, args.benchmark))) > 1:
+        parser.error("select only one of --live, --bulk and --benchmark")
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-phase2-", dir="/tmp") as root:
         work = Path(root)
@@ -683,11 +763,13 @@ def main():
                 assert [entry["rfc"] for entry in observations] == [2119, 8174, 9110]
                 assert all(entry["https_verification"] == "verified" for entry in observations)
                 print(json.dumps({"txt_observations": observations}, sort_keys=True), flush=True)
+            elif args.bulk:
+                exercise_bulk(project)
             else:
                 exercise(project)
         finally:
             project.close()
-        if args.live:
+        if args.live or args.bulk:
             return 0
         for name, exercise_case in (("resources", exercise_resources), ("timeout", exercise_timeout)):
             with ExitStack() as cleanup:

@@ -10,8 +10,10 @@ min_request_start_interval_ms = 1000
 request_timeout_seconds = 30
 
 [ingestion.rsync]
+mode = "batched"
 batch_size = 32
 transfer_timeout_seconds = 120
+bulk_transfer_timeout_seconds = 900
 
 [ingestion.pipeline]
 max_pending_documents = 3

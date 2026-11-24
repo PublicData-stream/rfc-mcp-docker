@@ -9,6 +9,7 @@ use rfc_storage::{
 use std::os::fd::OwnedFd;
 use tokio_postgres::{Client, Transaction};
 
+mod bulk;
 mod config;
 mod daemon;
 mod ingest;

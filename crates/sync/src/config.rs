@@ -1,6 +1,7 @@
 //! Versioned ingestion settings and startup resource checks.
 
 use crate::{
+    bulk,
     parse::DOCUMENT_BYTES,
     upstream::{TXT_LIMIT, XML_LIMIT},
 };
@@ -54,8 +55,17 @@ pub(crate) struct Https {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Rsync {
+    pub(crate) mode: RsyncMode,
     pub(crate) batch_size: usize,
     pub(crate) transfer_timeout_seconds: u64,
+    pub(crate) bulk_transfer_timeout_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RsyncMode {
+    Batched,
+    PersistentBulk,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -98,8 +108,10 @@ impl Default for Https {
 impl Default for Rsync {
     fn default() -> Self {
         Self {
+            mode: RsyncMode::Batched,
             batch_size: MAX_RSYNC_BATCH,
             transfer_timeout_seconds: 120,
+            bulk_transfer_timeout_seconds: 900,
         }
     }
 }
@@ -129,6 +141,8 @@ struct Resources {
     memory_available_bytes: u64,
     cgroup_memory_limit_bytes: Option<u64>,
     physical_memory_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bulk_filesystem: Option<bulk::Capacity>,
 }
 
 /// Validates the same settings the daemon uses without opening its runtime services.
@@ -170,8 +184,11 @@ impl SyncConfig {
             .f_bavail
             .checked_mul(scratch.f_frsize)
             .ok_or("ingestion scratch capacity overflows")?;
-        let resources =
+        let mut resources =
             config.resources(scratch_available, physical_memory()?, cgroup_memory()?)?;
+        if config.ingestion.rsync.mode == RsyncMode::PersistentBulk {
+            resources.bulk_filesystem = Some(bulk::preflight()?);
+        }
         Ok(Summary {
             source,
             config,
@@ -237,6 +254,9 @@ impl SyncConfig {
         if !(30..=120).contains(&rsync.transfer_timeout_seconds) {
             return Err("transfer_timeout_seconds must be 30 through 120".into());
         }
+        if !(30..=900).contains(&rsync.bulk_transfer_timeout_seconds) {
+            return Err("bulk_transfer_timeout_seconds must be 30 through 900".into());
+        }
         if !(1..=MAX_PENDING_DOCUMENTS).contains(&pipeline.max_pending_documents) {
             return Err("max_pending_documents must be 1 through 3".into());
         }
@@ -255,7 +275,11 @@ impl SyncConfig {
     }
 
     fn resources(&self, scratch: u64, physical: u64, cgroup: Option<u64>) -> Result<Resources> {
-        let scratch_required = (self.ingestion.rsync.batch_size as u64)
+        let batch_size = match self.ingestion.rsync.mode {
+            RsyncMode::Batched => self.ingestion.rsync.batch_size as u64,
+            RsyncMode::PersistentBulk => 0,
+        };
+        let scratch_required = batch_size
             .checked_mul(TXT_LIMIT as u64)
             .and_then(|bytes| bytes.checked_add(8 * MIB))
             .ok_or("ingestion scratch reservation overflows")?;
@@ -287,6 +311,7 @@ impl SyncConfig {
             memory_available_bytes: memory_available,
             cgroup_memory_limit_bytes: cgroup,
             physical_memory_bytes: physical,
+            bulk_filesystem: None,
         })
     }
 }

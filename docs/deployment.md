@@ -22,6 +22,17 @@ The volume operation adjusts only the backing directories themselves. PostgreSQL
 
 Set `RFC_NOTIFY_DYNAMIC_RANGE` and `RFC_CONTROL_DYNAMIC_RANGE` to ranges within their corresponding private subnets and outside the fixed listener addresses. This reserves the listener addresses during concurrent startup and recreation. An omitted range uses the full subnet for compatibility with existing environment files. For a qualified upgrade, add the ranges to the private environment file and recreate the affected Compose networks after draining the application services. Preserve the bind-backed mirror and database directories.
 
+### Bulk rsync staging
+
+To enable `ingestion.rsync.mode = "persistent_bulk"`, provision a dedicated ext4 filesystem with at most 5 GiB and 24,576 inodes. Leave room for one replacement file and the small sample tree. Set the mounted filesystem root to mode `0700` and map its owner to Sync's container UID 10002. Mount with `nosuid,nodev,noexec`. Use distinct filesystems for staging, the canonical mirror, and PostgreSQL. The staging tree is private to Sync and can be regenerated from upstream.
+
+Set `RFC_SYNC_RSYNC_STAGE_DIR` to the filesystem's host mountpoint. Use the overlay for Sync startup and manual reconciliation. Run the preflight after the host mount is active.
+
+```sh
+docker compose -f compose.yml -f deploy/compose.bulk-rsync.yml --env-file /path/to/rfc.env config --quiet
+docker compose -f compose.yml -f deploy/compose.bulk-rsync.yml --env-file /path/to/rfc.env run --rm --no-deps rfc-mcp-docker-sync --check-config
+```
+
 ## Initialize or upgrade
 
 For a new cluster, run the roles script and set the two role passwords interactively to match their provisioned files. For upgrades, start with existing roles. Back up the database and mirror as described in the [publication runbook](publication.md) before changing schema or images.

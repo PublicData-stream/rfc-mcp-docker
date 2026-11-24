@@ -27,7 +27,8 @@ pub(crate) const TXT_LIMIT: usize = 4 * 1024 * 1024;
 pub(crate) const CATALOG_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) const XML_LIMIT: usize = 8 * 1024 * 1024;
 const OFFICIAL_HTTPS: &str = "https://www.rfc-editor.org";
-const OFFICIAL_RSYNC: &str = "rsync://rsync.rfc-editor.org/rfcs-text-only/";
+pub(crate) const OFFICIAL_RSYNC: &str = "rsync://rsync.rfc-editor.org/rfcs-text-only/";
+pub(crate) const MAX_CATALOG_ENTRIES: usize = 20_000;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Source {
@@ -189,6 +190,10 @@ impl Upstream {
 
     pub(crate) fn metrics(&self) -> Metrics {
         self.metrics.clone()
+    }
+
+    pub(crate) fn rsync_module(&self) -> &'static str {
+        self.rsync_module
     }
 
     pub(crate) async fn after_fence(&self) {
@@ -427,7 +432,7 @@ fn scratch_used() -> Option<u64> {
         .checked_mul(stats.f_frsize)
 }
 
-fn filename(id: RfcNumber) -> String {
+pub(crate) fn filename(id: RfcNumber) -> String {
     format!("rfc{}.txt", id.get())
 }
 
@@ -450,10 +455,10 @@ pub(crate) fn now_us() -> Result<i64> {
     )?)
 }
 
-struct ProcessGroup(Option<i32>);
+pub(crate) struct ProcessGroup(pub(crate) Option<i32>);
 
 impl ProcessGroup {
-    fn kill(&mut self) {
+    pub(crate) fn kill(&mut self) {
         if let Some(pid) = self.0.take() {
             // The spawned child is the leader of this private process group.
             unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -476,19 +481,7 @@ pub(crate) struct RsyncBatch {
 impl RsyncBatch {
     pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<Vec<u8>> {
         let name = filename(id);
-        let mut file = store.open_candidate(&self.incoming, &name)?;
-        let length = usize::try_from(file.metadata()?.len())?;
-        if length == 0 || length > TXT_LIMIT {
-            return Err("rsync TXT size exceeds bounds".into());
-        }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(length)?;
-        bytes.resize(length, 0);
-        file.read_exact(&mut bytes)?;
-        if file.read(&mut [0])? != 0 {
-            return Err("rsync TXT changed during read".into());
-        }
-        drop(file);
+        let bytes = read_staged(store, &self.incoming, &name, None)?;
         std::fs::remove_file(self.incoming.join(name))?;
         Ok(bytes)
     }
@@ -497,4 +490,28 @@ impl RsyncBatch {
         self.temp.close()?;
         Ok(())
     }
+}
+
+pub(crate) fn read_staged(
+    store: &BlobWriter,
+    directory: &std::path::Path,
+    name: &str,
+    expected_length: Option<usize>,
+) -> Result<Vec<u8>> {
+    let mut file = store.open_candidate(directory, name)?;
+    let length = usize::try_from(file.metadata()?.len())?;
+    if length == 0
+        || length > TXT_LIMIT
+        || expected_length.is_some_and(|expected| expected != length)
+    {
+        return Err("rsync TXT size exceeds bounds or changed after inventory check".into());
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length)?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes)?;
+    if file.read(&mut [0])? != 0 {
+        return Err("rsync TXT changed during read".into());
+    }
+    Ok(bytes)
 }

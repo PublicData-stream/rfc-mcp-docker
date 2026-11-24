@@ -22,19 +22,23 @@ Production Compose mounts the [ingestion TOML](../deploy/ingestion.toml.example)
 | `ingestion.https.max_in_flight_requests` | 2 | 1–2 |
 | `ingestion.https.min_request_start_interval_ms` | 1000 | 1000–60000 |
 | `ingestion.https.request_timeout_seconds` | 30 | 5–30 |
+| `ingestion.rsync.mode` | `batched` | `batched`, `persistent_bulk` |
 | `ingestion.rsync.batch_size` | 32 | 1–32 |
 | `ingestion.rsync.transfer_timeout_seconds` | 120 | 30–120 |
+| `ingestion.rsync.bulk_transfer_timeout_seconds` | 900 | 30–900 |
 | `ingestion.pipeline.max_pending_documents` | 3 | 1–3 |
 | `ingestion.pipeline.parser_workers` | 1 | 1–2 |
 | `ingestion.max_accepted_bytes` | 4294967296 | 1–4294967296 |
 
-The pending-document window must fit both concurrency settings. The HTTPS request timeout includes the fixed five-second connect timeout. The rsync transfer timeout applies to one batch, including its fixed 30-second inactivity timeout. The accepted-byte cap is cumulative across the two catalog captures, accepted TXT and captured RFCXML. The 12-hour run deadline applies independently.
+The pending-document window must fit both concurrency settings. The HTTPS request timeout includes the fixed five-second connect timeout. The rsync timeouts apply to one batch or one bulk session, each with a fixed 30-second inactivity timeout. The accepted-byte cap is cumulative across the two catalog captures, accepted TXT and captured RFCXML. The 12-hour run deadline applies independently.
 
-Run `rfc-mcp-docker-sync --check-config` to see the effective settings and resource reservations as JSON. The check uses the same startup validation without opening the mirror or connecting to PostgreSQL or upstream. Sync reserves 4 MiB per batch entry plus 8 MiB for scratch. Its RAM estimate includes that scratch, 144 MiB per pending document, and 512 MiB of working memory. The 512 MiB scratch and 2 GiB RAM envelope is tightened by available space on `/tmp`, physical memory, and visible cgroup v2 memory limits. Run the check inside the target container to measure its limits. Sync uses the validated snapshot until restart.
+Run `rfc-mcp-docker-sync --check-config` to see the effective settings and resource reservations as JSON. The check uses the same startup validation without contacting PostgreSQL or upstream. Sync reserves 8 MiB for scratch and another 4 MiB per batch entry in batched mode. Its RAM estimate includes that scratch, 144 MiB per pending document, and 512 MiB of working memory. The 512 MiB scratch and 2 GiB RAM envelope is tightened by available space on `/tmp`, physical memory, and visible cgroup v2 memory limits. Run the check inside the target container to measure its limits. Sync uses the validated snapshot until restart.
 
 When `RFC_SYNC_CONFIG_FILE` is unset, `RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_PARSE_CONCURRENCY` are accepted for compatibility. Both accept `1` or `2`. Setting either alongside `RFC_SYNC_CONFIG_FILE` fails validation. [Compose provisioning and preflight](deployment.md#provision)
 
 ## Pipeline and recovery
+
+Bulk mode runs one rsync session for the selected RFCs. It keeps full and sample working trees on a separate capped filesystem. Sync checks the rsync receipt and the complete inventory before any file enters the bounded document window. Subsequent sessions use the existing files as checksum-verified transfer bases. A failed or interrupted session can leave some files updated. A retry must finish a fresh rsync session and validate the whole selection before using those bytes. [Bulk mount provisioning](deployment.md#bulk-rsync-staging)
 
 ```mermaid
 flowchart LR

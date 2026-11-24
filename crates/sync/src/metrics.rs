@@ -45,6 +45,8 @@ pub(crate) struct Record {
     pub https_peak: u64,
     pub minimum_start_spacing_us: Option<u64>,
     pub rsync_peak_bytes: u64,
+    pub rsync_transferred_files: usize,
+    pub rsync_checksum_hits: usize,
     pub scratch_peak_bytes: Option<u64>,
     pub out_of_order: u64,
     pub admitted_peak: u64,
@@ -131,6 +133,18 @@ impl Metrics {
         let mut record = self.0.lock().unwrap();
         record.rsync_peak_bytes = record.rsync_peak_bytes.max(bytes);
         record.scratch_peak_bytes = record.scratch_peak_bytes.max(scratch);
+    }
+
+    pub(crate) fn bulk_staged(&self, bytes: u64, transferred: usize, unchanged: usize) {
+        let mut record = self.0.lock().unwrap();
+        record.rsync_peak_bytes = record.rsync_peak_bytes.max(bytes);
+        record.rsync_transferred_files += transferred;
+        record.rsync_checksum_hits += unchanged;
+        #[cfg(feature = "phase2-fixtures")]
+        {
+            record.rsync_files += transferred + unchanged;
+            record.rsync_payload_bytes += bytes;
+        }
     }
 
     #[cfg(feature = "phase2-fixtures")]

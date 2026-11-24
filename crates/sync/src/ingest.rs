@@ -1,8 +1,8 @@
 use crate::{
     Candidate, Document, Evidence, IndexedText, Membership, Observation, Writer,
-    config::SyncConfig,
+    config::{RsyncMode, SyncConfig},
     metrics::{Record, Stage},
-    pipeline::{Event, Pipeline, Prepared, PriorTxt, Shutdown, VerifiedTxt},
+    pipeline::{Event, Pipeline, Prepared, PriorTxt, Shutdown, StagedTxt, VerifiedTxt},
     policy::Registry,
     recovery::recover_before_ingestion,
     upstream::{self, Capture, Download, Source, Upstream},
@@ -307,7 +307,7 @@ impl Run<'_> {
             let _parse = self.upstream.metrics().span(Stage::Parse);
             xml::catalog(&start.bytes)?
         };
-        if catalog.entries.len() > 20_000 {
+        if catalog.entries.len() > upstream::MAX_CATALOG_ENTRIES {
             return Err("catalog entry count exceeds bounds".into());
         }
         let selected: BTreeSet<_> = if self.scope == Scope::Full {
@@ -435,7 +435,7 @@ impl Run<'_> {
     ) -> Result<()> {
         let ordered: Vec<_> = selected.iter().copied().collect();
         let config = self.upstream.config().ingestion;
-        let mut batch: Option<upstream::RsyncBatch> = None;
+        let mut batch: Option<StagedTxt> = None;
         let mut staging = false;
         let mut stage_end = 0;
         let mut admitted = 0;
@@ -445,8 +445,15 @@ impl Run<'_> {
         let mut stage_error = None;
         while committed < ordered.len() {
             if !failed && !staging && batch.is_none() && admitted < ordered.len() {
-                stage_end = (admitted + config.rsync.batch_size).min(ordered.len());
-                pipeline.stage(ordered[admitted..stage_end].to_vec());
+                stage_end = match config.rsync.mode {
+                    RsyncMode::Batched => (admitted + config.rsync.batch_size).min(ordered.len()),
+                    RsyncMode::PersistentBulk => ordered.len(),
+                };
+                pipeline.stage(
+                    self.scope,
+                    ordered[admitted..stage_end].to_vec(),
+                    config.max_accepted_bytes - self.report.accepted_bytes,
+                );
                 staging = true;
             }
             if !failed && let Some(staged) = batch.as_ref() {
