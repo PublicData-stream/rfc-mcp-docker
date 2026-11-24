@@ -4,9 +4,7 @@ use crate::{
     ingest::Scope,
     metrics::{Stage, StageLease},
     pipeline::Shutdown,
-    upstream::{
-        MAX_CATALOG_ENTRIES, ProcessGroup, TXT_LIMIT, Upstream, filename, now_us, read_staged,
-    },
+    upstream::{MAX_CATALOG_ENTRIES, ProcessGroup, TXT_LIMIT, Upstream, filename, read_staged},
 };
 use rfc_core::RfcNumber;
 use rfc_storage::{blob::BlobWriter, postgres::Result};
@@ -270,7 +268,7 @@ pub(crate) async fn stage(
         return Err(format!("bulk rsync failed ({status})").into());
     }
     group.0 = None;
-    let observed_us = now_us()?;
+    let observed_us = upstream.rsync_observed_us()?;
     let files = parse_receipt(&receipt, &names, accepted_remaining)?;
     let mut count = 0;
     for entry in fs::read_dir(&inventory)? {

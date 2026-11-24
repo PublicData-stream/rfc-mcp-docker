@@ -63,6 +63,7 @@ pub(crate) struct PriorTxt {
     pub digest: BlobDigest,
     pub observation: BlobDigest,
     pub rsync_only: bool,
+    pub legacy: bool,
 }
 
 pub(crate) struct Prepared {
@@ -94,7 +95,7 @@ pub(crate) enum PreparedXml {
 
 pub(crate) enum TxtEvidence {
     Prior(PriorTxt),
-    HttpsMatch(Capture),
+    HttpsMatch(Capture, bulk::Proof),
     Rsync(bulk::Proof),
     Mismatch(Capture),
 }
@@ -113,7 +114,7 @@ pub(crate) enum StagedTxt {
 
 pub(crate) struct StagedBody {
     bytes: Vec<u8>,
-    rsync: Option<bulk::Proof>,
+    rsync: bulk::Proof,
 }
 
 impl StagedTxt {
@@ -121,14 +122,14 @@ impl StagedTxt {
         match self {
             Self::Batch(batch) => Ok(StagedBody {
                 bytes: batch.take(store, id)?,
-                rsync: None,
+                rsync: bulk::Proof {
+                    observed_us: batch.observed_us,
+                    fetched_us: Some(batch.observed_us),
+                },
             }),
             Self::Bulk(snapshot) => {
                 let (bytes, rsync) = snapshot.take(store, id)?;
-                Ok(StagedBody {
-                    bytes,
-                    rsync: Some(rsync),
-                })
+                Ok(StagedBody { bytes, rsync })
             }
         }
     }
@@ -391,7 +392,7 @@ async fn verify_txt(
     let StagedBody { bytes, rsync } = body;
     let digest = BlobDigest::hash(&bytes);
     let txt_evidence = if rsync_bootstrap {
-        TxtEvidence::Rsync(rsync.ok_or("rsync bootstrap requires a completed bulk snapshot")?)
+        TxtEvidence::Rsync(rsync)
     } else if let Some(prior) = prior.filter(|prior| prior.digest == digest)
         && revalidate(reader, &bytes, digest)?
     {
@@ -410,7 +411,7 @@ async fn verify_txt(
             });
         }
         capture.bytes = Arc::default();
-        TxtEvidence::HttpsMatch(capture)
+        TxtEvidence::HttpsMatch(capture, rsync)
     };
     Ok(Prepared {
         bytes: Arc::new(bytes),

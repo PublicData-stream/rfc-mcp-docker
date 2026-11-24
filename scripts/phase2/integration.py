@@ -158,7 +158,7 @@ COMMIT;
     assert project.sql("SELECT version FROM rfc.schema_migrations") == "1"
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8"
 
 
 def verify_ranges(project, report, sources, txt_verification="verified"):
@@ -291,6 +291,26 @@ def exercise(project):
     assert first["metrics"]["https_peak"] == 2 and first["metrics"]["out_of_order"] > 0
     mode.write_text("normal")
     assert first["verified_txt"] == len(sources) and first["reused_txt"] == 0
+    assert first["txt_audit"]["matched"] == len(sources)
+    assert project.sql(
+        "SELECT count(*) FROM rfc.source_observations h JOIN rfc.source_observations r"
+        " ON r.identity=h.comparison_rsync AND r.raw_digest=h.raw_digest"
+        " WHERE h.verification_method='dual_source' AND r.verification_method='rsync_integrity'"
+        " AND r.source_url='rsync://rsync.rfc-editor.org/rfcs-text-only/' || split_part(h.source_url,'/',5)",
+        phase1.SERVE,
+    ) == str(len(sources))
+    for digest, peer in (
+        ("p.raw_digest", "p.raw_digest <> h.raw_digest AND r.identity=h.comparison_rsync"),
+        ("p.raw_digest", "p.raw_digest <> h.raw_digest AND r.identity=p.identity"),
+    ):
+        project.denied_sql(
+            "INSERT INTO rfc.source_observations "
+            "(identity,kind,source_url,observed_at,fetched_at,raw_digest,https_verification,comparison_rsync) "
+            f"SELECT sha256(h.identity),'txt',h.source_url,now(),now(),{digest},'verified',r.identity "
+            "FROM rfc.source_observations h CROSS JOIN rfc.source_observations p CROSS JOIN rfc.source_observations r "
+            "WHERE h.verification_method='dual_source' AND p.verification_method='rsync_integrity' AND "
+            + peer + " LIMIT 1", phase1.SYNC, state="23514",
+        )
     assert first["invalid_utf8"] == first["contains_nul"] == 1
     verify_ranges(project, first, sources)
     project.verify_manifest(first)
@@ -298,6 +318,7 @@ def exercise(project):
     catalog.write_text(catalog.read_text().replace("Synthetic XML classification", "Updated catalog metadata"))
     second = project.reconcile()
     assert second["reused_txt"] == len(sources)
+    assert second["txt_audit"]["reused_dual_source"] == len(sources)
     assert second["metrics"]["https_requests"] == len(sources) + 2
     assert second["invalid_utf8"] == second["contains_nul"] == 1
     assert project.sql("SELECT count(*) FROM rfc.document_versions") == str(len(sources))
@@ -353,6 +374,7 @@ def exercise(project):
     original.unlink()
     original.write_bytes(b"Different same-ID candidate.\x00\n")
     mismatch = project.reconcile(expected="rsync and HTTPS TXT disagree")
+    assert mismatch["txt_audit"]["mismatched"] == 1
     assert mismatch["metrics"]["received_bytes"] > 0
     for filename, expected in (("body", original.read_bytes()), ("https-body", sources[100])):
         quarantine = project.app("sync", "-T", "--entrypoint", "/bin/sh", args=(
@@ -1010,7 +1032,7 @@ def exercise_schema7_upgrade(project, old_prefix, old_driver):
     before = project.sql(query)
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "7"
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "8"
     assert project.sql(query) == before
     assert project.sql("SELECT count(*) FROM rfc.source_observations WHERE source_transport <> 'https'") == "0"
     assert project.sql(

@@ -140,7 +140,7 @@ class Deployment:
                      "-d", "rfc", input=password_sql)
         self.sql("-f", "/migrations/bootstrap.sql")
         self.sql("-f", "/migrations/migrate.sql")
-        assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "7"
+        assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "8"
         assert self.sql("-c", "SELECT current_setting('server_encoding') || ':' || datlocale || ':' "
                         "|| datlocprovider::text FROM pg_database WHERE datname = current_database()") == "UTF8:und:i"
         assert self.sql("-c", "SELECT has_table_privilege('rfc_serve','rfc.generation_documents','INSERT')") == "f"

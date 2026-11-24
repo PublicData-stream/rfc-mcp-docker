@@ -456,6 +456,14 @@ impl Upstream {
         None
     }
 
+    pub(crate) fn rsync_observed_us(&self) -> Result<i64> {
+        #[cfg(feature = "phase2-fixtures")]
+        if self.fixture_clock.is_some() {
+            return Ok(1_790_000_009_000_000);
+        }
+        now_us()
+    }
+
     pub(crate) async fn stage(&self, ids: &[RfcNumber], shutdown: &Shutdown) -> Result<RsyncBatch> {
         let _timing = self.metrics.span(Stage::Rsync);
         let rsync = self.config.ingestion.rsync;
@@ -561,6 +569,7 @@ impl Upstream {
         Ok(RsyncBatch {
             temp,
             incoming,
+            observed_us: self.rsync_observed_us()?,
             _lease: lease,
         })
     }
@@ -631,6 +640,7 @@ impl Drop for ProcessGroup {
 pub(crate) struct RsyncBatch {
     temp: tempfile::TempDir,
     incoming: std::path::PathBuf,
+    pub(crate) observed_us: i64,
     _lease: StageLease,
 }
 

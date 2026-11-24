@@ -52,4 +52,10 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 7) AS apply
 \ir 0007-rsync-provenance.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (7);
 \endif
+SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 8) AS apply_v8
+\gset
+\if :apply_v8
+\ir 0008-txt-comparison.sql
+INSERT INTO rfc.schema_migrations (version) VALUES (8);
+\endif
 COMMIT;

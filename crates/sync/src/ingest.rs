@@ -68,6 +68,7 @@ struct Report {
     verified_txt: usize,
     rsync_only_txt: usize,
     reused_txt: usize,
+    txt_audit: TxtAudit,
     catalog_only: usize,
     invalid_utf8: usize,
     contains_nul: usize,
@@ -97,6 +98,14 @@ struct XmlCounts {
     terminal_failure: usize,
 }
 
+#[derive(Default, Serialize)]
+struct TxtAudit {
+    matched: usize,
+    mismatched: usize,
+    reused_dual_source: usize,
+    reused_legacy: usize,
+}
+
 impl Report {
     fn new(scope: Scope) -> Self {
         Self {
@@ -110,6 +119,7 @@ impl Report {
             verified_txt: 0,
             rsync_only_txt: 0,
             reused_txt: 0,
+            txt_audit: TxtAudit::default(),
             catalog_only: 0,
             invalid_utf8: 0,
             contains_nul: 0,
@@ -641,7 +651,7 @@ impl Run<'_> {
                      WHEN $1::bigint IS NOT NULL AND o.source_transport = 'rsync'
                          AND o.source_url = 'rsync://rsync.rfc-editor.org/rfcs-text-only/rfc' || d.rfc_id || '.txt'
                      THEN true
-                END
+                END, o.verification_method = 'legacy_https_verified'
              FROM rfc.generation_documents d JOIN rfc.source_observations o ON o.identity = d.txt_observation
              WHERE o.kind = 'txt' AND d.generation_id = coalesce($1, (SELECT g.id FROM rfc.generations g
                  JOIN rfc.generation_ingestion i ON i.generation_id = g.id
@@ -658,6 +668,7 @@ impl Run<'_> {
                         observation: BlobDigest::from_hex(row.try_get(2)?)
                             .ok_or("invalid baseline observation")?,
                         rsync_only,
+                        legacy: row.try_get(4)?,
                     })
                 } else {
                     None
@@ -832,6 +843,7 @@ impl Run<'_> {
         )?;
         let source = Source::Txt(id);
         if let TxtEvidence::Mismatch(capture) = &txt_evidence {
+            self.report.txt_audit.mismatched += 1;
             self.store
                 .quarantine_mismatch(&bytes, &capture.bytes, source.limit())?;
             return Err(format!("RFC {} rsync and HTTPS TXT disagree", id.get()).into());
@@ -862,25 +874,27 @@ impl Run<'_> {
         let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
         let (txt, reused, rsync_only) = match txt_evidence {
-            TxtEvidence::Prior(prior) => (prior.observation, true, prior.rsync_only),
-            TxtEvidence::HttpsMatch(capture) => (
-                observe(&candidate, source, &capture, digest).await?,
-                false,
-                false,
-            ),
-            TxtEvidence::Rsync(proof) => {
+            TxtEvidence::Prior(prior) => {
+                if prior.legacy {
+                    self.report.txt_audit.reused_legacy += 1;
+                } else if !prior.rsync_only {
+                    self.report.txt_audit.reused_dual_source += 1;
+                }
+                (prior.observation, true, prior.rsync_only)
+            }
+            TxtEvidence::HttpsMatch(capture, proof) => {
+                let rsync = observe_rsync(&candidate, id, proof, digest).await?;
                 let observation = candidate
-                    .observe(&Observation {
-                        kind: "txt",
-                        url: &format!("{}{}", upstream::OFFICIAL_RSYNC, upstream::filename(id)),
-                        observed_us: proof.observed_us,
-                        fetched_us: proof.fetched_us,
-                        etag: None,
-                        last_modified: None,
-                        raw_digest: digest,
-                        https_verification: "unverified",
-                    })
+                    .observe_comparison(
+                        &https_observation(source.kind(), &source.url(), &capture, digest),
+                        rsync,
+                    )
                     .await?;
+                self.report.txt_audit.matched += 1;
+                (observation, false, false)
+            }
+            TxtEvidence::Rsync(proof) => {
+                let observation = observe_rsync(&candidate, id, proof, digest).await?;
                 (observation, false, true)
             }
             TxtEvidence::Mismatch(_) => unreachable!("mismatches are quarantined before commit"),
@@ -1101,15 +1115,49 @@ async fn observe(
     digest: BlobDigest,
 ) -> Result<BlobDigest> {
     candidate
+        .observe(&https_observation(
+            source.kind(),
+            &source.url(),
+            capture,
+            digest,
+        ))
+        .await
+}
+
+fn https_observation<'a>(
+    kind: &'a str,
+    url: &'a str,
+    capture: &'a Capture,
+    digest: BlobDigest,
+) -> Observation<'a> {
+    Observation {
+        kind,
+        url,
+        observed_us: capture.observed_us,
+        fetched_us: Some(capture.fetched_us),
+        etag: capture.etag.as_deref(),
+        last_modified: capture.last_modified.as_deref(),
+        raw_digest: digest,
+        https_verification: "verified",
+    }
+}
+
+async fn observe_rsync(
+    candidate: &Candidate<'_>,
+    id: RfcNumber,
+    proof: crate::bulk::Proof,
+    digest: BlobDigest,
+) -> Result<BlobDigest> {
+    candidate
         .observe(&Observation {
-            kind: source.kind(),
-            url: &source.url(),
-            observed_us: capture.observed_us,
-            fetched_us: Some(capture.fetched_us),
-            etag: capture.etag.as_deref(),
-            last_modified: capture.last_modified.as_deref(),
+            kind: "txt",
+            url: &format!("{}{}", upstream::OFFICIAL_RSYNC, upstream::filename(id)),
+            observed_us: proof.observed_us,
+            fetched_us: proof.fetched_us,
+            etag: None,
+            last_modified: None,
             raw_digest: digest,
-            https_verification: "verified",
+            https_verification: "unverified",
         })
         .await
 }

@@ -236,28 +236,46 @@ impl Candidate<'_> {
     }
 
     pub async fn observe(&self, observation: &Observation<'_>) -> Result<BlobDigest> {
-        let id = identity(
-            "rfc-source-observation-v1",
-            &(
-                observation.kind,
-                observation.url,
-                observation.observed_us,
-                observation.fetched_us,
-                observation.etag,
-                observation.last_modified,
-                observation.raw_digest.to_string(),
-                observation.https_verification,
-            ),
-        )?;
+        self.insert_observation(observation, None).await
+    }
+
+    /// Records the HTTPS side of a byte comparison and binds the rsync proof.
+    pub async fn observe_comparison(
+        &self,
+        https: &Observation<'_>,
+        rsync: BlobDigest,
+    ) -> Result<BlobDigest> {
+        self.insert_observation(https, Some(rsync)).await
+    }
+
+    async fn insert_observation(
+        &self,
+        observation: &Observation<'_>,
+        comparison_rsync: Option<BlobDigest>,
+    ) -> Result<BlobDigest> {
+        let inputs = (
+            observation.kind,
+            observation.url,
+            observation.observed_us,
+            observation.fetched_us,
+            observation.etag,
+            observation.last_modified,
+            observation.raw_digest.to_string(),
+            observation.https_verification,
+        );
+        let id = match comparison_rsync {
+            Some(rsync) => identity("rfc-source-observation-v2", &(inputs, rsync.to_string()))?,
+            None => identity("rfc-source-observation-v1", &inputs)?,
+        };
         self.tx.execute(
-            "INSERT INTO rfc.source_observations (identity, kind, source_url, observed_at, fetched_at, etag, last_modified, raw_digest, https_verification)
+            "INSERT INTO rfc.source_observations (identity, kind, source_url, observed_at, fetched_at, etag, last_modified, raw_digest, https_verification, comparison_rsync)
              VALUES ($1::bytea, $2, $3,
                timestamptz 'epoch' + ($4::bigint / 1000000) * interval '1 second' + ($4::bigint % 1000000) * interval '1 microsecond',
                timestamptz 'epoch' + ($5::bigint / 1000000) * interval '1 second' + ($5::bigint % 1000000) * interval '1 microsecond',
-               $6, $7, $8::bytea, $9) ON CONFLICT DO NOTHING",
+               $6, $7, $8::bytea, $9, $10::bytea) ON CONFLICT DO NOTHING",
             &[&id.as_bytes().as_slice(), &observation.kind, &observation.url, &observation.observed_us,
               &observation.fetched_us, &observation.etag, &observation.last_modified, &observation.raw_digest.as_bytes().as_slice(),
-              &observation.https_verification],
+              &observation.https_verification, &comparison_rsync.as_ref().map(|peer| peer.as_bytes().as_slice())],
         ).await?;
         Ok(id)
     }

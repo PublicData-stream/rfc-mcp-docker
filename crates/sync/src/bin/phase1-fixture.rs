@@ -72,17 +72,32 @@ async fn populate() -> Result<()> {
         for &(number, bytes, blob) in &texts {
             let rfc = RfcNumber::new(number).unwrap();
             let url = format!("https://www.rfc-editor.org/rfc/rfc{number}.txt");
-            let txt = candidate
+            let peer = candidate
                 .observe(&Observation {
                     kind: "txt",
-                    url: &url,
+                    url: &format!("rsync://rsync.rfc-editor.org/rfcs-text-only/rfc{number}.txt"),
                     observed_us: TIME,
                     fetched_us: Some(TIME),
                     etag: None,
                     last_modified: None,
                     raw_digest: blob.digest(),
-                    https_verification: "verified",
+                    https_verification: "unverified",
                 })
+                .await?;
+            let txt = candidate
+                .observe_comparison(
+                    &Observation {
+                        kind: "txt",
+                        url: &url,
+                        observed_us: TIME,
+                        fetched_us: Some(TIME),
+                        etag: None,
+                        last_modified: None,
+                        raw_digest: blob.digest(),
+                        https_verification: "verified",
+                    },
+                    peer,
+                )
                 .await?;
             let doc_range = ByteRange::new(0, blob.byte_length()).unwrap();
             let first_line = bytes
