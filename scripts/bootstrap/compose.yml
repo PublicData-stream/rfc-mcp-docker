@@ -5,7 +5,7 @@ services:
   sync:
     environment:
       RFC_PHASE2_FIXED_CLOCK: "1"
-      RFC_PHASE2_PACED: "1"
+      RFC_PHASE2_PACED: ${PHASE_BOOTSTRAP_PACED:-1}
   feed:
     cpus: 0.5
     mem_limit: 128m

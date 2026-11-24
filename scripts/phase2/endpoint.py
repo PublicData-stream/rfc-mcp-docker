@@ -98,7 +98,10 @@ class Https(BaseHTTPRequestHandler):
         if not self.path.startswith("/rfc/") or "/" in self.path[5:]:
             self.send_error(404)
             return
-        if scenario == "cold-bootstrap" and self.path == "/rfc/rfc101.xml":
+        if scenario == "scale-bootstrap":
+            rfc = Path(self.path).stem.removeprefix("rfc")
+            time.sleep(0.025 if rfc.isascii() and rfc.isdecimal() and int(rfc) % 3 == 0 else 0.005)
+        if scenario in ("cold-bootstrap", "scale-bootstrap") and self.path == "/rfc/rfc101.xml":
             self.send_error(410)
             return
         if self.path == "/rfc/rfc100.txt":
@@ -205,6 +208,7 @@ class Rsync(socketserver.BaseRequestHandler):
             wait_for_release("release-rsync")
         if scenario in ("benchmark", "cold-bootstrap"):
             time.sleep(0.20)
+        interrupted = {"rsync-interrupted": 1024, "rsync-partial": 65536}.get(scenario)
         with socket.create_connection(("127.0.0.1", 9873), 3) as upstream:
             upstream.settimeout(10)
             self.request.settimeout(10)
@@ -217,10 +221,11 @@ class Rsync(socketserver.BaseRequestHandler):
                         chunk = key.fileobj.recv(32768)
                         if not chunk:
                             return
-                        if key.fileobj is upstream and mode() == "rsync-interrupted":
-                            remaining = 1024 - relayed
+                        if key.fileobj is upstream and interrupted is not None:
+                            remaining = interrupted - relayed
                             if len(chunk) >= remaining:
                                 self.request.sendall(chunk[:remaining])
+                                print(f"fixture rsync truncated after {interrupted} bytes", flush=True)
                                 return
                             relayed += len(chunk)
                         key.data.sendall(chunk)

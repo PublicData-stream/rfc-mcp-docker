@@ -49,6 +49,8 @@ PUBLICATION_SQL = """SELECT json_build_object(
         FROM rfc.notification_outbox WHERE publication_sequence = 1))
     FROM rfc.active_generation a WHERE a.singleton"""
 XML_RESPONSE = re.compile(r'"GET /rfc/rfc[0-9]+\.xml HTTP/1\.1" ([0-9]{3}) ')
+SCALE_SIZE = 3072
+BULK_MODES = {"bulk-daemon", "bulk-manual", "bulk-scale"}
 
 
 def utc_now():
@@ -82,7 +84,7 @@ class Project(phase6.Project):
         index = command.index("-p")
         return [*command[:index], "-f", str(HERE / "compose.yml"), *command[index:]]
 
-    def preprovision(self, size, work):
+    def preprovision(self, size, work, *, scale=False):
         with duration(self.setup, "fixture_subnet_selection"):
             self.prepare_network(work)
         with duration(self.setup, "proxy_tls"):
@@ -91,8 +93,17 @@ class Project(phase6.Project):
             self.prepare_control_secrets(work)
         self.env["PHASE6_NOTIFY_TARGET"] = f"{self.net}.34:8782"
         with duration(self.setup, "fixture_payload_and_upstream_tls"):
-            phase2.prepare_benchmark(self, size)
-            (self.source / "mode").write_text("cold-bootstrap")
+            base_sources = phase2.prepare_benchmark(self, size)
+            (self.source / "mode").write_text("scale-bootstrap" if scale else "cold-bootstrap")
+            self.env["PHASE_BOOTSTRAP_PACED"] = "0" if scale else "1"
+            if scale:
+                for rfc in range(10000, 10000 + size - len(base_sources)):
+                    if rfc % 3 == 0:
+                        (self.source / "https" / f"rfc{rfc}.xml").write_text(
+                            f'<rfc number="{rfc}"><back><references><name>Normative References</name>'
+                            '<reference><seriesInfo name="RFC" value="2119"/></reference>'
+                            '</references></back></rfc>'
+                        )
             phase6.feed_data(self, [])
             (self.source / "feed-mode").write_text("normal")
         assert not any((self.directory / "pgdata").iterdir())
@@ -204,9 +215,60 @@ def verify_publication(project, active, texts, report, *, manual, bulk):
         expected = ("unverified", "rsync") if bulk else ("verified", "https")
         assert sealed and same_digest and (verification, transport) == expected, (rfc, digest)
         assert project.canonical(digest).read_bytes() == texts[rfc], rfc
-    verified = json.loads(project.capture("exec", "-T", "serve", "/phase2/fixture-driver", "verify-restore"))
+    verified = json.loads(project.capture("exec", "-T", "serve", "/phase2/fixture-driver", "verify-restore",
+                                          timeout=300))
     assert verified["manifests"] == {str(generation): report["manifest_digest"]}, verified
     return verified
+
+
+def verify_scale(project, report, disk):
+    metrics = report["metrics"]
+    assert report["expected_txt"] == SCALE_SIZE and metrics["https_requests"] == SCALE_SIZE + 2
+    assert metrics["txt"]["calls"] == 0 and metrics["rsync"]["calls"] == 1
+    assert metrics["rsync_transferred_files"] == SCALE_SIZE and metrics["rsync_checksum_hits"] == 0
+    assert 1 <= metrics["https_peak"] <= 2 and metrics["parse_peak"] == 1
+    assert 1 <= metrics["admitted_peak"] <= metrics["xml_window_peak"] <= 3
+    assert metrics["raw_reserved_peak"] == metrics["xml_window_peak"] * 16 * 1024**2
+    assert 0 < metrics["memory_peak"] <= 2 * 1024**3
+    assert 0 < disk["peak_allocated_bytes"]["bulk_stage"] <= 512 * 1024**2
+    assert not disk["sampling_errors"], disk
+    generation = int(report["generation_id"])
+    rows = project.sql(f"""
+        SELECT json_build_array(d.rfc_id, encode(o.raw_digest, 'hex'), o.source_transport,
+            o.https_verification, o.source_url, a.state, c.state)
+        FROM rfc.generation_documents d
+        LEFT JOIN rfc.source_observations o ON o.identity=d.rfcxml_observation
+        JOIN rfc.relation_coverage a ON (a.generation_id, a.rfc_id, a.family) =
+            (d.generation_id, d.rfc_id, 'all_references')
+        JOIN rfc.relation_coverage c ON (c.generation_id, c.rfc_id, c.family) =
+            (d.generation_id, d.rfc_id, 'classified_references')
+        WHERE d.generation_id={generation} ORDER BY d.rfc_id
+    """, phase1.SERVE)
+    documents = [json.loads(row) for row in rows.splitlines()]
+    assert len(documents) == SCALE_SIZE
+    expected_edges = []
+    for rfc, digest, transport, verification, url, all_refs, classified in documents:
+        xml = project.source / "https" / f"rfc{rfc}.xml"
+        if xml.exists():
+            assert (transport, verification, url) == (
+                "https", "verified", f"https://www.rfc-editor.org/rfc/{xml.name}",
+            )
+            assert project.canonical(digest).read_bytes() == xml.read_bytes(), rfc
+            if rfc >= 10000:
+                assert (all_refs, classified) == ("complete", "complete"), rfc
+                expected_edges.append(rfc)
+        else:
+            assert (digest, transport, verification, url) == (None, None, None, None), rfc
+            if rfc >= 10000:
+                assert (all_refs, classified) == ("unavailable", "unavailable"), rfc
+    edges = project.sql(f"""
+        SELECT e.source_rfc, e.target_rfc, e.kind, o.observation=d.rfcxml_observation
+        FROM rfc.edge_evidence e JOIN rfc.relation_evidence o ON o.identity=e.evidence
+        JOIN rfc.generation_documents d ON (d.generation_id,d.rfc_id) = (e.generation_id,e.source_rfc)
+        WHERE e.generation_id={generation} AND e.source_rfc>=10000 AND o.method='rfcxml'
+        ORDER BY e.source_rfc
+    """, phase1.SERVE)
+    assert edges.splitlines() == [f"{rfc}|2119|normative_reference|t" for rfc in expected_edges]
 
 
 def collect_logs(project, evidence):
@@ -240,7 +302,8 @@ def collect_logs(project, evidence):
 
 
 def prepare_manual_candidate(project, evidence, mark):
-    with subprocess.Popen(project.operation("sync", "full"), env=project.env, text=True,
+    command = project.app("sync", "-T", args=("--phase2-reconcile", "--full"))
+    with subprocess.Popen(command, env=project.env, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
         try:
             phase6.wait(lambda: process.poll() is not None or
@@ -267,7 +330,8 @@ def prepare_manual_candidate(project, evidence, mark):
 def run_workflow(project, receipt, texts, failure, evidence):
     mode = receipt["mode"]
     manual = mode == "bulk-manual"
-    bulk = mode in {"bulk-manual", "bulk-daemon"}
+    bulk = mode in BULK_MODES
+    scale = mode == "bulk-scale"
     stages, milestones = receipt["workflow_seconds"], receipt["milestones"]
     receipt["t0_utc"] = utc_now()
     t0 = time.monotonic()
@@ -325,7 +389,7 @@ def run_workflow(project, receipt, texts, failure, evidence):
                 return state["active"] == generation and state["latest_generation"]["state"] == "published"
             return state["active"] is not None and job.get("generation_state") == "published"
 
-        phase6.wait(check, seconds=max(120, len(texts) * 5))
+        phase6.wait(check, seconds=1800 if scale else max(120, len(texts) * 5))
         active = receipt["database"]
         if failure:
             mark("first_failed_attempt")
@@ -377,7 +441,8 @@ def run_workflow(project, receipt, texts, failure, evidence):
         assert report["rsync_only_txt"] == (len(texts) if bulk else 0)
         assert report["reused_txt"] == 0 and metrics["rsync_payload_bytes"] == sum(map(len, texts.values()))
         assert metrics["https_requests"] == len(texts) * (1 if bulk else 2) + 2
-        assert metrics["minimum_start_spacing_us"] >= 1_000_000
+        if not scale:
+            assert metrics["minimum_start_spacing_us"] >= 1_000_000
         assert statuses["200"] > 0 and statuses["404"] > 0 and statuses["410"] == 1, statuses
         assert sum(statuses[status] for status in ("200", "404", "410")) == len(texts), statuses
         assert not any(statuses[key] for key in ("http_errors", "without_logged_response", "fetch_errors", "parse_errors"))
@@ -388,6 +453,8 @@ def run_workflow(project, receipt, texts, failure, evidence):
             generation = int(active["active"])
             manifest_hex = project.sql(f"SELECT encode(manifest_bytes, 'hex') FROM rfc.generations WHERE id = {generation}")
             (evidence / "manifest.json").write_bytes(bytes.fromhex(manifest_hex))
+        if scale:
+            verify_scale(project, report, disk)
         receipt["status"] = "published_and_ready"
 
 
@@ -432,7 +499,8 @@ def trial(args, docker, driver, work, size, repeat, failure=False, mode="baselin
     evidence = args.evidence / label
     evidence.mkdir()
     receipt = {"status": "error", "mode": mode, "size": size, "repeat": repeat, "failure_probe": failure,
-               "setup_seconds": {}, "workflow_seconds": {}, "milestones": {}}
+               "private_fixture_paced": mode != "bulk-scale", "setup_seconds": {},
+               "workflow_seconds": {}, "milestones": {}}
     directory = work / label
     directory.mkdir()
     project = None
@@ -442,10 +510,12 @@ def trial(args, docker, driver, work, size, repeat, failure=False, mode="baselin
             os.link(work / service, directory / service)
         project = Project(directory / f"{work.name}-{label}", driver, args.image_prefix,
                           docker, receipt["setup_seconds"])
-        project.preprovision(size, directory)
-        if mode in {"bulk-daemon", "bulk-manual"}:
+        scale = mode == "bulk-scale"
+        project.preprovision(size, directory, scale=scale)
+        if mode in BULK_MODES:
             with duration(receipt["setup_seconds"], "bulk_stage_provisioning"):
-                project.stage_mount = staging.enter_context(phase2.capped_stage(project))
+                capacity = {"mebibytes": 512, "inodes": 8192} if scale else {}
+                project.stage_mount = staging.enter_context(phase2.capped_stage(project, **capacity))
                 project.use_bulk_bootstrap(project.stage_mount)
         if failure:
             path = project.source / "https/rfc100.txt"
@@ -480,15 +550,17 @@ def main():
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--phase6", action="store_true", help="compare cold bulk daemon and manual publication")
+    profiles = parser.add_mutually_exclusive_group()
+    profiles.add_argument("--phase6", action="store_true", help="compare cold bulk daemon and manual publication")
+    profiles.add_argument("--phase7-scale", action="store_true", help="qualify 3072 RFCs on a local private fixture")
     parser.add_argument("--sizes", type=int, choices=(6, 96), nargs="+")
     parser.add_argument("--repeats", type=int, choices=range(1, 6))
     args = parser.parse_args()
     args.evidence = args.evidence.resolve()
     if Path("/tmp") not in args.evidence.parents or args.evidence.exists():
         parser.error("--evidence must be a new directory beneath /tmp")
-    if args.phase6 and (args.sizes is not None or args.repeats is not None):
-        parser.error("--phase6 uses a fixed trial set")
+    if (args.phase6 or args.phase7_scale) and (args.sizes is not None or args.repeats is not None):
+        parser.error("the selected profile uses a fixed trial set")
     sizes = args.sizes or (6, 96)
     repeats = args.repeats or 3
     if len(set(sizes)) != len(sizes):
@@ -517,7 +589,9 @@ def main():
             summary["images"] = dict(zip(images, ids, strict=True))
             phase3.fixture_driver(docker, args.image_prefix, driver)
             phase6.fixture_binaries(docker, args.image_prefix, work)
-        if args.phase6:
+        if args.phase7_scale:
+            summary["runs"].append(trial(args, docker, driver, work, SCALE_SIZE, 1, mode="bulk-scale"))
+        elif args.phase6:
             for mode in ("bulk-daemon", "bulk-manual", "strict-failure"):
                 summary["runs"].append(trial(args, docker, driver, work, 6, 1,
                                              failure=mode == "strict-failure", mode=mode))
@@ -534,7 +608,7 @@ def main():
             == (args.evidence / "bulk-manual/manifest.json").read_bytes()
         )
         summary["manual_daemon_equivalent"] = matched
-    else:
+    elif not args.phase7_scale:
         summary["median_t1_seconds"] = {}
         for size in sizes:
             runs = [r for r in summary["runs"] if r["size"] == size and r["status"] == "published_and_ready"]

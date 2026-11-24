@@ -371,17 +371,29 @@ def exercise(project):
         "environment": {"RFC_SYNC_CONFIG_FILE": container_path},
         "volumes": [f"{config}:{container_path}:ro"],
     }}}))
-    counts = "SELECT (SELECT count(*) FROM rfc.sync_jobs), (SELECT count(*) FROM rfc.generations)"
-    previous = project.sql(counts)
-    requests = project.capture("logs", "--no-color", "fixtures")
+    def preflight_snapshot():
+        database = project.sql("""
+            SELECT generation_id, publication_sequence, (SELECT count(*) FROM rfc.sync_jobs),
+                (SELECT count(*) FROM rfc.generations), (SELECT count(*) FROM rfc.notification_outbox),
+                (SELECT count(*) FROM rfc.blobs), (SELECT count(*) FROM rfc.ingestion_checkpoints)
+            FROM rfc.active_generation
+        """)
+        mirror = phase1.capture(project.app("sync", "-T", "--entrypoint", "/bin/sh", args=(
+            "-ec", "find /mirror -type d -print | sort; find /mirror -type f -exec sha256sum {} + | sort",
+        )), env=project.env)
+        return database, mirror, project.capture("logs", "--no-color", "fixtures")
+
+    previous = preflight_snapshot()
+    binary = ("--entrypoint", "/usr/local/bin/rfc-mcp-docker-sync")
     for options, args in (((), ()),
-                          (("--entrypoint", "/usr/local/bin/rfc-mcp-docker-sync"),
-                           ("--phase2-reconcile", "--sample"))):
+                          (binary, ("--phase2-reconcile", "--sample")),
+                          (binary, ("--check-config",))):
         phase1.failed(project.app("sync", *options, args=args), project.env,
                       "ingestion schema_version must be 1")
-    assert project.sql(counts) == previous
-    assert project.capture("logs", "--no-color", "fixtures") == requests
     config.write_bytes(valid)
+    checked = phase1.capture(project.app("sync", "-T", *binary, args=("--check-config",)), env=project.env)
+    assert json.loads(checked)["source"] == "file"
+    assert preflight_snapshot() == previous
     project.restart_sync()
     try:
         epoch = identity(project)

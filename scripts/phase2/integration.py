@@ -3,6 +3,7 @@
 
 import argparse
 from contextlib import ExitStack, contextmanager
+import hashlib
 import importlib.util
 import json
 import os
@@ -357,6 +358,11 @@ def exercise(project):
     ]:
         mode.write_text(scenario)
         project.reconcile(expected=expected)
+    mode.write_text("normal")
+    catalog.write_text(unchanged_catalog.replace("<doc-id>RFC100</doc-id>", "<doc-id>RFC../100</doc-id>", 1))
+    rejected_catalog = project.reconcile(expected="invalid RFC catalog document number")
+    assert rejected_catalog["metrics"]["rsync"]["calls"] == 0
+    catalog.write_text(unchanged_catalog)
     mode.write_text("bad-rfcxml")
     fallback = project.reconcile()
     assert any("RFC 8174 RFCXML parse" in error for error in fallback["diagnostics"])
@@ -415,6 +421,10 @@ def exercise(project):
     project.verify_manifest(refreshed)
     assert project.sql("""SELECT count(DISTINCT txt_observation) FROM rfc.generation_documents
                           WHERE rfc_id=100""") == "2"
+    control = project.reconcile(settings=(clock, "RFC_SYNC_HTTP_CONCURRENCY=2"))
+    blocked = exercise_writer_backpressure(project)
+    assert blocked["manifest_digest"] == control["manifest_digest"]
+    verify_ranges(project, blocked, {**sources, 100: changed})
     print("Phase 2 fixture candidate, byte indexes, provenance, failure fences and role boundaries passed", flush=True)
 
 
@@ -508,6 +518,24 @@ def exercise_xml_statuses(project):
             f"SELECT state FROM rfc.relation_coverage WHERE generation_id={generation}"
             " AND rfc_id=8174 AND family='all_references'"
         ) == "partial"
+        coverage = project.sql(f"""
+            SELECT d.rfc_id, d.rfcxml_observation IS NOT NULL,
+                a.state, c.state, EXISTS (SELECT FROM rfc.edge_evidence e
+                    JOIN rfc.relation_evidence r ON r.identity=e.evidence
+                    WHERE (e.generation_id,e.source_rfc)=(d.generation_id,d.rfc_id) AND r.method='rfcxml')
+            FROM rfc.generation_documents d
+            JOIN rfc.relation_coverage a ON (a.generation_id,a.rfc_id,a.family) =
+                (d.generation_id,d.rfc_id,'all_references')
+            JOIN rfc.relation_coverage c ON (c.generation_id,c.rfc_id,c.family) =
+                (d.generation_id,d.rfc_id,'classified_references')
+            WHERE d.generation_id={generation} ORDER BY d.rfc_id
+        """, phase1.SERVE).splitlines()
+        assert coverage[0] == "100|t|complete|complete|f", coverage
+        assert coverage[1:3] == ["101|f|unavailable|unavailable|f", "102|f|unavailable|unavailable|f"], coverage
+        for row in coverage[3:]:
+            rfc, captured, all_refs, classified, xml_edge = row.split("|")
+            assert captured == ("t" if rfc == "8174" else "f") and xml_edge == "f", coverage
+            assert all_refs != "complete" and classified != "complete", coverage
         logs = fixture_logs(project)
         cooldown, = re.findall(rf"fixture cooldown {scenario} /rfc/rfc100.xml (\d+\.\d+)", logs)
         starts = [(path, float(at)) for path, at in
@@ -592,6 +620,63 @@ def exercise_xml_overlap(project, *, options, settings):
     assert_pipeline_bounds(report, http_limit=2)
     assert report["metrics"]["out_of_order"] > 0, report
     print("TXT sealed, later membership committed, and the slot refilled while RFC 100 XML was held", flush=True)
+    return report
+
+
+def exercise_writer_backpressure(project):
+    key = 741007
+    project.sql(f"""
+        CREATE FUNCTION rfc.fixture_hold_membership() RETURNS trigger LANGUAGE plpgsql
+        SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+        BEGIN PERFORM pg_catalog.pg_advisory_xact_lock({key}::bigint); RETURN NEW; END $$;
+        REVOKE EXECUTE ON FUNCTION rfc.fixture_hold_membership() FROM PUBLIC;
+        CREATE TRIGGER fixture_hold_membership BEFORE INSERT ON rfc.generation_documents
+        FOR EACH ROW EXECUTE FUNCTION rfc.fixture_hold_membership()
+    """)
+    try:
+        lock = project.psql()
+        with subprocess.Popen(lock, env=project.env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as holder:
+            try:
+                holder.stdin.write(f"SELECT pg_try_advisory_lock({key}::bigint);\n")
+                holder.stdin.flush()
+                assert holder.stdout.readline().strip() == "t"
+                with xml_collector(project, "xml-writer-block", options=(), settings=(
+                    "RFC_PHASE2_FIXED_CLOCK=1", "RFC_SYNC_HTTP_CONCURRENCY=2",
+                )) as (collector, _, stdout, stderr):
+                    pattern = r"fixture request xml-writer-block /rfc/rfc(\d+)\.xml (\d+\.\d+)"
+
+                    def stalled():
+                        waiting = project.sql(f"SELECT count(*) FROM pg_locks WHERE locktype='advisory'"
+                                              f" AND objid={key} AND NOT granted")
+                        starts = re.findall(pattern, fixture_logs(project))
+                        assert len(starts) <= 3, starts
+                        return waiting == "1" and len(starts) == 3
+
+                    try:
+                        wait_for_fixture(collector, stalled, "writer did not stall with a full XML window")
+                    except AssertionError as error:
+                        raise AssertionError((str(error), project.sql(
+                            f"SELECT locktype,objid,granted FROM pg_locks WHERE objid={key}"
+                        ), re.findall(pattern, fixture_logs(project)), stdout.read_text(), stderr.read_text())) from error
+                    before_release = time.monotonic()
+                    holder.stdin.close()
+                    holder.wait(timeout=6)
+                    assert collector.wait(timeout=40) == 0, stderr.read_text()
+                    report = json.loads(stdout.read_text().strip().splitlines()[-1])
+                    starts = re.findall(pattern, fixture_logs(project))
+                    assert sorted(int(rfc) for rfc, _ in starts) == [100, 101, 102, 2119, 8174, 9110]
+                    assert {int(rfc) for rfc, when in starts if float(when) < before_release} == {100, 101, 102}, starts
+            finally:
+                if not holder.stdin.closed:
+                    holder.stdin.close()
+                holder.wait(timeout=6)
+    finally:
+        project.sql("DROP TRIGGER fixture_hold_membership ON rfc.generation_documents;"
+                    " DROP FUNCTION rfc.fixture_hold_membership()")
+    assert_pipeline_bounds(report, http_limit=2)
+    assert report["metrics"]["xml_window_peak"] == 3
+    project.verify_manifest(report)
+    print("PostgreSQL writer backpressure stopped admission at the XML item and byte window", flush=True)
     return report
 
 
@@ -832,13 +917,13 @@ def prepare_benchmark(project, size):
 
 
 @contextmanager
-def capped_stage(project):
+def capped_stage(project, *, mebibytes=64, inodes=512):
     image = project.directory / "rsync.ext4"
     mountpoint = project.directory / "rsync-mount"
     mountpoint.mkdir()
     with image.open("wb") as disk:
-        disk.truncate(64 * 1024**2)
-    run(["mkfs.ext4", "-q", "-N", "512", "-m", "0", str(image)])
+        disk.truncate(mebibytes * 1024**2)
+    run(["mkfs.ext4", "-q", "-N", str(inodes), "-m", "0", str(image)])
     run(["sudo", "-n", "mount", "-o", "loop,nosuid,nodev,noexec", str(image), str(mountpoint)])
     try:
         maps = phase1.capture([
@@ -927,7 +1012,7 @@ def exercise_bootstrap(project):
     sources = prepare(project, include_nul=True)
     count = len(sources)
     with capped_stage(project) as mountpoint:
-        settings = ("RFC_SYNC_CONFIG_FILE=/phase2/bulk.toml",)
+        settings = ("RFC_SYNC_CONFIG_FILE=/phase2/bulk.toml", "RFC_PHASE2_FIXED_CLOCK=1")
         options = bulk_options(project, mountpoint, bootstrap=True)
         check = project.app("sync", *options, "-e", settings[0], args=("--check-config",))
         config = json.loads(phase1.capture(check, env=project.env))
@@ -935,12 +1020,26 @@ def exercise_bootstrap(project):
         project.start()
         project.migrate()
         project.run("up", "-d", "--wait", "fixtures", timeout=35)
+        (project.source / "rsync/rfc20000.txt").write_bytes(b"Not in the selected catalog.\n")
+
+        def shell(command):
+            return phase1.capture(project.app("sync", options[0], options[1], "--entrypoint", "/bin/sh",
+                                              args=("-ec", command)), env=project.env)
+
         first = exercise_xml_overlap(project, options=options, settings=settings)
         assert first["verified_txt"] == 0 and first["rsync_only_txt"] == count
         assert first["metrics"]["txt"]["calls"] == 0 and first["metrics"]["https_requests"] == count + 2
         first_id = int(first["generation_id"])
         verify_ranges(project, first, sources, "unverified")
         project.verify_manifest(first)
+        assert project.sql("SELECT count(*) FROM rfc.generation_documents WHERE rfc_id=20000") == "0"
+        shell("test ! -e /rfc-rsync-txt/full/files/rfc20000.txt; "
+              "find /rfc-rsync-txt/full/files -type f -exec rm -- {} +")
+        replay = project.reconcile(options=options, settings=settings)
+        assert replay["metrics"]["rsync_transferred_files"] == count
+        assert replay["manifest_digest"] == first["manifest_digest"]
+        project.verify_manifest(replay)
+
         def provenance(generation):
             return project.sql(
                 "SELECT o.source_transport, o.https_verification, o.fetched_at IS NULL, "
@@ -984,9 +1083,6 @@ def exercise_bootstrap(project):
         rsync.write_bytes(changed)
         project.reconcile(expected="rsync and HTTPS TXT disagree", options=options, settings=settings)
         https.write_bytes(changed)
-        def shell(command):
-            return phase1.capture(project.app("sync", options[0], options[1], "--entrypoint", "/bin/sh",
-                                              args=("-ec", command)), env=project.env)
         for fill in (
             "for i in $(seq 1 600); do touch /rfc-rsync-txt/quota/$i 2>/dev/null || exit 0; done; exit 1",
             "dd if=/dev/zero of=/rfc-rsync-txt/quota/full bs=1M 2>/dev/null && exit 1; "
@@ -1015,18 +1111,47 @@ def exercise_bootstrap(project):
                                    settings=settings)
         assert sample["rsync_only_txt"] == 0 and sample["verified_txt"] == 3
         assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == f"{first_id}|3"
+        active = f"{first_id}|3"
+        for body, error in ((b"", "bulk rsync"), (b"%PDF-1.7\n", "input is not RFC TXT")):
+            rsync.write_bytes(body)
+            https.write_bytes(body)
+            rejected = project.reconcile(expected=error, options=options, settings=settings)
+            assert project.sql(f"SELECT count(*) FROM rfc.generation_documents WHERE generation_id="
+                               f"{int(rejected['generation_id'])} AND rfc_id=100") == "0"
+        rsync.write_bytes(bytes(range(256)) * 4096)
+        mode.write_text("rsync-partial")
+        try:
+            project.reconcile(expected="bulk rsync", options=options, settings=settings)
+            assert "fixture rsync truncated after 65536 bytes" in fixture_logs(project)
+            shell("test -z \"$(ls -A /rfc-rsync-txt/full/temporary)\"")
+        finally:
+            mode.write_text("normal")
+            rsync.write_bytes(changed)
+            https.write_bytes(changed)
+        shell("touch /rfc-rsync-txt/full/files/unexpected.txt")
+        try:
+            project.reconcile(expected="unexpected name in bulk rsync staging", options=options, settings=settings)
+        finally:
+            shell("rm /rfc-rsync-txt/full/files/unexpected.txt")
+        assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == active
+        assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "3"
+        verify_ranges(project, first, sources, "unverified")
         print("Bulk bootstrap provenance, capped failures, promotion fencing and rollback passed", flush=True)
 
 
-def exercise_provenance_upgrade(project, old_prefix, old_driver, old_schema, reader):
-    sources = prepare(project, include_nul=True)
-    project.start()
+def migrate_to_historical_schema(project, old_schema):
     migrations = (REPO / "migrations/migrate.sql").read_text()
     boundary = f"SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = {old_schema+1})"
     old_sql, _ = migrations.split(boundary, 1)
     run([*project.psql(), "-f", "/dev/stdin"], env=project.env,
         input=old_sql.replace("\\ir ", "\\i /migrations/") + "COMMIT;\n")
     assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == str(old_schema)
+
+
+def exercise_provenance_upgrade(project, old_prefix, old_driver, old_schema, reader):
+    sources = prepare(project, include_nul=True)
+    project.start()
+    migrate_to_historical_schema(project, old_schema)
     project.run("up", "-d", "--wait", "fixtures", timeout=35)
     current = {key: project.env[key] for key in ("PHASE1_IMAGE_PREFIX", "PHASE2_DRIVER")}
     project.env.update(PHASE1_IMAGE_PREFIX=old_prefix, PHASE2_DRIVER=str(old_driver))
@@ -1068,8 +1193,133 @@ def exercise_provenance_upgrade(project, old_prefix, old_driver, old_schema, rea
     assert next_candidate["txt_audit"]["reused_legacy"] == first["verified_txt"]
     assert next_candidate["metrics"]["txt"]["calls"] == 0
     project.verify_manifest(next_candidate)
+    changed = sources[100] + b"\nPost-migration change.\n"
+    (project.source / "rsync/rfc100.txt").write_bytes(changed)
+    project.reconcile(expected="rsync and HTTPS TXT disagree")
+    (project.source / "https/rfc100.txt").write_bytes(changed)
+    refreshed = project.reconcile()
+    assert refreshed["metrics"]["txt"]["calls"] == 1 and refreshed["txt_audit"]["matched"] == 1
+    assert refreshed["txt_audit"]["reused_legacy"] == len(sources) - 1
+    assert project.sql(f"""
+        SELECT h.verification_method, r.verification_method, h.raw_digest=r.raw_digest
+        FROM rfc.generation_documents d JOIN rfc.source_observations h ON h.identity=d.txt_observation
+        JOIN rfc.source_observations r ON r.identity=h.comparison_rsync
+        WHERE d.generation_id={int(refreshed['generation_id'])} AND d.rfc_id=100
+    """) == "dual_source|rsync_integrity|t"
+    project.verify_manifest(refreshed)
     assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == f"{second['generation_id']}|2"
     print(f"Schema {old_schema} retained and published data, source identities and strict reuse survived schema 9 upgrade", flush=True)
+
+
+def benchmark_content(project, report):
+    generation = int(report["generation_id"])
+    members = f"SELECT * FROM rfc.generation_documents WHERE generation_id={generation}"
+    originals = project.sql(f"""
+        SELECT json_build_array(g.rfc_id, encode(d.txt_digest,'hex'), d.line_starts, d.encoding,
+            g.title, g.current_status, g.publication_date, g.publication_month, g.stream, encode(x.raw_digest,'hex'))
+        FROM ({members}) g JOIN rfc.document_versions d ON d.identity=g.document_version
+        LEFT JOIN rfc.source_observations x ON x.identity=g.rfcxml_observation ORDER BY g.rfc_id
+    """, phase1.SERVE)
+    rsync = project.source / "rsync"
+    assert len(originals.splitlines()) == report["expected_txt"] == len(list(rsync.glob("rfc*.txt")))
+    for row in originals.splitlines():
+        rfc, digest, *_ = json.loads(row)
+        assert (project.directory / "mirror/blobs/blake3" / digest[:2] / digest).read_bytes() == (
+            rsync / f"rfc{rfc}.txt"
+        ).read_bytes(), rfc
+    ranges = project.sql(f"""
+        SELECT g.rfc_id, ranges.kind, ranges.start_byte, ranges.end_byte
+        FROM ({members}) g JOIN (
+            SELECT document_version, 'section' AS kind, start_byte, end_byte FROM rfc.sections
+            UNION ALL SELECT document_version, 'heading', heading_start_byte, heading_end_byte FROM rfc.sections
+            UNION ALL SELECT document_version, 'chunk', start_byte, end_byte FROM rfc.text_chunks
+            UNION ALL SELECT document_version, 'notice', start_byte, end_byte FROM rfc.notice_ranges
+            UNION ALL SELECT document_version, 'reference', start_byte, end_byte FROM rfc.relation_evidence
+                WHERE start_byte IS NOT NULL
+        ) ranges ON ranges.document_version=g.document_version ORDER BY 1,2,3,4
+    """, phase1.SERVE)
+    relations = project.sql(f"""
+        SELECT e.source_rfc, e.kind, e.target_rfc, r.method, r.xml_locator, r.start_byte, r.end_byte
+        FROM rfc.edge_evidence e JOIN rfc.relation_evidence r ON r.identity=e.evidence
+        WHERE e.generation_id={generation} ORDER BY 1,2,3,4,5,6,7
+    """, phase1.SERVE)
+    coverage = project.sql(f"""
+        SELECT scope,rfc_id,family,state FROM rfc.relation_coverage
+        WHERE generation_id={generation} ORDER BY 1,2,3,4
+    """, phase1.SERVE)
+    return {name: hashlib.sha256(value.encode()).hexdigest() for name, value in (
+        ("originals_and_membership", originals), ("ranges", ranges), ("relations", relations), ("coverage", coverage),
+    )}
+
+
+def benchmark_comparison(args, docker, work, driver):
+    serial = work / "serial-driver"
+    fixture_driver(docker, args.serial_image_prefix, serial, prebuilt=True)
+    profiles = (("serial", None, None), ("single", 1, 1), ("pipeline", 3, 2))
+    settings = ("RFC_PHASE2_FIXED_CLOCK=1", "RFC_PHASE2_PACED=1")
+    revision = phase1.capture(["git", "rev-parse", "HEAD"], cwd=REPO)
+    images = {}
+    for name, prefix in (("serial", args.serial_image_prefix), ("current", args.image_prefix)):
+        tags = [f"{prefix}-{kind}" for kind in ("sync", "ingestion-fixture")]
+        images[name] = dict(zip(tags, phase1.capture([
+            *docker, "image", "inspect", "--format", "{{.Id}}", *tags,
+        ]).splitlines(), strict=True))
+    runs = []
+    for repeat in range(1, args.repeats + 1):
+        for name, slots, workers in profiles:
+            with ExitStack() as cleanup:
+                project = Project(work / f"{work.name}-{name}-{repeat}", driver, args.image_prefix, docker, False)
+                cleanup.callback(project.close)
+                prepare_benchmark(project, 96)
+                project.start()
+                if name == "serial":
+                    migrate_to_historical_schema(project, 6)
+                else:
+                    project.migrate()
+                project.run("up", "-d", "--wait", "fixtures", timeout=35)
+                if name == "serial":
+                    previous = project.env.copy()
+                    project.env.update(PHASE1_IMAGE_PREFIX=args.serial_image_prefix, PHASE2_DRIVER=str(serial))
+                    try:
+                        report = project.reconcile(settings=(*settings, "RFC_SYNC_HTTP_CONCURRENCY=1"), timeout=480)
+                        # Run the historical verifier with the read-only role against schema 6.
+                        project.env["PHASE1_IMAGE_PREFIX"] = args.image_prefix
+                        project.verify_manifest(report)
+                    finally:
+                        project.env = previous
+                else:
+                    config = project.directory / "benchmark.toml"
+                    config.write_text(f"schema_version = 1\n[ingestion.https]\nmax_in_flight_requests = {workers}\n"
+                                      f"[ingestion.pipeline]\nmax_pending_documents = {slots}\nparser_workers = {workers}\n")
+                    report = project.reconcile(settings=(*settings, "RFC_SYNC_CONFIG_FILE=/phase2/benchmark.toml"),
+                                               options=("-v", f"{config}:/phase2/benchmark.toml:ro"), timeout=480)
+                    project.verify_manifest(report)
+                    assert_pipeline_bounds(report, http_limit=workers, paced=True)
+                    assert report["metrics"]["parse_peak"] <= workers
+                    assert report["metrics"]["xml_window_peak"] <= slots
+                assert report["verified_txt"] == 96 and report["reused_txt"] == 0
+                assert report["metrics"]["https_requests"] == 194
+                assert report["metrics"]["minimum_start_spacing_us"] >= 1_000_000
+                generation = int(report["generation_id"])
+                manifest = project.sql(f"SELECT encode(manifest_bytes,'hex') FROM rfc.generations WHERE id={generation}")
+                content = benchmark_content(project, report)
+                pgdata = project.capture("exec", "-T", "postgres", "du", "-sk", "/var/lib/postgresql")
+                mirror = phase1.capture(["sudo", "-n", "du", "-sk", "--", str(project.directory / "mirror")])
+                runs.append({"profile": name, "repeat": repeat, "content": content,
+                             "manifest_sha256": hashlib.sha256(bytes.fromhex(manifest)).hexdigest(),
+                             "storage_bytes": {"pgdata": int(pgdata.split()[0]) * 1024,
+                                               "mirror": int(mirror.split()[0]) * 1024}, **report})
+                receipt = {"revision": revision, "images": images, "paced": True, "runs": runs}
+                args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")
+    assert all(run["content"] == runs[0]["content"] for run in runs), [
+        (run["profile"], run["repeat"], run["content"]) for run in runs
+    ]
+    assert len({run["manifest_sha256"] for run in runs if run["profile"] != "serial"}) == 1
+    receipt["median_wall_us"] = {name: median(run["metrics"]["wall_us"] for run in runs if run["profile"] == name)
+                                 for name, _, _ in profiles}
+    receipt["comparison_passed"] = True
+    args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")
+    print(json.dumps(receipt["median_wall_us"], sort_keys=True), flush=True)
 
 
 def benchmark(args, docker, work, driver):
@@ -1136,10 +1386,14 @@ def main():
     parser.add_argument("--unpaced", action="store_true")
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--reference-receipt", type=Path)
+    parser.add_argument("--serial-image-prefix", help="compare the historical schema 6 serial collector at 96 RFCs")
     args = parser.parse_args()
     if sum(map(bool, (args.live, args.bulk, args.bulk_bootstrap, args.benchmark,
                       args.upgrade_from, args.upgrade_from_schema7))) > 1:
         parser.error("select only one live, bulk, bulk-bootstrap, benchmark or upgrade profile")
+    if args.serial_image_prefix and (args.benchmark != [96] or args.unpaced or args.reference_receipt
+                                     or args.receipt is None or Path("/tmp") not in args.receipt.resolve().parents):
+        parser.error("--serial-image-prefix requires paced --benchmark 96 and a --receipt under /tmp")
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-phase2-", dir="/tmp") as root:
         work = Path(root)
@@ -1149,7 +1403,10 @@ def main():
         else:
             fixture_driver(docker, args.image_prefix, driver)
         if args.benchmark:
-            benchmark(args, docker, work, driver)
+            if args.serial_image_prefix:
+                benchmark_comparison(args, docker, work, driver)
+            else:
+                benchmark(args, docker, work, driver)
             return 0
         project = Project(work / f"{work.name}-candidate", driver, args.image_prefix, docker, args.live)
         try:

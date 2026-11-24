@@ -25,11 +25,18 @@ async fn main() -> ProbeResult {
         [option, url, ca, expected] if option == "--phase0-https" => {
             https_probe(url, Path::new(ca), expected).await
         }
-        [option, scope] if option == "--phase2-reconcile" => match scope.as_str() {
-            "--full" => reconcile(Scope::Full).await,
-            "--sample" => reconcile(Scope::Sample).await,
-            _ => Err("reconciliation requires --full or --sample".into()),
-        },
+        [option, scope] if option == "--phase2-reconcile" => {
+            let scope = match scope.as_str() {
+                "--full" => Scope::Full,
+                "--sample" => Scope::Sample,
+                _ => return Err("reconciliation requires --full or --sample".into()),
+            };
+            #[cfg(feature = "phase6-fixtures")]
+            if std::env::var("RFC_PHASE6_FIXTURES").as_deref() == Ok("1") {
+                return rfc_mcp_docker_sync::reconcile_fixture(scope).await;
+            }
+            reconcile(scope).await
+        }
         [option, generation, flag, sequence]
             if matches!(option.as_str(), "--phase3-publish" | "--phase3-rollback")
                 && flag == "--expect-sequence" =>

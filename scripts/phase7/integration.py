@@ -164,11 +164,11 @@ class Deployment:
         self.open()
 
     def check_config(self):
-        def probe(*options, memory="2g", scratch="512m", expected=None):
+        def probe(*options, memory="2g", scratch="512m", expected=None, args=("--check-config",)):
             command = [*self.docker, "run", *phase0.local_image_args(), "--rm", "--network", "none",
                        "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                        "--memory", memory, "--tmpfs", f"/tmp:size={scratch},mode=1777,noexec,nosuid,nodev",
-                       *options, f"{self.prefix}-sync", "--check-config"]
+                       *options, f"{self.prefix}-sync", *args]
             if expected is not None:
                 phase1.failed(command, self.env, expected)
                 return None
@@ -184,6 +184,8 @@ class Deployment:
         assert legacy["ingestion"]["https"]["max_in_flight_requests"] == 1
         assert legacy["ingestion"]["pipeline"]["parser_workers"] == 2
         probe(*file_options, "-e", "RFC_SYNC_HTTP_CONCURRENCY=1", expected="conflicts with legacy")
+        probe(*file_options, "-e", "RFC_SYNC_PARSE_CONCURRENCY=1", expected="conflicts with legacy")
+        probe(*file_options, args=("--check-config", "--full"), expected="expected --version, --check-config")
         probe("-e", f"RFC_SYNC_CONFIG_FILE={INGESTION_PATH}", expected="cannot open ingestion config")
         probe("-e", "RFC_SYNC_CONFIG_FILE=", expected="must be nonempty")
         probe(memory="768m", expected="ingestion memory needs")
@@ -206,6 +208,23 @@ max_pending_documents = 1
         resources = probe(*small_options, memory="768m", scratch="16m")["resources"]
         assert resources["cgroup_memory_limit_bytes"] == resources["memory_available_bytes"] == 768 * 1024**2
         assert resources["scratch_available_bytes"] == 16 * 1024**2
+        for body, expected in (
+            (b"schema_version =", "invalid ingestion TOML"),
+            (b"schema_version = 2", "schema_version must be 1"),
+            (b"schema_version = 1\n[ingestion]\nunknown = true", "invalid ingestion TOML"),
+            (b"schema_version = 1\n[ingestion.https]\nurl = 'https://invalid.example'", "invalid ingestion TOML"),
+            (b"schema_version = 1\n[ingestion.rsync]\npath = '/mirror/blobs'", "invalid ingestion TOML"),
+            (b"schema_version = 1\n[ingestion.https]\nmax_in_flight_requests = 0", "must be 1 or 2"),
+            (b"schema_version = 1\n[ingestion.https]\nmin_request_start_interval_ms = 999", "1000 through 60000"),
+            (b"schema_version = 1\n[ingestion]\nmax_accepted_bytes = 4294967297", "1 through 4294967296"),
+            (b"schema_version = 1\n[ingestion.pipeline]\nmax_pending_documents = 1", "must fit max_pending_documents"),
+            (b"#" + b"x" * (16 * 1024), "exceeds 16 KiB"),
+            (b"\xff", "must be UTF-8"),
+        ):
+            small.chmod(0o644)
+            small.write_bytes(body)
+            small.chmod(0o444)
+            probe(*small_options, expected=expected)
         print("Sync configuration preflight passed with isolated and constrained containers", flush=True)
 
     def verify(self):
