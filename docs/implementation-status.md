@@ -1751,4 +1751,16 @@ attempt completed its assertions and was interrupted during namespace
 cleanup. The final run completed its assertions and namespace cleanup before
 the disposable profile was removed.
 
+The hosted arm64 Phase 7 Compose job failed after `87bfe89` updated the
+Sync usage text. Sync rejected `--check-config --full`, and the probe
+failed because it expected the previous option order. The probe now
+checks for a nonzero exit and the `--check-config` option in stderr.
+[Failed Phase 7 job](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/45642824861/job/139310609462)
+
+On 2026-11-25, the offline Rust gate and the Phase 7 `--config-only`
+probe passed locally. The Docker E2E helper built fresh Linux amd64
+images and ran the full Phase 7 and Phase 0 cases on rootful Docker.
+Both passed. The config probe also verified that `--check-config`
+returns valid JSON for the default and mounted configurations.
+
 [Sync monitoring commands and log levels](ingestion.md#monitor-sync)

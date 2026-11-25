@@ -237,7 +237,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         for name in ("RFC_SYNC_HTTP_CONCURRENCY", "RFC_SYNC_PARSE_CONCURRENCY"):
             probe("-e", f"{name}=1", expected=f"{name} was removed")
             probe(*file_options, "-e", f"{name}=1", expected=f"{name} was removed")
-        probe(*file_options, args=("--check-config", "--full"), expected="expected --version, --check-config")
+        probe(*file_options, args=("--check-config", "--full"), expected="--check-config")
         probe("-e", f"RFC_SYNC_CONFIG_FILE={INGESTION_PATH}", expected="cannot open ingestion config")
         probe("-e", "RFC_SYNC_CONFIG_FILE=", expected="must be nonempty")
         probe(memory="768m", expected="ingestion memory needs")
