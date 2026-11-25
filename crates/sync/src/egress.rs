@@ -34,14 +34,15 @@ pub(crate) fn preflight(accepted: u64) -> Result<(u64, u64)> {
         || stats.f_favail < 40_016
         || stats.f_frsize > 4096
     {
-        return Err(
-            "HTTPS spool lacks free bytes or inodes for the configured ingestion budget".into(),
-        );
+        return Err(crate::diagnostics::CapacityPressure(
+            "HTTPS spool lacks free bytes or inodes for the configured ingestion budget".to_owned(),
+        )
+        .into());
     }
     Ok((available, stats.f_favail))
 }
 
-fn private_root() -> io::Result<()> {
+pub(crate) fn private_root() -> io::Result<()> {
     let metadata = fs::symlink_metadata(ROOT)?;
     if !metadata.is_dir()
         || metadata.mode() & 0o777 != 0o700
@@ -93,6 +94,11 @@ impl Lease {
         let _ = self.0.metadata()?;
         Ok((state.clone(), state.remaining()?))
     }
+}
+
+pub(crate) fn cooldown_remaining() -> Result<Duration> {
+    private_root()?;
+    Cooldown(Path::new(ROOT).join("cooldown")).remaining()
 }
 
 #[derive(Clone)]

@@ -1716,3 +1716,39 @@ profile, kubeconfig, and evidence under `/tmp`.
 
 The disposable Compose projects, Minikube profile, staging mounts, and
 test image tags were removed after verification.
+
+## Sync monitoring and diagnosis
+
+Local qualification on 2026-11-25 used Linux amd64, rootless Docker and
+private HTTPS-first fixtures. The offline Rust gate, frozen all-feature
+Clippy, and frozen all-feature tests passed. The Rust tests cover
+serialization of safe diagnostic evidence and repair failure classification
+inside the audit task.
+
+- The Phase 0 Compose gate passed against rebuilt stock images. The
+  publication and fault probes passed, including byte-exact reads, guarded
+  rollback, required HTTPS timeout, audit ENOSPC, and a database disconnect
+  before publication commit.
+- The cold-daemon Compose probe exercised status with Sync stopped and
+  PostgreSQL unavailable, a watcher reconnecting across daemon startup,
+  three concurrent watchers during a manual sample, and person-readable
+  and JSON output. Monitoring made no upstream requests or changes to the
+  active pointer or notification outbox during inspection.
+- The same probe observed the 300- and 900-second invalid-inventory retry
+  deadlines, retained a typed audit diagnostic across restart, and verified
+  that successful publication cleared the diagnostic on the same job. An
+  undelivered authenticated notification appeared in diagnosis with its
+  publication sequence and retry metadata.
+- Rootless Minikube 1.39.0 with Kubernetes 1.37.0 verified all three commands
+  through `kubectl exec` as Sync. Manual publication, repair replay,
+  automatic publication, and brokered Feed publication passed with
+  byte-exact MCP reads and authenticated outbox delivery.
+
+An initial Minikube attempt mistook a structured log event for a one-off
+command result because the pod log merges both streams. The probe now
+identifies command results before asserting their payload. A subsequent
+attempt completed its assertions and was interrupted during namespace
+cleanup. The final run completed its assertions and namespace cleanup before
+the disposable profile was removed.
+
+[Sync monitoring commands and log levels](ingestion.md#monitor-sync)

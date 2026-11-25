@@ -399,15 +399,15 @@ impl SyncConfig {
             .min(MEMORY_LIMIT)
             .min(cgroup.unwrap_or(MEMORY_LIMIT));
         if SCRATCH_REQUIRED > scratch_available {
-            return Err(format!(
+            return Err(crate::diagnostics::CapacityPressure(format!(
                 "ingestion scratch needs {SCRATCH_REQUIRED} bytes, available {scratch_available}"
-            )
+            ))
             .into());
         }
         if memory_required > memory_available {
-            return Err(format!(
+            return Err(crate::diagnostics::CapacityPressure(format!(
                 "ingestion memory needs {memory_required} bytes, available {memory_available}"
-            )
+            ))
             .into());
         }
         Ok(Resources {

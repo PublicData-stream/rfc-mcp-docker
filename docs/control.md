@@ -22,7 +22,7 @@ Choose a new key ID and generate a fresh key. Install it as the active key on th
 
 ## Reconciliation and publication
 
-Feed polls the official publication feed every 15 minutes plus jitter. Conditional validators advance only after its hints are acknowledged. The RFC publication identifier determines the observation fingerprint and event ID, so a replay, a switch between feed formats, or a restart can repeat the same hint safely. A feed hint acknowledges durable acceptance, which can refer to an existing job. Inspect `rfc.control_events.job_id`, the event status, and `rfc.sync_jobs.state` to see whether work has completed. A failed job is terminal after two retries. Later scheduled work can still reconcile independently.
+Feed polls the official publication feed every 15 minutes plus jitter. Conditional validators advance only after its hints are acknowledged. The RFC publication identifier determines the observation fingerprint and event ID, so a replay, a switch between feed formats, or a restart can repeat the same hint safely. A feed hint acknowledges durable acceptance, which can refer to an existing job. The Sync CLI's `status` command shows job and retry state, and `diagnose` explains the latest stored reason. The event's job ID is available in `rfc.control_events.job_id`. A failed job is terminal after two retries. Later scheduled work can still reconcile independently. [Sync monitoring commands](ingestion.md#monitor-sync)
 
 Feed requests a poll through Sync's private control listener. Sync owns the
 upstream validators and schedules the fetch in the same HTTPS budget as

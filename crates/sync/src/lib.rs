@@ -24,6 +24,7 @@ mod fixture_storage;
 mod inventory;
 mod manual;
 mod metrics;
+mod monitor;
 mod parse;
 mod policy;
 mod publication;
@@ -40,6 +41,7 @@ pub use daemon::run_daemon;
 #[cfg(feature = "phase3-fixtures")]
 pub use discovery::reconcile_audited_fixture;
 pub use discovery::{Scope, reconcile};
+pub use monitor::{Command as MonitorCommand, inspect};
 pub use publication::promote;
 pub use recovery::{Maintenance, maintain};
 pub use xml::validate_feed;

@@ -39,7 +39,8 @@ pub(crate) const PUBLICATION_GATE: &str = "https_txt_audit_required";
 pub(crate) const POLICY: &str = "https-first-rsync-audit-v1";
 const DEADLINE: Duration = Duration::from_secs(600);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Scope {
     Full,
     Sample,
@@ -172,7 +173,8 @@ async fn reconcile_standalone(
             _ = interrupt.recv() => (),
         }
     };
-    let work = execute_with_registry(scope, None, &config, &upstream, &shutdown, registry);
+    let run = Run::start(scope, None);
+    let work = execute_with_registry(&run, &config, &upstream, &shutdown, registry);
     tokio::pin!(work);
     let outcome = tokio::select! {
         result = &mut work => result?,
@@ -235,25 +237,23 @@ impl Execution {
 }
 
 pub(crate) async fn execute(
-    scope: Scope,
-    job: Option<i64>,
+    run: &Run,
     config: &SyncConfig,
     upstream: &Upstream,
     shutdown: &Shutdown,
 ) -> Result<Execution> {
-    execute_with_registry(scope, job, config, upstream, shutdown, None).await
+    execute_with_registry(run, config, upstream, shutdown, None).await
 }
 
 async fn execute_with_registry(
-    scope: Scope,
-    job: Option<i64>,
+    run: &Run,
     config: &SyncConfig,
     upstream: &Upstream,
     shutdown: &Shutdown,
     registry: Option<Registry>,
 ) -> Result<Execution> {
     let started = Instant::now();
-    let run = Run::start(scope, job);
+    let (scope, job) = (run.scope(), run.job());
     let upstream = upstream.for_run(run.clone());
     let mut report = Report {
         event: "acquisition",

@@ -235,8 +235,7 @@ impl BlobWriter {
         Ok(root)
     }
 
-    /// Opens a writable mirror and durably prepares its private directories.
-    pub fn open(path: &Path) -> io::Result<Self> {
+    fn writable_root(path: &Path) -> io::Result<OwnedFd> {
         let root = mirror(path)?;
         if read_only(&root)? {
             return Err(io::Error::new(
@@ -244,6 +243,23 @@ impl BlobWriter {
                 "sync requires a writable mirror mount",
             ));
         }
+        fs::accessat(
+            &root,
+            ".",
+            fs::Access::WRITE_OK | fs::Access::EXEC_OK,
+            AtFlags::EACCESS,
+        )?;
+        Ok(root)
+    }
+
+    /// Inspects the Sync mirror mount without preparing or changing directories.
+    pub fn check_mount(path: &Path) -> io::Result<()> {
+        Self::writable_root(path).map(drop)
+    }
+
+    /// Opens a writable mirror and durably prepares its private directories.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let root = Self::writable_root(path)?;
         let blobs = ensure_directory(&root, "blobs", PUBLIC_DIRECTORY)?;
         let blobs = ensure_directory(&blobs, "blake3", PUBLIC_DIRECTORY)?;
         let staging = ensure_directory(&root, "staging", PRIVATE_DIRECTORY)?;
@@ -256,7 +272,7 @@ impl BlobWriter {
                 ));
             }
         }
-        for writable in [&root, &blobs, &staging, &quarantine] {
+        for writable in [&blobs, &staging, &quarantine] {
             fs::accessat(
                 writable,
                 ".",

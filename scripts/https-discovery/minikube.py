@@ -150,7 +150,15 @@ print(response.read().decode())
             print(self.kubectl("describe", "pod", name))
             print(self.kubectl("logs", name))
             raise
-        return self.kubectl("logs", name).splitlines()[-1]
+        # Kubernetes combines the command result and structured stderr logs.
+        # The final line can come from either stream.
+        for line in reversed(self.kubectl("logs", name).splitlines()):
+            if line.startswith("{"):
+                payload = json.loads(line)
+                if {"event", "level", "timestamp_ms"} <= payload.keys():
+                    continue
+            return line
+        raise AssertionError(f"{name} produced no command result")
 
     def database(self, *sql, input=None):
         return self.kubectl("exec", "-i", "postgres", "--", "psql", "-XqAt",
@@ -336,7 +344,26 @@ print(response.read().decode())
         assert self.database("-c", "SELECT publication_sequence FROM rfc.active_generation") == "0"
         if automatic:
             sync("sync", args=())
+            def live_status():
+                try:
+                    report = json.loads(self.kubectl("exec", "sync", "--", "/phase6/sync", "status", "--json",
+                                                    timeout=20, stderr=subprocess.PIPE))
+                except subprocess.CalledProcessError:
+                    return None
+                return report if report["live"]["state"] == "available" else None
+
+            status = phase6.wait(live_status, seconds=45)
+            assert status["schema_version"] == 1 and status["database"]["state"] == "available", status
+            watched = self.kubectl("exec", "sync", "--", "sh", "-ec",
+                                   '/phase6/sync watch --json & watcher=$!; sleep 4; kill -TERM "$watcher"; wait "$watcher"')
+            snapshots = [json.loads(line) for line in watched.splitlines()]
+            assert snapshots[0]["live"]["state"] == "available", snapshots
+            assert all(row["database"]["state"] == "not_requested" for row in snapshots), snapshots
             self.delivered(1)
+            diagnosed = json.loads(self.kubectl("exec", "sync", "--", "/phase6/sync", "diagnose", "--json"))
+            assert diagnosed["database"]["data"]["publication_sequence"] == 1, diagnosed
+            assert all(finding["severity"] != "error" for finding in diagnosed["findings"]), diagnosed
+            assert "https_attempt" not in self.kubectl("logs", "sync")
             self.verify_served(1, sources[2119])
             self.add_feed_publication()
             self.pod("feed", f"{self.prefix}-feed", 10003, ["/phase6/feed"], env={
@@ -346,6 +373,7 @@ print(response.read().decode())
             self.delivered(2)
             self.verify_served(2, sources[2119])
             assert self.database("-c", "SELECT count(*) FROM rfc.control_events WHERE status='completed'") == "1"
+            print("Minikube status, watch, and diagnose passed through kubectl exec as Sync", flush=True)
             print("Minikube fresh daemon and brokered Feed publications passed with authenticated outbox and MCP reads",
                   flush=True)
             return

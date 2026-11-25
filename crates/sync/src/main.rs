@@ -1,16 +1,57 @@
 use rfc_core::GenerationId;
 use rfc_mcp_docker::{ProbeResult, https_probe};
 use rfc_mcp_docker_sync::{
-    Maintenance, Scope, Writer, check_config, maintain, promote, reconcile, run_daemon,
+    Maintenance, MonitorCommand, Scope, Writer, check_config, inspect, maintain, promote,
+    reconcile, run_daemon,
 };
 use rfc_storage::{blob::BlobWriter, postgres::mirror_root};
-use std::path::Path;
+use std::{path::Path, process::ExitCode};
+
+const USAGE: &str = "rfc-mcp-docker-sync [status|watch|diagnose] [--json]\n\
+     Run without arguments to start the daemon.\n\
+     Use --check-config, --version, --phase1-check-storage, --phase2-reconcile (--full|--sample),\n\
+     --phase3-(publish|rollback) GENERATION --expect-sequence SEQUENCE,\n\
+     --phase3-(recover|gc), or --phase3-discard GENERATION for existing operations.";
 
 #[tokio::main(worker_threads = 2)]
-async fn main() -> ProbeResult {
+async fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    match args.as_slice() {
+    let command = match args.first().map(String::as_str) {
+        Some("status") => Some(MonitorCommand::Status),
+        Some("watch") => Some(MonitorCommand::Watch),
+        Some("diagnose") => Some(MonitorCommand::Diagnose),
+        _ => None,
+    };
+    if let Some(command) = command {
+        return match &args[1..] {
+            [] => ExitCode::from(inspect(command, false).await),
+            [flag] if flag == "--json" => ExitCode::from(inspect(command, true).await),
+            [flag] if flag == "--help" || flag == "-h" => {
+                println!("rfc-mcp-docker-sync {} [--json]", args[0]);
+                ExitCode::SUCCESS
+            }
+            _ => {
+                eprintln!("Expected rfc-mcp-docker-sync {} [--json]", args[0]);
+                ExitCode::from(2)
+            }
+        };
+    }
+    match run(&args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(args: &[String]) -> ProbeResult {
+    match args {
         [] => run_daemon().await,
+        [option] if option == "--help" || option == "-h" => {
+            println!("{USAGE}");
+            Ok(())
+        }
         [option] if option == "--check-config" => check_config(),
         [option] if option == "--version" => {
             println!("rfc-mcp-docker-sync {}", env!("CARGO_PKG_VERSION"));
@@ -55,11 +96,6 @@ async fn main() -> ProbeResult {
                 GenerationId::new(generation.parse()?).ok_or("invalid generation ID")?;
             maintain(Maintenance::Discard(generation)).await
         }
-        _ => Err(
-            "expected --version, --check-config, --phase1-check-storage, --phase2-reconcile (--full|--sample), \
-             --phase3-(publish|rollback) GENERATION --expect-sequence SEQUENCE, \
-             --phase3-(recover|gc), or --phase3-discard GENERATION"
-                .into(),
-        ),
+        _ => Err(USAGE.into()),
     }
 }

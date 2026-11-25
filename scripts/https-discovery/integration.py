@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
@@ -85,6 +86,20 @@ def daemon_reports(project):
     logs = project.capture("logs", "--no-color", "--no-log-prefix", "sync")
     return [event for line in logs.splitlines() if line.startswith("{")
             and (event := json.loads(line)).get("event") == "acquisition"]
+
+
+def monitor(project, command="status", *, offline=False, db_available=True, expected=0):
+    if offline:
+        options = () if db_available else ("-e", "RFC_DB_HOST=127.0.0.1")
+        argv = project.app("sync", "-T", *options, args=(command, "--json"))
+    else:
+        options = () if db_available else ("-e", "RFC_DB_HOST=127.0.0.1")
+        argv = project.command("exec", "-T", *options, "sync", "/phase6/sync", command, "--json")
+    result = subprocess.run(argv, env=project.env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == expected, (result.returncode, result.stdout, result.stderr)
+    report = json.loads(result.stdout)
+    assert report["schema_version"] == 1, report
+    return report
 
 
 def wait_report(project, **expected):
@@ -1127,6 +1142,11 @@ def exercise_inventory_retry(project):
     first = wait_report(project, state="acquisition_failed")
     job = first["job_id"]
     for retries, delay in enumerate((300, 900), start=1):
+        phase6.wait(lambda: project.sql(f"SELECT retries FROM rfc.sync_jobs WHERE id={job}") == str(retries))
+        report = monitor(project, "diagnose")
+        assert report["live"]["state"] == report["database"]["state"] == "available", report
+        assert report["database"]["data"]["running_job"]["diagnostic"]["code"] == "invalid_inventory", report
+        assert any(finding["code"] == "job_waiting" for finding in report["findings"]), report
         advance_retry(project, job, retries, delay=delay)
     wait_job(project, job, "reconciliation_failed")
     failures = [report for report in daemon_reports(project) if report["job_id"] == job]
@@ -1138,10 +1158,92 @@ def exercise_inventory_retry(project):
         assert report["metrics"]["https_requests"] == 1, report
         assert report["acquisition"]["txt_downloaded"] == report["audit"]["matched"] == 0, report
     assert publication_snapshot(project) == "-1|0|0|0"
+    project.run("stop", "sync")
+    failed = monitor(project, "diagnose", offline=True, expected=1)
+    assert failed["live"]["state"] == "unavailable", failed
+    assert failed["database"]["data"]["last_terminal_job"]["diagnostic"]["code"] == "invalid_inventory", failed
+    missing = monitor(project, offline=True, db_available=False, expected=1)
+    assert missing["live"]["data"] is None and missing["database"]["data"] is None, missing
     bad_link.unlink()
-    # Startup enqueues a fresh job after the invalid listing exhausted its retries.
-    project.restart_sync()
     print("Invalid inventory was retried twice, then corrected on the same initialized stack", flush=True)
+
+
+def exercise_monitored_audit_retry(project, config):
+    settings = config.read_text()
+    faster = settings.replace("retry_backoff_seconds = [5, 30]", "retry_backoff_seconds = [1, 2]")
+    assert faster != settings
+    config.write_text(faster)
+    mode = project.source / "mode"
+    mode.write_text("acquisition-audit-truncate")
+    project.restart_sync()
+    first = wait_report(project, state="acquisition_failed")
+    job = first["job_id"]
+    phase6.wait(lambda: project.sql(f"SELECT retries FROM rfc.sync_jobs WHERE id={job}") == "1")
+    assert monitor(project)["database"]["data"]["running_job"]["diagnostic"]["code"] == "audit_failed"
+    project.run("stop", "sync")
+    mode.write_text("acquisition-monitor")
+    without_daemon = monitor(project, offline=True)
+    assert without_daemon["live"]["state"] == "unavailable", without_daemon
+    assert without_daemon["database"]["data"]["running_job"]["id"] == job, without_daemon
+
+    # Keep this fixture job waiting while testing a daemon-owned sample.
+    project.sql(f"UPDATE rfc.sync_jobs SET next_attempt_at=now()+interval '5 minutes' WHERE id={job}")
+    watch_offline = project.app("sync", "-T", "--entrypoint", "/bin/sh",
+                                args=("-ec", '/phase6/sync watch --json & watcher=$!; sleep 12; kill -TERM "$watcher"; wait "$watcher"'))
+    with subprocess.Popen(watch_offline, env=project.env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as watcher:
+        assert select.select([watcher.stdout], [], [], 15)[0], "offline watch produced no snapshot"
+        first_line = json.loads(watcher.stdout.readline())
+        assert first_line["live"]["state"] == "unavailable", first_line
+        project.restart_sync()
+        out, err = watcher.communicate(timeout=15)
+        assert watcher.returncode == 0, (out, err)
+        assert any(json.loads(line)["live"]["state"] == "available" for line in out.splitlines()), out
+    phase6.wait(lambda: monitor(project)["live"]["data"])
+    restored = monitor(project)
+    assert restored["database"]["data"]["running_job"]["diagnostic"]["code"] == "audit_failed", restored
+    live_only = monitor(project, db_available=False)
+    assert live_only["live"]["state"] == "available" and live_only["database"]["data"] is None, live_only
+    bad_option = subprocess.run(project.command("exec", "-T", "sync", "/phase6/sync", "status", "--invalid"),
+                                env=project.env, capture_output=True, timeout=10)
+    assert bad_option.returncode == 2 and not bad_option.stdout, bad_option
+    person_readable = project.capture("exec", "-T", "sync", "/phase6/sync", "status")
+    assert "Sync daemon available" in person_readable and "PostgreSQL available" in person_readable
+    before = publication_snapshot(project)
+    logs_before = project.capture("logs", "--no-log-prefix", "fixtures")
+    monitor(project)
+    monitor(project, "diagnose")
+    assert project.capture("logs", "--no-log-prefix", "fixtures") == logs_before
+
+    command = project.command("exec", "-T", "sync", "sh", "-ec",
+                              '/phase6/sync watch --json & watcher=$!; sleep 10; kill -TERM "$watcher"; wait "$watcher"')
+    watchers = [subprocess.Popen(command, env=project.env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True) for _ in range(3)]
+    try:
+        sample = subprocess.run(project.command("exec", "-T", "sync", "/phase6/sync", "--phase2-reconcile", "--sample"),
+                                env=project.env, check=True, capture_output=True, text=True, timeout=35)
+        assert json.loads(sample.stdout)["state"] == "ready", sample.stdout
+        for watcher in watchers:
+            out, err = watcher.communicate(timeout=15)
+            assert watcher.returncode == 0, (out, err)
+            snapshots = [json.loads(line) for line in out.splitlines()]
+            assert all(row["database"]["state"] == "not_requested" for row in snapshots), snapshots
+            assert any((row["live"]["data"]["active"] or {}).get("scope") == "sample"
+                       for row in snapshots), snapshots
+    finally:
+        for watcher in watchers:
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.wait(timeout=10)
+    assert publication_snapshot(project) == before
+    project.sql(f"UPDATE rfc.sync_jobs SET next_attempt_at=now() WHERE id={job}")
+    wait_job(project, job, "published")
+    assert project.sql(f"SELECT diagnostic IS NULL FROM rfc.sync_jobs WHERE id={job}") == "t"
+    events = [json.loads(line) for line in project.capture("logs", "--no-color", "--no-log-prefix", "sync").splitlines()
+              if line.startswith("{")]
+    assert any(event.get("event") == "https_attempt" and event.get("rfc") == 2119
+               and event.get("level") == "debug" for event in events), events
+    print("Live work, concurrent watchers, offline status, audit diagnostics across restart, and retry recovery passed", flush=True)
 
 
 def exercise_cold_daemon(project, client, sources, config, spool):
@@ -1167,12 +1269,16 @@ def exercise_cold_daemon(project, client, sources, config, spool):
                            args=("-ec", "mkdir -m 0700 /rfc-https-spool/acquisition")), env=project.env)
     phase6.run(["sudo", "-n", "fallocate", "-l", "1G", str(spool / "acquisition/interrupted")])
     phase1.failed(project.app("sync", args=("--check-config",)), project.env, "spool lacks free bytes")
+    overlay = json.loads(project.ingestion_overlay.read_text())
+    overlay["services"]["sync"]["environment"]["RFC_SYNC_LOG_LEVEL"] = "debug"
+    project.ingestion_overlay.write_text(json.dumps(overlay))
     exercise_inventory_retry(project)
+    exercise_monitored_audit_retry(project, config)
     observed = wait_report(project, state="published", published_sequence=1)
     assert observed["inventory_txt"] == len(sources)
     assert observed["metrics"]["rsync_transferred_payload_bytes"] == 0, observed
     assert observed["metrics"]["minimum_start_spacing_us"] >= 1_000_000, observed
-    assert observed["acquisition"]["txt_downloaded"] == observed["acquisition"]["txt_audited"] == len(sources)
+    assert observed["acquisition"]["txt_sealed"] == observed["acquisition"]["txt_audited"] == len(sources)
     wait_job(project, observed["job_id"], "published")
     phase6.wait(lambda: project.admin("/ready").returncode == 0)
     load_mcp_schemas(client)
@@ -1185,6 +1291,9 @@ def exercise_cold_daemon(project, client, sources, config, spool):
     (project.directory.parent / "spoof-mode").write_text("acknowledgment")
     phase6.wait(lambda: "forged acknowledgment" in project.capture("logs", "control-probe"))
     assert project.sql("SELECT count(*) FROM rfc.notification_outbox WHERE delivery_state='pending'") == "1"
+    diagnosed = monitor(project, "diagnose")
+    assert diagnosed["database"]["data"]["oldest_pending_notification"]["publication_sequence"] == 1, diagnosed
+    assert any(finding["code"] == "notification_pending" for finding in diagnosed["findings"]), diagnosed
     project.restart_sync(PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782", PHASE6_DAILY="6")
     phase6.wait(lambda: project.sql("SELECT delivery_state FROM rfc.notification_outbox "
                                     "WHERE publication_sequence=1") == "delivered")

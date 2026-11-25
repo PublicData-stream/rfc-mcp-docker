@@ -8,6 +8,7 @@ use crate::{
     feed_broker::Broker,
     inventory,
     manual::{Manual, Reply},
+    monitor::{Live, RetryWait, Socket},
     shutdown::Shutdown,
     upstream::Upstream,
 };
@@ -125,6 +126,22 @@ async fn daemon() -> Result<()> {
     };
     let manual = Manual::default();
     let operator = Manual::bind()?;
+    let live = Live::default();
+    let monitor_worker = match Socket::bind() {
+        Ok(socket) => {
+            let live = live.clone();
+            let shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                if socket.serve(&live, &shutdown).await.is_err() {
+                    diagnostics::event(Level::Warn, "monitor_socket_failed", || json!({}));
+                }
+            }))
+        }
+        Err(_) => {
+            diagnostics::event(Level::Warn, "monitor_socket_bind_failed", || json!({}));
+            None
+        }
+    };
     diagnostics::event(Level::Info, "daemon_ready", || json!({}));
     let (broker, feed_requests) = Broker::new();
     let broker_control = broker.clone();
@@ -144,6 +161,7 @@ async fn daemon() -> Result<()> {
             &schedule,
             &worker_shutdown,
             &worker_manual,
+            &live,
         )
         .await
     });
@@ -186,6 +204,9 @@ async fn daemon() -> Result<()> {
     } else {
         operator_worker.await
     };
+    if let Some(monitor_worker) = monitor_worker {
+        monitor_worker.await?;
+    }
     drop(lease);
     result?
         .and(worker_result?)
@@ -314,7 +335,7 @@ async fn enqueue(
 
 enum NextJob {
     Ready(i64),
-    Waiting,
+    Waiting(RetryWait),
     Idle,
 }
 
@@ -324,16 +345,18 @@ async fn claim(writer: &mut Writer) -> Result<NextJob> {
         .await?;
     lock_queue(&tx).await?;
     let running = tx.query_opt(
-        "SELECT id, next_attempt_at <= clock_timestamp() FROM rfc.sync_jobs WHERE state = 'running'", &[],
+        "SELECT id, next_attempt_at <= clock_timestamp(), (extract(epoch FROM next_attempt_at) * 1000)::bigint
+         FROM rfc.sync_jobs WHERE state = 'running'", &[],
     ).await?;
     let job = if let Some(row) = running {
         if row.try_get::<_, bool>(1)? {
             NextJob::Ready(row.try_get(0)?)
         } else {
-            NextJob::Waiting
+            NextJob::Waiting(RetryWait { job_id: row.try_get(0)?, next_attempt_ms: row.try_get(2)? })
         }
     } else if let Some(row) = tx
-        .query_opt("SELECT id, next_attempt_at <= clock_timestamp() FROM rfc.sync_jobs WHERE state = 'pending'", &[])
+        .query_opt("SELECT id, next_attempt_at <= clock_timestamp(), (extract(epoch FROM next_attempt_at) * 1000)::bigint
+            FROM rfc.sync_jobs WHERE state = 'pending'", &[])
         .await?
     {
         if row.try_get::<_, bool>(1)? {
@@ -341,7 +364,7 @@ async fn claim(writer: &mut Writer) -> Result<NextJob> {
             tx.execute("UPDATE rfc.sync_jobs SET state = 'running', started_at = clock_timestamp() WHERE id = $1", &[&id]).await?;
             NextJob::Ready(id)
         } else {
-            NextJob::Waiting
+            NextJob::Waiting(RetryWait { job_id: row.try_get(0)?, next_attempt_ms: row.try_get(2)? })
         }
     } else {
         NextJob::Idle
@@ -399,7 +422,7 @@ async fn schedule_retry(
     job: i64,
     status: JobStatus,
     diagnostic: Diagnostic,
-) -> Result<()> {
+) -> Result<Option<RetryWait>> {
     let stored = serde_json::to_string(&diagnostic)?;
     let tx = writer.client.transaction().await?;
     tx.batch_execute("SET LOCAL synchronous_commit = on")
@@ -447,7 +470,10 @@ async fn schedule_retry(
             })
         },
     );
-    Ok(())
+    Ok(next_attempt_ms.map(|next_attempt_ms| RetryWait {
+        job_id: job,
+        next_attempt_ms,
+    }))
 }
 
 async fn catalog_changed(
@@ -494,36 +520,46 @@ async fn worker(
     schedule: &Schedule,
     shutdown: &Shutdown,
     manual: &Manual,
+    live: &Live,
 ) -> Result<()> {
     let mut writer = Writer::connect().await?;
     let mut daily = Instant::now() + jitter(schedule.daily);
     let mut hourly = Instant::now() + jitter(schedule.hourly);
     while shutdown.check().is_ok() {
         if let Some(scope) = manual.claim() {
-            let _ = report_execution(
-                discovery::execute(scope, None, &config, upstream, shutdown).await,
-                manual,
-            );
+            let run = live.start(scope, None);
+            let result = discovery::execute(&run, &config, upstream, shutdown).await;
+            live.finish();
+            let _ = report_execution(result, manual);
             continue;
         }
         if Instant::now() >= daily && enqueue(&mut writer, None, false).await.is_ok() {
             daily = Instant::now() + jitter(schedule.daily);
         }
-        match claim(&mut writer).await {
+        let next = claim(&mut writer).await;
+        if let Ok(next) = &next {
+            live.waiting(match next {
+                NextJob::Waiting(wait) => Some(*wait),
+                _ => None,
+            });
+        }
+        match next {
             Ok(NextJob::Ready(job)) => {
-                let result = process_job(&config, upstream, job, shutdown, manual).await;
+                let result = process_job(&config, upstream, job, shutdown, manual, live).await;
                 if let Some((status, diagnostic)) = result
                     && shutdown.check().is_ok()
-                    && schedule_retry(&mut writer, job, status, diagnostic)
-                        .await
-                        .is_err()
                 {
-                    diagnostics::event(
-                        Level::Warn,
-                        "job_retry_record_failed",
-                        || json!({"job_id": job}),
-                    );
-                    sleep(LOOP_TICK).await;
+                    match schedule_retry(&mut writer, job, status, diagnostic).await {
+                        Ok(wait) => live.waiting(wait),
+                        Err(_) => {
+                            diagnostics::event(
+                                Level::Warn,
+                                "job_retry_record_failed",
+                                || json!({"job_id": job}),
+                            );
+                            sleep(LOOP_TICK).await;
+                        }
+                    }
                 }
             }
             Ok(NextJob::Idle) if Instant::now() >= hourly => {
@@ -565,9 +601,12 @@ async fn process_job(
     job: i64,
     shutdown: &Shutdown,
     manual: &Manual,
+    live: &Live,
 ) -> Option<(JobStatus, Diagnostic)> {
     manual.start_automatic();
-    let result = discovery::execute(Scope::Full, Some(job), config, upstream, shutdown).await;
+    let run = live.start(Scope::Full, Some(job));
+    let result = discovery::execute(&run, config, upstream, shutdown).await;
+    live.finish();
     let diagnostic = result
         .as_ref()
         .ok()

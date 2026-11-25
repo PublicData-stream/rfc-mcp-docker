@@ -174,7 +174,40 @@ The initial container memory limits are 768 MiB for serve, 2 GiB for sync, 128 M
 
 ## Operate and recover
 
-Use the same Compose project and private environment file for every command. Set `RFC_ENV_FILE` to its path. Inspect the project and the loopback serving health before opening or reopening ingress:
+Use the same Compose project and private environment file for every command.
+Set `RFC_ENV_FILE` to its path.
+
+Run Sync monitoring commands inside the Sync container as UID 10002.
+Use `kubectl exec` against the Sync container when running the private
+Minikube probe.
+
+```sh
+docker compose --env-file "$RFC_ENV_FILE" exec -T rfc-mcp-docker-sync \
+    rfc-mcp-docker-sync status
+docker compose --env-file "$RFC_ENV_FILE" exec -T rfc-mcp-docker-sync \
+    rfc-mcp-docker-sync watch
+docker compose --env-file "$RFC_ENV_FILE" exec -T rfc-mcp-docker-sync \
+    rfc-mcp-docker-sync diagnose --json
+kubectl exec sync -- /usr/local/bin/rfc-mcp-docker-sync status
+```
+
+When Sync is stopped, run `status` or `diagnose` in a one-off Sync container
+using the same Compose configuration and mounted settings. PostgreSQL can
+still provide job, publication, and notification evidence.
+
+```sh
+docker compose --env-file "$RFC_ENV_FILE" run --rm --no-deps rfc-mcp-docker-sync status --json
+docker compose --env-file "$RFC_ENV_FILE" run --rm --no-deps rfc-mcp-docker-sync diagnose
+```
+
+Use `docker compose --env-file "$RFC_ENV_FILE" logs rfc-mcp-docker-sync` and the run ID or durable job ID
+from the report to find the relevant events. For notification delivery, use
+the publication sequence. Set `RFC_SYNC_LOG_LEVEL=debug` in the Compose
+environment and recreate Sync when you need per-RFC attempt and batch
+detail. Restore the default `info` level after collecting the details.
+[Sync CLI and log contract](ingestion.md#monitor-sync)
+
+Inspect the project and the loopback serving health before opening or reopening ingress.
 
 ```sh
 docker compose --env-file "$RFC_ENV_FILE" ps

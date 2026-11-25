@@ -195,6 +195,52 @@ the local capacity or corruption problem has been resolved.
 <a id="pipeline-and-recovery"></a>
 <a id="txt-provenance-and-reuse"></a>
 
+## Monitor Sync
+
+`status` summarizes live progress, pending and retrying jobs, the most
+recent terminal job, publication, and the oldest pending notification.
+`watch` follows daemon-owned runs, including manual requests handled by
+the daemon. It emits a snapshot on startup, when state changes, and every
+30 seconds if idle. While its container remains available, it reconnects
+after a transient socket failure. Use logs for a standalone reconciliation.
+
+`diagnose` reads the same observations and checks local startup
+prerequisites. Findings include a stable code, severity, evidence, and
+suggested action. The daemon may be stopped while PostgreSQL supplies
+durable records. Local checks inspect the configuration currently mounted
+for the command. A running daemon uses the settings it loaded at startup.
+The commands make no upstream or Serve requests and leave jobs, mounts,
+and publication state untouched.
+
+All three commands default to person-readable output. With `--json`,
+`status` and `diagnose` write one JSON object, and `watch` writes one object
+per line. Each includes `schema_version: 1`, the sample time in Unix epoch
+milliseconds, and separate `live` and `database` states. An unavailable
+source has null data. `watch` marks the database source as `not_requested`.
+Treat the two sample times independently because live progress can advance
+while PostgreSQL is being read.
+
+| Command | Exit status |
+|---|---|
+| `status` | `0` when it can read either source, `1` when both sources are unavailable |
+| `watch` | `0` on clean interruption or pipe closure, `1` on an access or protocol error |
+| `diagnose` | `0` with informational findings or warnings, `1` when any finding is an error |
+
+Invalid monitoring arguments exit `2`. A retry deadline is informational.
+An older job may lack a stored reason. Look up the job ID in the Sync logs
+in that case.
+
+Structured logs record lifecycle transitions, progress, retries, audit,
+publication, and notification delivery. Set `RFC_SYNC_LOG_LEVEL` to
+`error`, `warn`, `info` (the default), or `debug`. Debug adds per-RFC
+HTTPS and repair outcomes and timings, plus database and rsync audit batch
+details. Use the run ID to correlate one attempt, the job ID to correlate
+retries, and the publication sequence to follow delivery. The daemon's
+terminal `acquisition` log includes the typed inventory reason and line
+number on a rejection. The explicit reconciliation command continues to
+return its operator report, which can include a bounded preview.
+[Compose usage](deployment.md#operate-and-recover)
+
 ## Historical qualification
 
 See the [pinned schema 9 ingestion guide](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/docs/ingestion.md)

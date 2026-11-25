@@ -15,6 +15,17 @@ use std::{
 
 type Error = dyn std::error::Error + Send + Sync;
 
+#[derive(Debug)]
+pub(crate) struct CapacityPressure(pub String);
+
+impl fmt::Display for CapacityPressure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CapacityPressure {}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
@@ -89,9 +100,10 @@ impl Diagnostic {
             }
             if let Some(error) = error.downcast_ref::<Failure>() {
                 match error.code {
-                    Code::AuditFailed | Code::RepairFailed => {
+                    Code::AuditFailed => {
                         context.get_or_insert(error.code);
                     }
+                    Code::RepairFailed => context = Some(error.code),
                     code => {
                         return Self {
                             http_status: error.http_status,
@@ -224,13 +236,35 @@ struct State {
     phase: Phase,
     progress: Progress,
     last_progress_log: Instant,
+    finished: Option<(Instant, RunResult)>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RunResult {
+    pub outcome: String,
+    pub diagnostic: Option<Diagnostic>,
+    pub generation_id: Option<String>,
+    pub publication_sequence: Option<i64>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RunSnapshot {
+    pub run_id: String,
+    pub scope: Scope,
+    pub job_id: Option<i64>,
+    pub phase: Phase,
+    pub progress: Progress,
+    pub started_at_ms: u64,
+    pub elapsed_ms: u64,
+    pub result: Option<RunResult>,
 }
 
 #[derive(Clone)]
 pub(crate) struct Run {
     id: Arc<str>,
-    scope: &'static str,
+    scope: Scope,
     job: Option<i64>,
+    started_at_ms: u64,
     started: Instant,
     state: Arc<Mutex<State>>,
 }
@@ -239,21 +273,24 @@ impl Run {
     pub fn start(scope: Scope, job: Option<i64>) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let started = Instant::now();
+        let started_at_ms = epoch_ms();
         let run = Self {
             id: format!(
                 "{}-{}-{}",
-                epoch_ms(),
+                started_at_ms,
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             )
             .into(),
-            scope: scope.as_str(),
+            scope,
             job,
+            started_at_ms,
             started,
             state: Arc::new(Mutex::new(State {
                 phase: Phase::Preflight,
                 progress: Progress::default(),
                 last_progress_log: started,
+                finished: None,
             })),
         };
         run.event(
@@ -262,6 +299,32 @@ impl Run {
             || json!({"phase": Phase::Preflight}),
         );
         run
+    }
+
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    pub fn job(&self) -> Option<i64> {
+        self.job
+    }
+
+    pub fn snapshot(&self) -> RunSnapshot {
+        let state = self.state.lock().unwrap();
+        let (elapsed, result) = match &state.finished {
+            Some((end, result)) => (end.duration_since(self.started), Some(result.clone())),
+            None => (self.started.elapsed(), None),
+        };
+        RunSnapshot {
+            run_id: self.id.to_string(),
+            scope: self.scope,
+            job_id: self.job,
+            phase: state.phase,
+            progress: state.progress,
+            started_at_ms: self.started_at_ms,
+            elapsed_ms: millis(elapsed),
+            result,
+        }
     }
 
     pub fn phase(&self, phase: Phase) {
@@ -297,7 +360,19 @@ impl Run {
         generation: Option<&str>,
         sequence: Option<i64>,
     ) {
-        let progress = self.state.lock().unwrap().progress;
+        let progress = {
+            let mut state = self.state.lock().unwrap();
+            state.finished = Some((
+                Instant::now(),
+                RunResult {
+                    outcome: outcome.to_owned(),
+                    diagnostic,
+                    generation_id: generation.map(str::to_owned),
+                    publication_sequence: sequence,
+                },
+            ));
+            state.progress
+        };
         self.event(
             if diagnostic.is_some() {
                 Level::Warn
@@ -318,7 +393,7 @@ impl Run {
         event(level, name, || {
             let mut record = fields();
             record["run_id"] = json!(self.id.as_ref());
-            record["scope"] = self.scope.into();
+            record["scope"] = self.scope.as_str().into();
             record["job_id"] = self.job.into();
             record["elapsed_ms"] = millis(self.started.elapsed()).into();
             record
@@ -350,6 +425,18 @@ mod tests {
                 r#"{"code":"https_cooldown","phase":"acquisition","raw":"untrusted"}"#
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn repair_failure_keeps_its_reason_inside_the_audit_task() {
+        let error = Failure::new(
+            Code::AuditFailed,
+            Failure::new(Code::RepairFailed, "quarantine full"),
+        );
+        assert_eq!(
+            Diagnostic::failure(Phase::Acquisition, &error).code,
+            Code::RepairFailed
         );
     }
 }

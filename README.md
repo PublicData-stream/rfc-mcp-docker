@@ -4,6 +4,8 @@ A read-only RFC research MCP service under development. Sync builds and publishe
 
 Sync acquires original TXT and RFCXML over HTTPS and requires an rsync checksum audit or a fresh dual-source byte match for each required TXT before publication. The standard Compose deployment uses the same engine for automatic and manual reconciliation. [Source evidence and operator commands](docs/ingestion.md)
 
+Use the Sync CLI's `status`, `watch`, and `diagnose` commands to inspect reconciliation, retry deadlines, and publication delivery. [Monitoring commands](docs/ingestion.md#monitor-sync)
+
 See [Docker Compose deployment](docs/deployment.md), the [MCP API](docs/mcp.md), [implementation status](docs/implementation-status.md), [candidate ingestion](docs/ingestion.md), [control plane and key rotation](docs/control.md), [publication and recovery](docs/publication.md), [storage and database provisioning](docs/storage.md), and [contributing](CONTRIBUTING.md).
 
 See [Phase 8 release readiness](docs/release-readiness.md) for qualification commands, the acceptance matrix, and public-release gates.

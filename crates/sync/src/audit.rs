@@ -101,8 +101,14 @@ fn capacity(dir: &File, bytes: u64, inodes: u64) -> Result<Capacity> {
         .f_bavail
         .checked_mul(stats.f_frsize)
         .ok_or("audit filesystem capacity overflow")?;
-    if stats.f_flag & libc::ST_RDONLY != 0 || available_bytes < bytes || stats.f_favail < inodes {
+    if stats.f_flag & libc::ST_RDONLY != 0 {
         return Err("rsync audit volume lacks writable bytes or inodes".into());
+    }
+    if available_bytes < bytes || stats.f_favail < inodes {
+        return Err(crate::diagnostics::CapacityPressure(
+            "rsync audit volume lacks writable bytes or inodes".to_owned(),
+        )
+        .into());
     }
     Ok(Capacity {
         available_bytes,
