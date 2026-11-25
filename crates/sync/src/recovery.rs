@@ -182,8 +182,12 @@ async fn recover(
                 report.blocked_deletions += 1;
                 continue;
             }
-            if let Err(error) = mirror.remove_queued_blob(digest, row.try_get(1)?) {
-                eprintln!("preserving queued blob {digest}: {error}");
+            if mirror.remove_queued_blob(digest, row.try_get(1)?).is_err() {
+                crate::diagnostics::event(
+                    crate::diagnostics::Level::Warn,
+                    "blob_deletion_deferred",
+                    || serde_json::json!({"blob_digest": digest.to_string()}),
+                );
                 report.blocked_deletions += 1;
                 continue;
             }

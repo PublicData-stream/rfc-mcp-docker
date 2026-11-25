@@ -1,5 +1,6 @@
 use crate::Writer;
 use crate::daemon::finish_published_job;
+use crate::diagnostics::{self, Diagnostic, Level, Phase};
 use rfc_core::{BlobDigest, GenerationId};
 use rfc_storage::{
     blob::BlobWriter,
@@ -13,7 +14,27 @@ pub async fn promote(generation: GenerationId, expected: i64, rollback: bool) ->
     }
     let mut writer = Writer::connect().await?;
     let _coordinator = writer.acquire_coordinator().await?;
-    promote_locked(&mut writer, generation, expected, rollback, None).await
+    let result = promote_locked(&mut writer, generation, expected, rollback, None).await;
+    diagnostics::event(
+        if result.is_ok() {
+            Level::Info
+        } else {
+            Level::Warn
+        },
+        if rollback {
+            "rollback_finished"
+        } else {
+            "promotion_finished"
+        },
+        || {
+            serde_json::json!({
+                "generation_id": generation.get(), "expected_sequence": expected,
+                "publication_sequence": result.as_ref().ok(),
+                "diagnostic": result.as_ref().err().map(|error| Diagnostic::failure(Phase::Publication, &**error)),
+            })
+        },
+    );
+    result
 }
 
 pub(crate) async fn promote_locked(

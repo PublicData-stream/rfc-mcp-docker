@@ -2,6 +2,7 @@ use crate::{
     Scope, Writer,
     acquisition::Spool,
     config::SyncConfig,
+    diagnostics::{self, Code, Diagnostic, Level, Phase},
     discovery,
     egress::Lease,
     feed_broker::Broker,
@@ -15,7 +16,8 @@ use rfc_mcp_docker::control::{
     jitter,
 };
 use rfc_storage::{fixture_boundary, postgres::Result};
-use std::{env, time::Duration};
+use serde_json::json;
+use std::{env, net::SocketAddr, time::Duration};
 use tokio::{
     net::TcpListener,
     time::{Instant, sleep, timeout},
@@ -67,6 +69,32 @@ pub(crate) fn acquisition_fixture() -> bool {
 }
 
 pub async fn run_daemon() -> Result<()> {
+    diagnostics::event(Level::Info, "daemon_starting", || json!({}));
+    let result = daemon().await;
+    diagnostics::event(
+        if result.is_ok() {
+            Level::Info
+        } else {
+            Level::Error
+        },
+        "daemon_stopped",
+        || json!({"outcome": if result.is_ok() { "shutdown" } else { "failed" }}),
+    );
+    result
+}
+
+pub(crate) fn control_settings() -> Result<(SocketAddr, SocketAddr, Keys, Keys)> {
+    let listen = control::address(&env::var("RFC_SYNC_CONTROL_BIND")?)?;
+    let notify = control::address(&env::var("RFC_SYNC_SERVE_ADDR")?)?;
+    let feed_keys = Keys::load(Link::FeedSync)?;
+    let notify_keys = Keys::load(Link::SyncServe)?;
+    if feed_keys.overlaps(&notify_keys) {
+        return Err("feed and notification key sets overlap".into());
+    }
+    Ok((listen, notify, feed_keys, notify_keys))
+}
+
+async fn daemon() -> Result<()> {
     let config = SyncConfig::load()?;
     let lease = Lease::acquire()?;
     Spool::sweep().await?;
@@ -79,13 +107,7 @@ pub async fn run_daemon() -> Result<()> {
             .full_reconcile_interval_seconds
             .min(settings.revalidation.interval_seconds),
     ))?;
-    let listen = control::address(&env::var("RFC_SYNC_CONTROL_BIND")?)?;
-    let notify = control::address(&env::var("RFC_SYNC_SERVE_ADDR")?)?;
-    let feed_keys = Keys::load(Link::FeedSync)?;
-    let notify_keys = Keys::load(Link::SyncServe)?;
-    if feed_keys.overlaps(&notify_keys) {
-        return Err("feed and notification key sets overlap".into());
-    }
+    let (listen, notify, feed_keys, notify_keys) = control_settings()?;
     let mut leader = Writer::connect().await?;
     leader.acquire_egress_leader().await?;
     enqueue(&mut leader, None, true).await?;
@@ -103,6 +125,7 @@ pub async fn run_daemon() -> Result<()> {
     };
     let manual = Manual::default();
     let operator = Manual::bind()?;
+    diagnostics::event(Level::Info, "daemon_ready", || json!({}));
     let (broker, feed_requests) = Broker::new();
     let broker_control = broker.clone();
     let broker_upstream = upstream.clone();
@@ -146,6 +169,7 @@ pub async fn run_daemon() -> Result<()> {
         result = &mut services => (Ok(result), 0),
         _ = stopping => (Ok(Ok(())), 0),
     };
+    diagnostics::event(Level::Info, "daemon_stopping", || json!({}));
     shutdown.stop();
     let worker_result = if finished_worker == 1 {
         Ok(Ok(()))
@@ -172,8 +196,16 @@ pub async fn run_daemon() -> Result<()> {
 pub(crate) async fn watch_leader(leader: &Writer) -> Result<()> {
     loop {
         sleep(HEARTBEAT).await;
-        timeout(HEARTBEAT, leader.client.simple_query("SELECT 1")).await??;
+        if let Err(error) = heartbeat(leader).await {
+            diagnostics::event(Level::Error, "leader_heartbeat_failed", || json!({}));
+            return Err(error);
+        }
     }
+}
+
+async fn heartbeat(leader: &Writer) -> Result<()> {
+    timeout(HEARTBEAT, leader.client.simple_query("SELECT 1")).await??;
+    Ok(())
 }
 
 async fn accept(command: Command, broker: &Broker) -> std::result::Result<Outcome, Rejection> {
@@ -320,7 +352,7 @@ async fn claim(writer: &mut Writer) -> Result<NextJob> {
 
 pub(crate) async fn finish_published_job(tx: &Transaction<'_>, job: i64) -> Result<()> {
     lock_queue(tx).await?;
-    complete(tx, job, JobStatus::Published).await
+    complete(tx, job, JobStatus::Published, None).await
 }
 
 #[derive(Clone, Copy)]
@@ -331,7 +363,12 @@ enum JobStatus {
     Published,
 }
 
-async fn complete(tx: &Transaction<'_>, job: i64, status: JobStatus) -> Result<()> {
+async fn complete(
+    tx: &Transaction<'_>,
+    job: i64,
+    status: JobStatus,
+    diagnostic: Option<&str>,
+) -> Result<()> {
     let (state, outcome, event_status) = match status {
         JobStatus::Deferred => ("failed", "acquisition_deferred", "failed"),
         JobStatus::Failed | JobStatus::InvalidInventory => {
@@ -341,9 +378,9 @@ async fn complete(tx: &Transaction<'_>, job: i64, status: JobStatus) -> Result<(
     };
     if tx
         .execute(
-            "UPDATE rfc.sync_jobs SET state = $2, outcome = $3, finished_at = clock_timestamp()
+            "UPDATE rfc.sync_jobs SET state = $2, outcome = $3, finished_at = clock_timestamp(), diagnostic = $4
          WHERE id = $1 AND state = 'running'",
-            &[&job, &state, &outcome],
+            &[&job, &state, &outcome, &diagnostic],
         )
         .await?
         != 1
@@ -357,7 +394,13 @@ async fn complete(tx: &Transaction<'_>, job: i64, status: JobStatus) -> Result<(
     Ok(())
 }
 
-async fn schedule_retry(writer: &mut Writer, job: i64, status: JobStatus) -> Result<()> {
+async fn schedule_retry(
+    writer: &mut Writer,
+    job: i64,
+    status: JobStatus,
+    diagnostic: Diagnostic,
+) -> Result<()> {
+    let stored = serde_json::to_string(&diagnostic)?;
     let tx = writer.client.transaction().await?;
     tx.batch_execute("SET LOCAL synchronous_commit = on")
         .await?;
@@ -369,8 +412,9 @@ async fn schedule_retry(writer: &mut Writer, job: i64, status: JobStatus) -> Res
         )
         .await?
         .try_get(0)?;
-    if retries >= 2 {
-        complete(&tx, job, status).await?;
+    let next_attempt_ms: Option<i64> = if retries >= 2 {
+        complete(&tx, job, status, Some(&stored)).await?;
+        None
     } else {
         let delay: i32 = match (status, retries) {
             (JobStatus::InvalidInventory, 0) => 300,
@@ -378,13 +422,31 @@ async fn schedule_retry(writer: &mut Writer, job: i64, status: JobStatus) -> Res
             (_, 0) => 30,
             _ => 120,
         };
-        tx.execute(
-            "UPDATE rfc.sync_jobs SET retries = retries + 1, next_attempt_at = clock_timestamp() + make_interval(secs => $2::integer)
-             WHERE id = $1",
-            &[&job, &delay],
-        ).await?;
-    }
+        Some(
+            tx.query_one(
+                "UPDATE rfc.sync_jobs SET retries = retries + 1, diagnostic = $3,
+                next_attempt_at = clock_timestamp() + make_interval(secs => $2::integer)
+             WHERE id = $1 RETURNING (extract(epoch FROM next_attempt_at) * 1000)::bigint",
+                &[&job, &delay, &stored],
+            )
+            .await?
+            .try_get(0)?,
+        )
+    };
     tx.commit().await?;
+    diagnostics::event(
+        Level::Warn,
+        if next_attempt_ms.is_some() {
+            "job_retry_scheduled"
+        } else {
+            "job_failed"
+        },
+        || {
+            json!({
+                "job_id": job, "attempt": retries + 1, "next_attempt_ms": next_attempt_ms, "diagnostic": diagnostic,
+            })
+        },
+    );
     Ok(())
 }
 
@@ -450,10 +512,17 @@ async fn worker(
         match claim(&mut writer).await {
             Ok(NextJob::Ready(job)) => {
                 let result = process_job(&config, upstream, job, shutdown, manual).await;
-                if let Some(status) = result
+                if let Some((status, diagnostic)) = result
                     && shutdown.check().is_ok()
-                    && schedule_retry(&mut writer, job, status).await.is_err()
+                    && schedule_retry(&mut writer, job, status, diagnostic)
+                        .await
+                        .is_err()
                 {
+                    diagnostics::event(
+                        Level::Warn,
+                        "job_retry_record_failed",
+                        || json!({"job_id": job}),
+                    );
                     sleep(LOOP_TICK).await;
                 }
             }
@@ -466,11 +535,15 @@ async fn worker(
                 }
                 match changed {
                     Ok(true) if enqueue(&mut writer, None, false).await.is_err() => {
-                        eprintln!("catalog change could not be queued");
+                        diagnostics::event(Level::Warn, "catalog_enqueue_failed", || json!({}));
                         hourly = Instant::now() + LOOP_TICK;
                     }
                     Ok(_) => {}
-                    Err(_) => eprintln!("hourly catalog check failed"),
+                    Err(error) => diagnostics::event(Level::Warn, "catalog_check_failed", || {
+                        json!({
+                            "diagnostic": Diagnostic::failure(Phase::Catalog, &*error),
+                        })
+                    }),
                 }
             }
             _ => tokio::select! {
@@ -492,15 +565,21 @@ async fn process_job(
     job: i64,
     shutdown: &Shutdown,
     manual: &Manual,
-) -> Option<JobStatus> {
+) -> Option<(JobStatus, Diagnostic)> {
     manual.start_automatic();
     let result = discovery::execute(Scope::Full, Some(job), config, upstream, shutdown).await;
-    match report_execution(result, manual) {
+    let diagnostic = result
+        .as_ref()
+        .ok()
+        .and_then(|execution| execution.diagnostic)
+        .unwrap_or_else(|| Diagnostic::new(Code::AcquisitionFailed, Phase::Acquisition));
+    let status = match report_execution(result, manual) {
         Ok(discovery::Outcome::Complete) => None,
         Ok(discovery::Outcome::Deferred) => Some(JobStatus::Deferred),
         Err(error) if error.is::<inventory::ParseError>() => Some(JobStatus::InvalidInventory),
         Err(_) => Some(JobStatus::Failed),
-    }
+    };
+    status.map(|status| (status, diagnostic))
 }
 
 fn report_execution(
@@ -509,7 +588,12 @@ fn report_execution(
 ) -> Result<discovery::Outcome> {
     match result {
         Ok(execution) => {
-            println!("{}", execution.report);
+            match execution.daemon_report() {
+                Ok(report) => println!("{report}"),
+                Err(_) => {
+                    diagnostics::event(Level::Error, "acquisition_report_failed", || json!({}))
+                }
+            }
             manual.finish(execution.operator());
             execution.outcome
         }
@@ -560,17 +644,26 @@ async fn dispatch(mut client: Client, base_retry: Duration) -> Result<()> {
         let reserved_until: &str = claim.try_get(1)?;
         if client.notify_generation(&event).await.is_ok() {
             fixture_boundary("before_outbox_ack");
-            writer.client.execute(
+            let changed = writer.client.execute(
                 "UPDATE rfc.notification_outbox SET delivery_state = 'delivered', delivered_at = clock_timestamp(), last_error = NULL
                  WHERE publication_sequence = $1 AND attempts = $2 AND next_attempt_at = $3::text::timestamptz AND delivery_state = 'pending'",
                 &[&event.publication_sequence, &attempt, &reserved_until],
             ).await?;
+            if changed == 1 {
+                diagnostics::event(Level::Info, "notification_delivered", || {
+                    json!({
+                        "publication_sequence": event.publication_sequence, "generation_id": event.generation_id, "attempt": attempt,
+                    })
+                });
+            }
             fixture_boundary("after_outbox_ack");
         } else {
-            eprintln!(
-                "notification for publication {} will retry",
-                event.publication_sequence
-            );
+            diagnostics::event(Level::Warn, "notification_retry", || {
+                json!({
+                    "publication_sequence": event.publication_sequence, "generation_id": event.generation_id, "attempt": attempt,
+                    "retry_reserved_until": reserved_until, "reason": "authenticated_ack_unavailable",
+                })
+            });
         }
     }
 }

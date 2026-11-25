@@ -6,6 +6,7 @@ use crate::{
     audit, candidate,
     checkpoint::Context,
     config::SyncConfig,
+    diagnostics::{Code, Diagnostic, Failure, Level, Phase, Run},
     egress::Lease,
     inventory,
     metrics::{Record, Stage},
@@ -23,6 +24,7 @@ use rfc_storage::{
     postgres::{Result, mirror_root},
 };
 use serde::Serialize;
+use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -195,6 +197,7 @@ async fn reconcile_standalone(
 pub(crate) struct Execution {
     pub outcome: Result<Outcome>,
     pub report: String,
+    pub diagnostic: Option<Diagnostic>,
 }
 
 impl Execution {
@@ -203,6 +206,31 @@ impl Execution {
             success: matches!(self.outcome, Ok(Outcome::Complete)),
             report: self.report.clone(),
         }
+    }
+
+    pub(crate) fn daemon_report(&self) -> Result<String> {
+        let mut report: serde_json::Value = serde_json::from_str(&self.report)?;
+        if let Some(diagnostic) = self.diagnostic {
+            report["diagnostic"] = serde_json::to_value(diagnostic)?;
+            if report["error"].is_string() {
+                report["error"] = report["diagnostic"]["code"].clone();
+            }
+        }
+        if let Some(rejection) = report
+            .get_mut("inventory_rejection")
+            .and_then(|value| value.as_object_mut())
+        {
+            rejection.remove("entry_preview");
+        }
+        for field in ["catalog_before", "catalog_after"] {
+            if let Some(source) = report
+                .get_mut(field)
+                .and_then(|value| value.as_object_mut())
+            {
+                source.remove("source_url");
+            }
+        }
+        Ok(serde_json::to_string(&report)?)
     }
 }
 
@@ -225,7 +253,8 @@ async fn execute_with_registry(
     registry: Option<Registry>,
 ) -> Result<Execution> {
     let started = Instant::now();
-    let upstream = upstream.with_fresh_metrics();
+    let run = Run::start(scope, job);
+    let upstream = upstream.for_run(run.clone());
     let mut report = Report {
         event: "acquisition",
         scope: scope.as_str(),
@@ -241,12 +270,18 @@ async fn execute_with_registry(
             .await?;
         Spool::sweep().await?;
         config.preflight()?;
+        run.phase(Phase::Recovery);
         let resumed = if let Some(job) = job {
             resume_candidate(&writer, job, &mut report).await?
         } else {
             false
         };
         let outcome = if resumed {
+            run.event(
+                Level::Info,
+                "candidate_resumed",
+                || json!({"generation_id": report.generation_id}),
+            );
             Outcome::Complete
         } else {
             let store = BlobWriter::open(&mirror_root())?;
@@ -275,6 +310,7 @@ async fn execute_with_registry(
                 .expected_publication_sequence
                 .ok_or("candidate has no publication sequence")?;
             shutdown.check()?;
+            run.phase(Phase::Publication);
             let sequence =
                 publication::promote_locked(&mut writer, generation, expected, false, job).await?;
             report.published_sequence = Some(sequence);
@@ -292,10 +328,29 @@ async fn execute_with_registry(
             "acquisition_failed"
         }
     };
+    let diagnostic = match &result {
+        Err(error) => Some(run.diagnose(&**error)),
+        Ok(Outcome::Deferred) => Some(Diagnostic::new(
+            if report.hints_awaiting_catalog > 0 {
+                Code::AwaitingCatalog
+            } else {
+                Code::AwaitingMirror
+            },
+            Phase::Inventory,
+        )),
+        Ok(Outcome::Complete) => None,
+    };
+    run.finish(
+        report.state,
+        diagnostic,
+        report.generation_id.as_deref(),
+        report.published_sequence,
+    );
     report.metrics = upstream.metrics().snapshot(started.elapsed());
     Ok(Execution {
         outcome: result,
         report: serde_json::to_string(&report)?,
+        diagnostic,
     })
 }
 
@@ -363,6 +418,8 @@ async fn discover(
             Ok(())
         })
         .await?;
+    let run = upstream.run();
+    run.phase(Phase::Catalog);
     let before = shutdown.until(deadline, upstream.catalog()).await?;
     let catalog_digest = BlobDigest::hash(&before.bytes);
     report.catalog_before = Some(observation(&before, catalog_digest));
@@ -376,6 +433,7 @@ async fn discover(
     };
     let expected = expected(&catalog, scope)?;
     report.expected_txt = expected.len();
+    run.progress(|progress| progress.expected = expected.len());
     report.catalog_without_txt = catalog
         .entries
         .values()
@@ -387,6 +445,7 @@ async fn discover(
         return Err(format!("catalog lost previously accepted RFC {}", id.get()).into());
     }
 
+    run.phase(Phase::Inventory);
     let inventory = {
         let _stage = upstream.metrics().span(Stage::Rsync);
         let timeout = Duration::from_secs(config.ingestion.discovery.inventory_timeout_seconds)
@@ -394,6 +453,7 @@ async fn discover(
         inventory::list(upstream.rsync_module(), timeout, shutdown).await?
     };
     report.inventory_txt = inventory.len();
+    run.progress(|progress| progress.inventory = inventory.len());
     let metadata: Vec<_> = inventory
         .iter()
         .map(|(id, entry)| (id.get(), entry.length, &entry.modified_utc))
@@ -502,13 +562,15 @@ async fn discover(
             upstream.rsync_module(),
         ),
     )?;
+    run.phase(Phase::Acquisition);
     let audit = audit::Audit::open(
         scope_name,
         &audit_key.to_string(),
         &config.ingestion.revalidation,
         writer,
     )
-    .await?;
+    .await
+    .map_err(|error| Failure::new(Code::AuditFailed, error))?;
     report.selection_id = Some(selection_id.clone());
 
     let mut reuse_xml = if let Some(active) = active {
@@ -583,6 +645,7 @@ async fn discover(
                 result = &mut work => result?,
             }
         };
+        run.phase(Phase::CatalogFence);
         rfc_storage::fixture_boundary("before_https_catalog_validation");
         let fence_deadline = Instant::now()
             + Duration::from_secs(config.ingestion.https.request_timeout_seconds * 3 + 120);
@@ -594,10 +657,13 @@ async fn discover(
         if catalog_digest != end_digest || before.bytes != after.bytes {
             audited.invalidate()?;
             checkpoint.remove(&writer.client, None).await?;
-            return Err("catalog changed during acquisition".into());
+            return Err(
+                Failure::new(Code::CatalogChanged, "catalog changed during acquisition").into(),
+            );
         }
         spool.stage_catalog("catalog-after", &after).await?;
         rfc_storage::fixture_boundary("after_https_catalog_validation");
+        run.phase(Phase::CandidateValidation);
         let candidate_selection = candidate::Selection {
             scope,
             context: checkpoint,
@@ -627,18 +693,19 @@ async fn discover(
         report.expected_publication_sequence = Some(sequence);
         report.promotion_deadline_us = Some(expires);
         report.acquisition.membership_committed = report.expected_txt;
-        if let Err(error) = audited.commit() {
-            eprintln!(
-                "could not acknowledge committed audit for generation {}: {error}",
-                generation.get()
+        if audited.commit().is_err() {
+            run.event(
+                Level::Warn,
+                "audit_cleanup_failed",
+                || json!({"generation_id": generation.get()}),
             );
         }
         Ok(Outcome::Complete)
     }
     .await;
     let cleanup = spool.remove().await;
-    if let Err(error) = cleanup {
-        eprintln!("could not clean HTTPS acquisition spool: {error}");
+    if cleanup.is_err() {
+        run.event(Level::Warn, "spool_cleanup_failed", || json!({}));
     }
     result
 }

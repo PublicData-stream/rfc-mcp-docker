@@ -6,6 +6,7 @@ mod transfer;
 use crate::{
     acquisition::{Accepted, LocalFailure, Original},
     config::Revalidation,
+    diagnostics::{self, Code, Failure, Level},
     shutdown::Shutdown,
     upstream::{TXT_LIMIT, Upstream, now_us},
 };
@@ -14,6 +15,7 @@ use rfc_core::{BlobDigest, RfcNumber};
 use rfc_mcp_docker::control::jitter;
 use rfc_storage::postgres::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -394,7 +396,9 @@ impl Audit {
         }
         (
             self.report,
-            result.map(|()| Completion(self.journal, self.deadline, self.expires_us)),
+            result
+                .map(|()| Completion(self.journal, self.deadline, self.expires_us))
+                .map_err(|error| Failure::new(Code::AuditFailed, error).into()),
         )
     }
 
@@ -415,16 +419,23 @@ impl Audit {
                 Some(State::Matched(saved, _)) if saved == &item => {
                     self.report.matched += 1;
                     self.report.reused += 1;
+                    upstream
+                        .run()
+                        .progress(|progress| progress.audit_matched += 1);
                 }
                 Some(State::Repair(_, repair)) if repair.sealed.as_ref() == Some(&item) => {
                     self.report.repaired += 1;
                     self.report.reused += 1;
+                    upstream
+                        .run()
+                        .progress(|progress| progress.audit_repaired += 1);
                 }
                 Some(State::Repair(_, repair)) if repair.sealed.is_none() => {
                     // A fresh HTTPS capture does not clear a confirmed mismatch.
                     // If a durable pair already exists, verify and replay it first.
                     self.repair(item, repair.as_ref().clone(), resolved, upstream, stop)
-                        .await?;
+                        .await
+                        .map_err(|error| Failure::new(Code::RepairFailed, error))?;
                 }
                 _ => {
                     if !(1..=TXT_LIMIT as u64).contains(&item.length) {
@@ -474,17 +485,22 @@ impl Audit {
         let cleanup = remove_directory(&path);
         result?;
         cleanup?;
-        self.report.matched += inputs
+        let matched = inputs
             .iter()
             .filter(|item| matches!(self.journal.states.get(&item.rfc), Some(State::Matched(..))))
             .count();
+        self.report.matched += matched;
+        upstream
+            .run()
+            .progress(|progress| progress.audit_matched += matched);
         for item in inputs {
             if matches!(
                 self.journal.states.get(&item.rfc),
                 Some(State::Repair(_, _))
             ) {
                 self.repair(item.clone(), Repair::default(), resolved, upstream, stop)
-                    .await?;
+                    .await
+                    .map_err(|error| Failure::new(Code::RepairFailed, error))?;
             }
         }
         Ok(())
@@ -529,12 +545,20 @@ impl Audit {
                     self.journal.batch(session, entries)?;
                     let bytes = inputs.iter().map(|item| item.length).sum();
                     let matches = outcomes.values().filter(|&&matched| matched).count();
+                    upstream.run().event(Level::Debug, "audit_batch", || json!({
+                        "attempt": attempt + 1, "items": inputs.len(), "matches": matches,
+                        "outcome": "committed", "duration_ms": diagnostics::millis(start.elapsed()),
+                    }));
                     upstream.metrics().staged(bytes, 0, None, 0, matches);
                     rfc_storage::fixture_boundary("after_rsync_audit_receipt");
                     return Ok(());
                 }
                 Err(error) => {
                     self.report.failed_sessions += 1;
+                    upstream.run().event(Level::Debug, "audit_batch", || json!({
+                        "attempt": attempt + 1, "items": inputs.len(),
+                        "outcome": "failed", "duration_ms": diagnostics::millis(start.elapsed()),
+                    }));
                     stop.check()?;
                     if attempt + 1 == self.options.max_attempts {
                         self.report.unresolved += inputs.len() - 1;
@@ -609,6 +633,9 @@ impl Audit {
                 remove_directory(&path)?;
                 File::open(&self.root)?.sync_all()?;
                 self.report.repaired += 1;
+                upstream
+                    .run()
+                    .progress(|progress| progress.audit_repaired += 1);
                 return Ok(());
             }
             if repair.attempts >= self.options.max_attempts {
@@ -639,7 +666,12 @@ impl Audit {
             self.journal.repair(input.clone(), repair.clone())?;
             self.report.repair_attempts += 1;
             rfc_storage::fixture_boundary("before_rsync_repair_capture");
+            let started = Instant::now();
             let attempt = self.capture_pair(&path, &input, upstream, stop).await;
+            upstream.run().event(Level::Debug, "repair_attempt", || json!({
+                "rfc": input.rfc, "attempt": repair.attempts, "duration_ms": diagnostics::millis(started.elapsed()),
+                "outcome": match &attempt { Ok((true, _)) => "matched", Ok((false, _)) => "mismatch", Err(_) => "failed" },
+            }));
             match attempt {
                 Ok((true, proof)) => {
                     repair.equal = Some(proof);

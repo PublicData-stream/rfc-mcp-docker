@@ -52,12 +52,11 @@ pub(crate) async fn seal(
     shutdown.check()?;
     let generation = writer.start_ingestion(PARSER, INDEX, job).await?;
     let result = build(writer, generation, selection, audit, shutdown).await;
-    if result.is_err()
-        && let Err(error) = writer.fail(generation).await
-    {
-        eprintln!(
-            "could not mark generation {} failed: {error}",
-            generation.get()
+    if result.is_err() && writer.fail(generation).await.is_err() {
+        crate::diagnostics::event(
+            crate::diagnostics::Level::Warn,
+            "candidate_failure_record_failed",
+            || serde_json::json!({"generation_id": generation.get(), "job_id": job}),
         );
     }
     result

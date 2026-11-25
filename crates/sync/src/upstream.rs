@@ -3,6 +3,7 @@
 use crate::{
     acquisition::{Accepted, LocalFailure},
     config::Https,
+    diagnostics::{self, Code, Diagnostic, Failure, Level, Phase, Run},
     egress::{Cooldown, Lease},
     metrics::{Metrics, Stage},
     request_order::{Lane, Order},
@@ -12,6 +13,7 @@ use reqwest::{Client, StatusCode, header};
 use rfc_core::{BlobDigest, RfcNumber};
 use rfc_mcp_docker::control::{FEED_LIMIT, FeedFormat, jitter};
 use rfc_storage::postgres::Result;
+use serde_json::json;
 use std::{
     future::{Future, poll_fn},
     path::Path,
@@ -146,7 +148,15 @@ impl FetchFailure {
             "request failed"
         };
         let detail = std::error::Error::source(&error).unwrap_or(&error);
-        let message = format!("{} HTTPS transport: {reason}: {detail}", source.kind());
+        let code = if error.is_timeout() {
+            Code::HttpsTimeout
+        } else {
+            Code::HttpsTransport
+        };
+        let message = Failure::new(
+            code,
+            format!("{} HTTPS transport: {reason}: {detail}", source.kind()),
+        );
         if retryable {
             Self::Retryable {
                 error: message.into(),
@@ -172,6 +182,7 @@ pub(crate) struct Upstream {
     order: Arc<Order>,
     parsers: Arc<Semaphore>,
     cooldown: Option<Cooldown>,
+    run: Option<Run>,
 }
 
 impl Upstream {
@@ -231,6 +242,7 @@ impl Upstream {
             order: Arc::default(),
             parsers: Arc::new(Semaphore::new(2)),
             cooldown: None,
+            run: None,
         })
     }
 
@@ -255,11 +267,16 @@ impl Upstream {
         Ok(self)
     }
 
-    pub(crate) fn with_fresh_metrics(&self) -> Self {
+    pub(crate) fn for_run(&self, run: Run) -> Self {
         Self {
             metrics: Metrics::default(),
+            run: Some(run),
             ..self.clone()
         }
+    }
+
+    pub(crate) fn run(&self) -> &Run {
+        self.run.as_ref().expect("acquisition upstream has a run")
     }
 
     fn start_interval(&self) -> Duration {
@@ -306,11 +323,9 @@ impl Upstream {
 
     pub(crate) async fn wait_repair_egress(&self, shutdown: &Shutdown) -> Result<()> {
         loop {
-            let next = self
-                .next_request
-                .lock()
-                .await
-                .ok_or("HTTPS cooldown exceeds clock range")?;
+            let next = self.next_request.lock().await.ok_or_else(|| {
+                Failure::new(Code::HttpsCooldown, "HTTPS cooldown exceeds clock range")
+            })?;
             if next.saturating_duration_since(time::Instant::now())
                 <= MAX_RETRY_AFTER.max(self.start_interval())
             {
@@ -327,7 +342,8 @@ impl Upstream {
         shutdown: &Shutdown,
         accepted: &Accepted,
     ) -> Result<Capture> {
-        match self
+        let started = time::Instant::now();
+        let result = self
             .fetch_once(
                 Source::Txt(id),
                 true,
@@ -335,8 +351,9 @@ impl Upstream {
                 Some(shutdown),
                 None,
             )
-            .await
-        {
+            .await;
+        self.log_attempt(Source::Txt(id), 1, "repair", started, &result);
+        match result {
             Ok(Download::Captured(capture)) => Ok(capture),
             Ok(Download::Missing(_)) => Err("required repair TXT is unavailable".into()),
             Err(FetchFailure::Retryable { error, .. } | FetchFailure::Terminal(error)) => {
@@ -350,10 +367,12 @@ impl Upstream {
         format: FeedFormat,
         validators: (&Option<String>, &Option<String>),
     ) -> Result<Capture> {
-        match self
+        let started = time::Instant::now();
+        let result = self
             .fetch_once(Source::Feed(format), false, None, None, Some(validators))
-            .await
-        {
+            .await;
+        self.log_attempt(Source::Feed(format), 1, "feed", started, &result);
+        match result {
             Ok(Download::Captured(capture)) => Ok(capture),
             Ok(Download::Missing(_)) => Err("feed returned an invalid result".into()),
             Err(FetchFailure::Terminal(error) | FetchFailure::Retryable { error, .. }) => {
@@ -371,9 +390,11 @@ impl Upstream {
         let max_attempts = self.https.max_attempts;
         let mut attempt = 1;
         loop {
+            let started = time::Instant::now();
             let result = self
                 .fetch_once(source, attempt > 1, path, shutdown, None)
                 .await;
+            self.log_attempt(source, attempt, "acquisition", started, &result);
             if let Some((partial, _)) = path
                 && result.is_err()
             {
@@ -405,6 +426,58 @@ impl Upstream {
                     attempt += 1;
                 }
             }
+        }
+    }
+
+    fn log_attempt(
+        &self,
+        source: Source,
+        attempt: u32,
+        purpose: &'static str,
+        started: time::Instant,
+        result: &std::result::Result<Download, FetchFailure>,
+    ) {
+        let fields = || {
+            let (outcome, diagnostic) = match result {
+                Ok(Download::Captured(capture)) if capture.unchanged => ("unchanged", None),
+                Ok(Download::Captured(_)) => ("captured", None),
+                Ok(Download::Missing(MissingXml::NotFound)) => ("not_found", None),
+                Ok(Download::Missing(MissingXml::Gone)) => ("gone", None),
+                Err(FetchFailure::Retryable { error, .. }) => {
+                    ("retryable", Some(self.fetch_diagnostic(source, &**error)))
+                }
+                Err(FetchFailure::Terminal(error)) => {
+                    ("failed", Some(self.fetch_diagnostic(source, &**error)))
+                }
+            };
+            let rfc = match source {
+                Source::Txt(id) | Source::Xml(id) => Some(id.get()),
+                _ => None,
+            };
+            json!({"source": source.kind(), "rfc": rfc, "purpose": purpose, "attempt": attempt,
+                "outcome": outcome, "duration_ms": diagnostics::millis(started.elapsed()), "diagnostic": diagnostic})
+        };
+        if let Some(run) = &self.run {
+            run.event(Level::Debug, "https_attempt", fields);
+        } else {
+            diagnostics::event(Level::Debug, "https_attempt", fields);
+        }
+    }
+
+    fn fetch_diagnostic(
+        &self,
+        source: Source,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> Diagnostic {
+        if let Some(run) = &self.run {
+            run.diagnose(error)
+        } else {
+            let phase = if matches!(source, Source::Catalog) {
+                Phase::Catalog
+            } else {
+                Phase::Acquisition
+            };
+            Diagnostic::failure(phase, error)
         }
     }
 
@@ -448,7 +521,10 @@ impl Upstream {
             let Some(deadline) = *gate else {
                 drop(gate);
                 drop(permit);
-                return Err(FetchFailure::terminal("HTTPS cooldown exceeds clock range"));
+                return Err(FetchFailure::terminal(Failure::new(
+                    Code::HttpsCooldown,
+                    "HTTPS cooldown exceeds clock range",
+                )));
             };
             if deadline <= time::Instant::now() {
                 next = gate;
@@ -461,9 +537,10 @@ impl Upstream {
                 && deadline.saturating_duration_since(time::Instant::now())
                     > MAX_RETRY_AFTER.max(self.start_interval())
             {
-                return Err(FetchFailure::terminal(
+                return Err(FetchFailure::terminal(Failure::new(
+                    Code::HttpsCooldown,
                     "HTTPS deployment is in upstream cooldown",
-                ));
+                )));
             }
             cancellable(shutdown, time::sleep_until(deadline))
                 .await
@@ -550,8 +627,20 @@ impl Upstream {
                         *next = None;
                         return Err(FetchFailure::terminal(LocalFailure(error)));
                     }
+                    drop(next);
+                    let fields = || {
+                        json!({
+                            "source": source.kind(), "http_status": status.as_u16(),
+                            "cooldown_ms": diagnostics::millis(delay),
+                        })
+                    };
+                    if let Some(run) = &self.run {
+                        run.event(Level::Warn, "https_cooldown", fields);
+                    } else {
+                        diagnostics::event(Level::Warn, "https_cooldown", fields);
+                    }
                     return Err(FetchFailure::Retryable {
-                        error: error.into(),
+                        error: Failure::http(Code::HttpsCooldown, status.as_u16(), error).into(),
                         retry_after,
                     });
                 }
@@ -559,13 +648,17 @@ impl Upstream {
                 | StatusCode::BAD_GATEWAY
                 | StatusCode::GATEWAY_TIMEOUT => {
                     return Err(FetchFailure::Retryable {
-                        error: error.into(),
+                        error: Failure::http(Code::HttpsStatus, status.as_u16(), error).into(),
                         retry_after: None,
                     });
                 }
                 _ => (),
             }
-            return Err(FetchFailure::terminal(error));
+            return Err(FetchFailure::terminal(Failure::http(
+                Code::HttpsStatus,
+                status.as_u16(),
+                error,
+            )));
         }
         let headers = response.headers();
         let encoding = headers.get_all(header::CONTENT_ENCODING);
@@ -704,7 +797,7 @@ async fn cancellable<T>(shutdown: Option<&Shutdown>, work: impl Future<Output = 
     match shutdown {
         Some(shutdown) => tokio::select! {
             biased;
-            _ = shutdown.cancelled() => Err("HTTPS request cancelled".into()),
+            _ = shutdown.cancelled() => Err(Failure::new(Code::Cancelled, "HTTPS request cancelled").into()),
             result = work => Ok(result),
         },
         None => Ok(work.await),

@@ -1,3 +1,4 @@
+use crate::diagnostics::{Code, Failure};
 use rfc_storage::postgres::Result;
 use tokio::sync::watch;
 
@@ -15,7 +16,7 @@ impl Shutdown {
 
     pub(crate) fn check(&self) -> Result<()> {
         if *self.0.borrow() {
-            Err("reconciliation cancelled".into())
+            Err(Failure::new(Code::Cancelled, "reconciliation cancelled").into())
         } else {
             Ok(())
         }
@@ -32,8 +33,8 @@ impl Shutdown {
     ) -> Result<T> {
         tokio::select! {
             biased;
-            _ = self.cancelled() => Err("reconciliation cancelled".into()),
-            _ = tokio::time::sleep_until(deadline) => Err("reconciliation deadline exceeded".into()),
+            _ = self.cancelled() => Err(Failure::new(Code::Cancelled, "reconciliation cancelled").into()),
+            _ = tokio::time::sleep_until(deadline) => Err(Failure::new(Code::DeadlineExceeded, "reconciliation deadline exceeded").into()),
             result = work => result,
         }
     }

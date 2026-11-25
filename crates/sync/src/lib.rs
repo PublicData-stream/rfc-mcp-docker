@@ -15,6 +15,7 @@ mod candidate;
 mod checkpoint;
 mod config;
 mod daemon;
+mod diagnostics;
 mod discovery;
 mod egress;
 mod feed_broker;

@@ -29,9 +29,9 @@ pub(crate) struct Entry {
     pub modified_utc: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Rejection {
+pub(crate) enum Rejection {
     TruncatedListing,
     EntryLimit,
     LineLimit,
@@ -50,8 +50,8 @@ enum Rejection {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ParseError {
-    reason: Rejection,
-    line: usize,
+    pub(crate) reason: Rejection,
+    pub(crate) line: usize,
     entry_preview: String,
 }
 

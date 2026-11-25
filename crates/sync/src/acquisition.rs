@@ -4,6 +4,7 @@ use crate::{
     Observation, Writer, audit,
     checkpoint::{Context, Kind},
     config::SyncConfig,
+    diagnostics::{self, Code, Failure, Level},
     egress::ROOT,
     insert_observation,
     parse::{Budget, BudgetExceeded, DOCUMENT_BYTES, OwnedText},
@@ -20,6 +21,7 @@ use rfc_storage::{
     postgres::{Result, mirror_root},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
@@ -109,7 +111,11 @@ impl std::fmt::Display for LocalFailure {
     }
 }
 
-impl std::error::Error for LocalFailure {}
+impl std::error::Error for LocalFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Original {
@@ -522,6 +528,8 @@ impl Spool {
                                 }
                             }
                             let database = upstream.metrics().span(crate::metrics::Stage::Database);
+                            let started = std::time::Instant::now();
+                            let batch_size = batch.len();
                             let tx = writer.client.transaction().await?;
                             tx.batch_execute("SET LOCAL synchronous_commit = on")
                                 .await?;
@@ -530,6 +538,9 @@ impl Spool {
                             }
                             rfc_storage::fixture_boundary("before_https_checkpoint_commit");
                             tx.commit().await?;
+                            upstream.run().event(Level::Debug, "checkpoint_batch_committed", || json!({
+                                "items": batch_size, "duration_ms": diagnostics::millis(started.elapsed()),
+                            }));
                             rfc_storage::fixture_boundary("after_https_checkpoint_commit");
                             drop(database);
                             counts.db_commits += 1;
@@ -555,6 +566,11 @@ impl Spool {
                                 }
                                 write_record(&mut ledger, &mut ledger_bytes, &receipt).await?;
                             }
+                            upstream.run().progress(|progress| {
+                                progress.txt_sealed = counts.txt_sealed;
+                                progress.xml_classified = counts.xml_classified;
+                                progress.checkpoint_batches += 1;
+                            });
                             Result::Ok(())
                         }
                         .await;
@@ -695,6 +711,10 @@ async fn apply_repair(
         receipt.persist(&tx, selection).await?;
         tx.commit().await?;
         counts.db_commits += 1;
+        worker
+            .upstream
+            .run()
+            .progress(|progress| progress.checkpoint_batches += 1);
         rfc_storage::fixture_boundary("after_rsync_repair_checkpoint");
         join.replace_txt(&receipt, counts)?;
         *summaries
@@ -715,7 +735,7 @@ async fn apply_repair(
             let _ = repair
                 .acknowledge
                 .send(Err("could not seal repaired TXT".into()));
-            Err(error)
+            Err(Failure::new(Code::RepairFailed, error).into())
         }
     }
 }

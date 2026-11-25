@@ -1134,7 +1134,7 @@ def exercise_inventory_retry(project):
     for report in failures:
         rejection = report["inventory_rejection"]
         assert rejection["reason"] == "unexpected_link" and rejection["line"] > 1, report
-        assert rejection["entry_preview"].endswith("rfc1.txt -> rfc100.txt"), report
+        assert "entry_preview" not in rejection and report["error"] == "invalid_inventory", report
         assert report["metrics"]["https_requests"] == 1, report
         assert report["acquisition"]["txt_downloaded"] == report["audit"]["matched"] == 0, report
     assert publication_snapshot(project) == "-1|0|0|0"
