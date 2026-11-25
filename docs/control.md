@@ -1,4 +1,4 @@
-# Phase 6 control plane
+# Private control plane
 
 Run one feed process, one sync daemon, and one serve process per Compose deployment. Coordinate the [schema migration and application restart](deployment.md#initialize-or-upgrade) in one maintenance window. The sync and feed binaries start their daemons with no arguments. Storage, rollback, recovery, and garbage-collection commands remain available. The [Phase 6 Compose overlay](../scripts/phase6/compose.yml) is an offline test configuration. See [production Compose deployment](deployment.md) for runtime wiring.
 
@@ -24,26 +24,24 @@ Choose a new key ID and generate a fresh key. Install it as the active key on th
 
 Feed polls the official publication feed every 15 minutes plus jitter. Conditional validators advance only after its hints are acknowledged. The RFC publication identifier determines the observation fingerprint and event ID, so a replay, a switch between feed formats, or a restart can repeat the same hint safely. A feed hint acknowledges durable acceptance, which can refer to an existing job. Inspect `rfc.control_events.job_id`, the event status, and `rfc.sync_jobs.state` to see whether work has completed. A failed job is terminal after two retries. Later scheduled work can still reconcile independently.
 
-With HTTPS-first Phase 3, Feed requests a poll through the Sync control
-listener. Sync owns the upstream validators and schedules the fetch in the
-same HTTPS budget as catalog, TXT, and RFCXML. Feed retains cadence,
-deduplication, and durable hint delivery. The HTTPS-first deployment overlay
-removes Feed's separate upstream network. The preceding direct-poll
-behavior applies to the qualified schema 9 release.
+Feed requests a poll through Sync's private control listener. Sync owns the
+upstream validators and schedules the fetch in the same HTTPS budget as
+catalog, TXT, RFCXML, and repair. Feed uses the internal control network.
 
-Phase 3 startup, scheduled work, and Feed hints use the same full
-processing path and restart checkpoints. Successful jobs record `acquisition_complete`. Hints whose
-digests have yet to match an eligible catalog ID or mirror entry defer the
-job within the existing retry budget. PostgreSQL advisory key `-3` and the
-shared spool lease serialize HTTPS ownership. The local Sync-UID socket
-lets an operator join the active matching acquisition or queue one
-different scope. The incumbent remains readable and new publication is
-gated. Previously queued publication notifications can still be delivered.
-[HTTPS-first processing](ingestion.md#run-acquisition)
+Startup and scheduled work queue full reconciliation. Sync also probes the
+catalog digest hourly while idle. A changed catalog or an accepted Feed hint
+can queue a full run. Hints whose RFC has yet to appear in the eligible
+catalog or mirror defer within the retry budget. Queue transactions bound
+work to one running and one coalesced pending job. The shared spool lease
+and PostgreSQL advisory key `-3` serialize HTTPS ownership. Key `-4` fences
+short queue transactions.
 
-The following publication behavior applies to the deployed schema 9 release.
-
-Sync performs full reconciliation at startup and daily and checks the official catalog digest hourly. A changed catalog or a new feed event can also queue a full reconciliation. One running job and one pending rerun bound concurrency. PostgreSQL advisory key `-3` owns the daemon and `-4` serializes short queue transactions. The existing mirror and PostgreSQL corpus locks still fence ingestion, maintenance, and promotion. The job retains its candidate and expected publication sequence across a daemon crash. A verified full run commits a new publication with its provenance, even when the corpus content is unchanged. Under a promotion error, the previous active generation remains readable. A failed job can leave its ready candidate for inspection or disposal with `--phase3-discard`.
+The local Sync-UID operator socket lets a matching request attach to an active
+run and reserves one different-scope request. A daemon-owned full run
+validates and promotes its candidate. It completes the job and associated
+hints in the pointer and outbox transaction. A restart can resume a ready
+candidate within its audit and sequence fences. A failed publication leaves
+the incumbent readable. [Reconciliation and retry](ingestion.md#run-acquisition)
 
 A publication and its outbox entry share a transaction. Pending entries hold the attempt count and next due time. A lost or unauthenticated reply leaves the entry pending. Check the configured notification address, receiver epoch, key IDs and expiry, and `rfc.notification_outbox.next_attempt_at` when investigating backlog. Old notifications are acknowledged as superseded after the receiver checks PostgreSQL. Serve resolves the active pointer from PostgreSQL even when notifications are down. A reader that pinned an earlier generation continues under the existing retirement rules.
 
@@ -53,7 +51,7 @@ For operator rollback, stop the sync daemon, obtain the current publication sequ
 
 Issue a POST to `/internal/v1/identify` with body `{}` and epoch `bootstrap`. The signed response carries `epoch`. Use that epoch on business routes. `sync-requested` takes `event_id` (UUID), `observation_digest` (64 lowercase hex characters), `observed_at` (Unix seconds), and `reason` (`feed_publication`). `generation-committed` takes `event_id`, `generation_id`, and `publication_sequence` as well as an optional `manifest_digest`. Business replies contain `event_id` and `outcome` (`accepted`, `observed`, or `superseded`).
 
-On the HTTPS-first Feed-to-Sync link, `/internal/v1/feed-poll` takes
+On the Feed-to-Sync link, `/internal/v1/feed-poll` takes
 `format` (`atom` or `rss`) and optional `known`, a lowercase hexadecimal
 digest of the last acknowledged sorted RFC list. A response is
 `"pending"`, `"unchanged"`, `{"retry":seconds}`, or
@@ -61,7 +59,7 @@ digest of the last acknowledged sorted RFC list. A response is
 canonical RFC numbers. Sync queues upstream work and returns inside the
 existing control deadline.
 
-Successful replies bind the raw JSON and HTTP status to the caller and initiating nonce. The response headers are `X-RFC-Request-Nonce`, `X-RFC-Receiver`, and `X-RFC-Response-Signature`. The response MAC uses a separate domain prefix from the request MAC. Phase 6 processes one bounded request per connection.
+Successful replies bind the raw JSON and HTTP status to the caller and initiating nonce. The response headers are `X-RFC-Request-Nonce`, `X-RFC-Receiver`, and `X-RFC-Response-Signature`. The response MAC uses a separate domain prefix from the request MAC. Each connection processes one bounded request.
 
 The request prefix starts with `RFMCP-HMAC-SHA384-V1`. In order, the remaining lines carry the key ID, caller, audience, epoch, Unix timestamp, nonce, `POST`, literal request path, `application/json`, and decimal body length. End the prefix with a blank line and append the original JSON bytes. Send the key ID, caller, audience, epoch, timestamp, nonce, and tag in their corresponding `X-RFC-*` headers.
 

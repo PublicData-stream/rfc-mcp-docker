@@ -106,8 +106,7 @@ class Deployment:
 
     def command(self, *args, extra=None):
         compose = [*self.docker, "compose", "-p", self.name, "-f", str(ROOT / "compose.yml"),
-                   "-f", str(HERE / "compose.yml"),
-                   "-f", str(ROOT / "deploy/compose.https-acquisition.yml")]
+                   "-f", str(HERE / "compose.yml")]
         if extra:
             compose.extend(("-f", str(extra)))
         return [*compose, *phase0.compose_args(*args)]
@@ -173,7 +172,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         assert report["resources"]["scratch_available_bytes"] == 512 * 1024**2
         assert report["resources"]["spool_available_inodes"] >= 40016
         assert report["resources"]["audit"]["available_bytes"] >= 256 * 1024**2
-        print("The shadow overlay isolates the spool, audit volume, v2 config, and Feed egress", flush=True)
+        print("Base Compose isolates the spool, audit volume, v2 config, and Feed egress", flush=True)
 
     def provision(self):
         self.check_config_mount()

@@ -78,6 +78,16 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: ${RFC_SYNC_SPOOL_HOST_DIR:?Provision a private disk-backed HTTPS spool}
+        target: /rfc-https-spool
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RFC_SYNC_AUDIT_HOST_DIR:?Provision a private disk-backed rsync audit volume}
+        target: /rfc-rsync-audit
+        bind:
+          create_host_path: false
     secrets:
       - {source: db_ca, target: db_ca}
       - {source: sync_database_password, target: db_password}
@@ -107,7 +117,6 @@ services:
       - {source: feed_feed_key, target: feed_key}
     networks:
       feed_control: {}
-      feed_egress: {gw_priority: 1}
 
   postgres:
     <<: *runtime
@@ -192,7 +201,6 @@ networks:
         - subnet: "${RFC_CONTROL_SUBNET:?Set RFC_CONTROL_SUBNET}"
           ip_range: "${RFC_CONTROL_DYNAMIC_RANGE:-${RFC_CONTROL_SUBNET:?Set RFC_CONTROL_SUBNET}}"
   sync_egress: {}
-  feed_egress: {}
 
 volumes:
   mirror:

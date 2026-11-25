@@ -29,5 +29,4 @@ services:
 
 networks:
   sync_egress: {internal: true}
-  feed_egress: {internal: true}
   test_edge: {}

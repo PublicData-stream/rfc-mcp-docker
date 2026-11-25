@@ -877,6 +877,8 @@ def publication_contract(project, client, sources, first):
     assert project.publication() == 4
     phase6.wait(lambda: project.sql("SELECT delivery_state FROM rfc.notification_outbox WHERE publication_sequence=4") == "delivered")
     assert project.sql("SELECT count(*) FROM rfc.notification_outbox WHERE publication_sequence=4") == "1"
+    phase6.wait(lambda: project.sql("SELECT delivery_state FROM rfc.notification_outbox "
+                                    "WHERE publication_sequence=1") == "delivered")
     print("Manual publication, repaired proof, MCP verification, rollback and daemon restart passed", flush=True)
 
 
@@ -888,7 +890,7 @@ def verify_active_get(client, sources, generation, sequence):
     assert document["original"]["source_verification"]["method"] == "rsync_checksum_match"
 
 
-def exercise_cold_daemon(project, client, sources, config):
+def exercise_cold_daemon(project, client, sources, config, spool):
     valid = config.read_bytes()
     config.write_text("schema_version = 1\n")
     try:
@@ -899,9 +901,20 @@ def exercise_cold_daemon(project, client, sources, config):
         assert publication_snapshot(project) == "-1|0|0|0"
     finally:
         config.write_bytes(valid)
+    invalid_stage = project.directory / "invalid-audit"
+    invalid_stage.mkdir(mode=0o755)
+    phase1.failed(project.app("sync", "-v", f"{invalid_stage}:/rfc-rsync-audit", args=()),
+                  project.env, "rsync audit directory must be owned by Sync with mode 0700")
+    assert project.sql("SELECT count(*) FROM rfc.sync_jobs") == "0"
 
+    # Leave enough abandoned spool data for preflight to fail until startup
+    # has acquired the lease and swept the interrupted run.
+    phase6.run(project.app("sync", "--entrypoint", "/bin/sh",
+                           args=("-ec", "mkdir -m 0700 /rfc-https-spool/acquisition")), env=project.env)
+    phase6.run(["sudo", "-n", "fallocate", "-l", "1G", str(spool / "acquisition/interrupted")])
+    phase1.failed(project.app("sync", args=("--check-config",)), project.env, "spool lacks free bytes")
     project.restart_sync()
-    observed = wait_report(project, state="published", publication_sequence=1)
+    observed = wait_report(project, state="published", published_sequence=1)
     assert observed["metrics"]["minimum_start_spacing_us"] >= 1_000_000, observed
     assert observed["acquisition"]["txt_downloaded"] == observed["acquisition"]["txt_audited"] == len(sources)
     wait_job(project, observed["job_id"], "published")
@@ -916,11 +929,14 @@ def exercise_cold_daemon(project, client, sources, config):
     (project.directory.parent / "spoof-mode").write_text("acknowledgment")
     phase6.wait(lambda: "forged acknowledgment" in project.capture("logs", "control-probe"))
     assert project.sql("SELECT count(*) FROM rfc.notification_outbox WHERE delivery_state='pending'") == "1"
-    project.restart_sync(PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782")
+    project.restart_sync(PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782", PHASE6_DAILY="6")
     phase6.wait(lambda: project.sql("SELECT delivery_state FROM rfc.notification_outbox "
                                     "WHERE publication_sequence=1") == "delivered")
     assert project.sql("SELECT count(*) FROM rfc.notification_outbox WHERE publication_sequence=1") == "1"
+    phase6.wait(lambda: project.publication() >= 3, seconds=60)
+    assert project.sql("SELECT count(*) FROM rfc.control_events") == "0"
     print("Cold daemon published byte-exact originals and retried the same authenticated outbox event", flush=True)
+    print("Periodic reconciliation published after the startup run without Feed activity", flush=True)
 
 
 def upgrade_publication(project, old_driver, sources, old_schema):
@@ -1013,7 +1029,7 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
     empty = publication_snapshot(project)
     assert empty == "-1|0|0|0"
     if cold_daemon_only:
-        exercise_cold_daemon(project, client, sources, config)
+        exercise_cold_daemon(project, client, sources, config, spool)
         return
     fresh = manual(project)
     assert fresh["expected_txt"] == fresh["new_txt"] == len(sources)
@@ -1194,7 +1210,8 @@ def main():
                          old_schema=10 if args.upgrade_from_schema10 else 9 if args.upgrade_from_schema9 else None,
                          cold_daemon_only=args.cold_daemon_only)
             except Exception:
-                project.run("logs", "--no-color", "--tail", "15", "sync", "fixtures", "feed")
+                project.run("logs", "--no-color", "--tail", "15", "postgres", "sync", "fixtures", "feed",
+                            "control-probe")
                 raise
             finally:
                 project.close()

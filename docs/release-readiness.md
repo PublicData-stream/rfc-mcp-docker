@@ -13,8 +13,9 @@ cargo fetch --locked
 bash scripts/phase8/verify.sh
 bash scripts/phase8/audit.sh /tmp/rfc-phase8-audit
 python3 -B scripts/phase0/upstream.py
-python3 -B scripts/phase2/integration.py --context rootless --image-prefix "$RFC_PHASE8_IMAGE_PREFIX" --live
 ```
+
+For an explicitly authorized live ingestion sample, use the [standard Compose sample command](ingestion.md#run-acquisition) with the daemon stopped and a bounded official-source window.
 
 Use a new audit output directory for every run. The audit verifies the scanner archive against its pinned SHA-256 and retrieves the advisory database. It records the candidate image IDs, per-image CycloneDX SBOMs, resolved Rust dependency and license inventories, and advisory, license, and redacted secret results. Use `RFC_PHASE8_CONTEXT` to select the Docker context and `RFC_PHASE8_TRIVY_ARCHIVE` to reuse a downloaded scanner archive. The manual [GitHub Actions audit job](../.github/workflows/release-audit.yml) exports the same redacted evidence. Scanner completion means the reports were generated. Review findings before assigning a release status.
 

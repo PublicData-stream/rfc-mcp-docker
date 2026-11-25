@@ -1401,3 +1401,119 @@ Use a disposable Minikube profile with `MINIKUBE_HOME`, `KUBECONFIG`, and
 directory and the same image prefix. All upstream traffic in these checks
 used fixture services. Official-corpus timing and production cutover remain
 separate gates.
+
+## HTTPS-first RFC synchronization Phase 6
+
+Base Compose uses schema 11 and requires the read-only v2 Sync TOML and two
+private disk-backed staging mounts. The Sync daemon and one-shot commands
+share the audited HTTPS-first engine. Feed polls through Sync's authenticated
+broker and uses only the internal control network. The retired collector and
+its compatibility probes run from pinned source. [Deployment and upgrade](deployment.md) ·
+[Acquisition policy](ingestion.md)
+
+### Private verification on 2026-11-25
+
+- The frozen Rust gate, all-feature Clippy and tests, and `actionlint`
+  passed. The HTTP boundary probe replayed 258 fixed-seed mutations.
+- Base Compose rendered on rootful Docker 29.10.1 and rootless Docker 29.10.0.
+  Phase 0 passed with identical image IDs on both engines, including PostgreSQL
+  TLS and grants, the pinned MCP wire contract, rsync byte equality, and worker
+  confinement. The isolated rootless run passed after the concurrent startup
+  timeout.
+- Base Compose configuration preflight passed on both engines after
+  isolated retries. It verified the read-only v2 file, Sync-only staging,
+  effective resource limits, missing and invalid staging rejection, and
+  Feed isolation. The first two preflight runs hit Docker command timeouts.
+- The cold rootless daemon rejected v1 configuration and invalid audit
+  ownership before queuing work. On startup it swept an abandoned 1 GiB
+  acquisition directory and published the complete fixture at sequence 1.
+  It rejected invalid notification replies and delivered the original outbox
+  event after restart. A scheduled run published again with Feed stopped.
+- The isolated rootless scheduler probe passed delayed-checkpoint overlap,
+  one-slot backpressure, both forms of `Retry-After` across SIGKILL,
+  daemon attachment, and different-scope queuing. Authenticated hints
+  coalesced and waited for catalog and mirror convergence. Replay and queue
+  lock probes preserved the original job. The cold run's minimum start
+  spacing was 1,000,632 µs. The first run missed the delayed-checkpoint
+  overlap assertion.
+- The rootful manual publication probe audited all six required TXT
+  originals after 14 HTTPS starts. It fenced competing writers, rejected
+  sample promotion, and verified readiness, exact MCP bytes, and evidence
+  metadata. The NUL and invalid UTF-8 fixtures retained their exact
+  canonical bytes. The daemon recovered a ready candidate after restart
+  and delivered the outstanding manual and automatic outbox events.
+- The rootful incumbent probe passed warm reuse, idle catalog checks,
+  failure on missing incumbent TXT and damaged canonical content, and
+  retained rollback with the incumbent readable through failures.
+- The rootless confinement probe passed on the base deployment before and
+  after container recreation. It verified read-only access, service and
+  network isolation, Landlock and seccomp, worker saturation, cancellation,
+  reaping, and reader-fence release.
+- The rootful destructive restore verified 16 canonical blobs, 794 byte
+  ranges and line starts, three manifests, and the active pointer at
+  sequence 2. It replayed the five MCP tools through the restored proxy
+  and rejected damaged or missing originals. The retry used an existing
+  private evidence directory as required by the harness.
+- The populated schema 9 and 10 fixtures each migrated twice to schema 11
+  and preserved their manifests, historical observations, and original
+  provenance. Both verified the first audited HTTPS publication and
+  byte-exact retained rollback. The initial schema 9 stack timed out while
+  PostgreSQL was syncing its initialized data. The isolated retry passed.
+- The local `bootstrap-quick` CI case passed using the pinned historical
+  checkout and matching schema 10 images.
+- Rootless Minikube 1.39.0 with Kubernetes 1.37.0 and containerd passed both
+  fresh-stack publication paths, a brokered Feed-triggered publication, and
+  authenticated outbox delivery. Both paths served an exact RFC 2119 MCP
+  read at the observed sequence. The manual path reused six TXT and three
+  RFCXML originals on a warm run, with 14 HTTPS starts cold and five warm.
+  Replacing the interrupted pod reused the recorded repair pair. Stock
+  preflight verified the independent capped ext4 mounts, CPU and memory
+  limits, scratch capacity, and isolation from Serve and Feed. The first
+  attempt exposed an invalid wildcard control bind in the harness. A later
+  attempt hit the pod status timeout. The passing probe used specific pod IPs
+  and a longer bounded wait. The disposable profile and staging mounts
+  were removed.
+
+### Repeat the checks
+
+Use preloaded stock and fixture images from the same source revision.
+Run timing-sensitive probes serially in disposable projects and keep
+temporary data under `/tmp`.
+
+~~~sh
+export TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target RFC_E2E_PRELOADED=1
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+python3 -B scripts/phase0/integration.py --context "$context" --project "$prefix" --skip-build
+python3 -B scripts/phase7/integration.py --context "$context" --image-prefix "$prefix" --config-only
+python3 -B scripts/phase6/integration.py --context "$context" --image-prefix "$prefix"
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" --publication-only
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" --upgrade-from-schema9 "$schema9_prefix"
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" --upgrade-from-schema10 "$schema10_prefix"
+python3 -B scripts/phase7/integration.py --context "$context" --image-prefix "$prefix"
+restore_evidence=$(mktemp -d /tmp/rfc-phase6-restore.XXXXXXXX)
+python3 -B scripts/phase8/integration.py --context "$context" --image-prefix "$prefix" --evidence "$restore_evidence"
+~~~
+
+Build the historical `phase3-fixture` target from `376fdc6` (schema 9)
+and `29896b5` (schema 10) under the corresponding image prefixes.
+Set `MINIKUBE_HOME`, `KUBECONFIG`, and `TMPDIR` under `/tmp` for a disposable
+rootless Docker profile with containerd. Attach the two capped ext4
+filesystems at separate node paths under `/tmp`, writable by the mapped
+Sync UID/GID. Pass the two node paths to the probe.
+
+~~~sh
+python3 -B scripts/https-discovery/minikube.py --profile "$profile" --image-prefix "$prefix" \
+    --spool-node-dir "$spool_node_dir" --audit-node-dir "$audit_node_dir"
+~~~
+
+Logs, exit statuses, image IDs, and the restore receipt are under
+`/tmp/rfc-https-phase6.jy3N5U89` on the qualification host. The initial
+Docker build hit an Alpine DNS failure. The final stock images were built
+on rootless Docker and transferred to rootful Docker. The disposable
+Compose projects, Minikube resources, staging images, and test image tags
+were removed.
+
+The private probes use packaged rsync and local HTTPS stand-ins. Official
+corpus timing and public activation have their own qualification gates.

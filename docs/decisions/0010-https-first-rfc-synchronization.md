@@ -1,6 +1,6 @@
 # HTTPS-first RFC synchronization
 
-The next collector will use one source policy for daemon startup, scheduled
+The HTTPS-first collector uses one source policy for daemon startup, scheduled
 reconciliation, Feed-triggered work, and manual reconciliation. The schema 9
 collector and its two TXT policies are the baseline for this change.
 [Historical bootstrap decision](0009-cold-rfc-bootstrap.md) ·
@@ -33,12 +33,11 @@ collector and its two TXT policies are the baseline for this change.
 
 ## Minimum compatibility work
 
-The next config version removes `txt_provenance` and the rsync acquisition
+Ingestion TOML v2 removes `txt_provenance` and the rsync acquisition
 mode selector. Old configuration must fail with a migration hint. Keep
 resource and scheduling settings separate from the fixed source policy.
 Phase 2 brokers Feed polling through Sync. Catalog probes, TXT, RFCXML,
-Feed polls, and retries share one HTTPS scheduler. Future repair requests
-use the same scheduler.
+Feed polls, and retries share one HTTPS scheduler. Repair requests use the same scheduler.
 
 A forward schema migration must represent HTTPS captures, checksum audit
 receipts, and exact-byte matches for repair as distinct evidence. Extend
@@ -52,7 +51,7 @@ before the first publication under the new policy.
 
 The upgrade baseline is migrations 0001–0009 and ingestion TOML schema
 `1` at revision `376fdc65c37c331ea433ebdb57ef70e7afbfdfbe`. Before the
-future migration, close ingress, drain Feed and Sync, stop Serve, and retain
+migration, close ingress, drain Feed and Sync, stop Serve, and retain
 a verified matched PostgreSQL and mirror backup, the schema 9 images, and
 the v1 configuration. With the upgraded schema, verify the incumbent's
 sequence, retained reads, readiness, and a pinned MCP read before reopening
@@ -90,7 +89,7 @@ generation membership evidence. Checkpoints pin verified originals and sealed
 TXT indexes. Both lanes join by selection and RFC identity under the corpus
 and publication fence. The existing active generation and retained rollback
 remain available. TXT audit, repair and promotion are later phases.
-[Shadow runbook](../deployment.md#https-first-phase-3-shadow-runbook)
+[Phase 3 evidence](../implementation-status.md#https-first-rfc-synchronization-phase-3)
 
 ## Phase 4 rollout
 
@@ -108,7 +107,15 @@ enforce the sealed selection, expected sequence, and deadline. The daemon
 promotes its own full candidates and completes the associated job and hints
 with the pointer and outbox event. Manual reconciliation prepares a candidate
 for explicit promotion. Historical manifests and retained rollback preserve
-the original evidence. [Phase 5 shadow runbook](../deployment.md#https-first-phase-5-shadow-runbook)
+the original evidence. [Phase 5 evidence](../implementation-status.md#https-first-rfc-synchronization-phase-5)
+
+## Phase 6 rollout
+
+Base Compose requires v2 TOML and private disk-backed spool and audit
+filesystems. Feed uses the authenticated Sync broker. The runtime uses one
+engine for manual and automatic work. Historical collectors are exercised
+from pinned checkouts. Schema 11 serves historical manifests using the
+evidence originally recorded for them. [Upgrade and operations](../deployment.md#upgrade-existing-volumes)
 
 ## Cold-start timing
 
