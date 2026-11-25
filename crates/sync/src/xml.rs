@@ -230,7 +230,6 @@ fn publication_date(node: Element<'_, '_>) -> Result<(Option<String>, Option<Str
 pub(crate) struct XmlReference {
     pub kind: RelationKind,
     pub target: RfcNumber,
-    #[cfg_attr(not(feature = "phase2-fixtures"), allow(dead_code))]
     pub locator: String,
 }
 

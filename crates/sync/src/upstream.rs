@@ -8,16 +8,10 @@ use crate::{
     request_order::{Lane, Order},
     shutdown::Shutdown,
 };
-#[cfg(feature = "phase2-fixtures")]
-use crate::{config::scratch_stats, legacy_config::SyncConfig, metrics::StageLease};
 use reqwest::{Client, StatusCode, header};
 use rfc_core::{BlobDigest, RfcNumber};
 use rfc_mcp_docker::control::{FEED_LIMIT, FeedFormat, jitter};
-#[cfg(feature = "phase2-fixtures")]
-use rfc_storage::blob::BlobWriter;
 use rfc_storage::postgres::Result;
-#[cfg(feature = "phase2-fixtures")]
-use std::{collections::BTreeSet, io::Read, process::Stdio};
 use std::{
     future::{Future, poll_fn},
     path::Path,
@@ -25,8 +19,6 @@ use std::{
     task::Poll,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-#[cfg(feature = "phase2-fixtures")]
-use tokio::process::Command;
 use tokio::{
     io::AsyncWriteExt,
     sync::{Mutex, Semaphore},
@@ -169,15 +161,11 @@ impl FetchFailure {
 #[derive(Clone)]
 pub(crate) struct Upstream {
     https: Https,
-    #[cfg(feature = "phase2-fixtures")]
-    legacy: Option<SyncConfig>,
     http: Client,
     https_origin: &'static str,
     rsync_module: &'static str,
     paced: bool,
     metrics: Metrics,
-    #[cfg(feature = "phase2-fixtures")]
-    fixture_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
     // None represents a Retry-After beyond the range of the monotonic clock.
     next_request: Arc<Mutex<Option<time::Instant>>>,
     in_flight: Arc<Semaphore>,
@@ -198,24 +186,7 @@ impl Upstream {
         Ok(upstream)
     }
 
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn fixture(config: SyncConfig) -> Result<Self> {
-        let legacy = config.ingestion.https;
-        let mut upstream = Self::fixture_client(Https {
-            max_in_flight_requests: legacy.max_in_flight_requests,
-            min_request_start_interval_ms: legacy.min_request_start_interval_ms,
-            request_timeout_seconds: legacy.request_timeout_seconds,
-            max_attempts: legacy.rfcxml_max_attempts,
-        })?;
-        upstream.legacy = Some(config);
-        upstream.paced = std::env::var("RFC_PHASE2_PACED").as_deref() == Ok("1");
-        if std::env::var("RFC_PHASE2_FIXED_CLOCK").as_deref() == Ok("1") {
-            upstream.fixture_clock = Some(Arc::new(1_790_000_000_000_000.into()));
-        }
-        Ok(upstream)
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
+    #[cfg(feature = "phase3-fixtures")]
     fn fixture_client(https: Https) -> Result<Self> {
         Self::new(
             https,
@@ -234,18 +205,6 @@ impl Upstream {
         ca: Option<reqwest::Certificate>,
     ) -> Result<Self> {
         let timeout = Duration::from_secs(https.request_timeout_seconds);
-        #[cfg(feature = "phase2-fixtures")]
-        let timeout = if ca.is_some()
-            && let Ok(value) = std::env::var("RFC_PHASE2_HTTP_TIMEOUT_MS")
-        {
-            let value: u64 = value.parse()?;
-            if !(1..=30_000).contains(&value) {
-                return Err("invalid fixture HTTPS timeout".into());
-            }
-            Duration::from_millis(value)
-        } else {
-            timeout
-        };
         let mut builder = Client::builder()
             .https_only(true)
             .no_proxy()
@@ -262,15 +221,11 @@ impl Upstream {
         }
         Ok(Self {
             https,
-            #[cfg(feature = "phase2-fixtures")]
-            legacy: None,
             http: builder.build()?,
             https_origin,
             rsync_module,
             paced: true,
             metrics: Metrics::default(),
-            #[cfg(feature = "phase2-fixtures")]
-            fixture_clock: None,
             next_request: Arc::new(Mutex::new(Some(time::Instant::now()))),
             in_flight: Arc::new(Semaphore::new(https.max_in_flight_requests)),
             order: Arc::default(),
@@ -300,11 +255,6 @@ impl Upstream {
         Ok(self)
     }
 
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn config(&self) -> &SyncConfig {
-        self.legacy.as_ref().expect("legacy fixture upstream")
-    }
-
     pub(crate) fn with_fresh_metrics(&self) -> Self {
         Self {
             metrics: Metrics::default(),
@@ -316,11 +266,6 @@ impl Upstream {
         Duration::from_millis(self.https.min_request_start_interval_ms)
     }
 
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn is_fixture(&self) -> bool {
-        self.https_origin != OFFICIAL_HTTPS
-    }
-
     pub(crate) fn metrics(&self) -> Metrics {
         self.metrics.clone()
     }
@@ -329,19 +274,15 @@ impl Upstream {
         self.rsync_module
     }
 
+    #[cfg(feature = "phase6-fixtures")]
+    pub(crate) fn is_fixture(&self) -> bool {
+        self.https_origin != OFFICIAL_HTTPS
+    }
+
     pub(crate) async fn after_fence(&self) {
         if self.paced {
             self.delay_starts(self.start_interval()).await;
         }
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) async fn fetch(&self, source: Source) -> Result<Download> {
-        self.fetch_once(source, false, None, None, None)
-            .await
-            .map_err(|failure| match failure {
-                FetchFailure::Retryable { error, .. } | FetchFailure::Terminal(error) => error,
-            })
     }
 
     pub(crate) async fn catalog(&self) -> Result<Capture> {
@@ -350,14 +291,6 @@ impl Upstream {
             Ok(Download::Missing(_)) => Err("required catalog is unavailable".into()),
             Err(FetchAttempts::Exhausted(error) | FetchAttempts::Terminal(error)) => Err(error),
         }
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) async fn fetch_xml(
-        &self,
-        id: RfcNumber,
-    ) -> std::result::Result<Download, FetchAttempts> {
-        self.fetch_with_retries(Source::Xml(id), None, None).await
     }
 
     pub(crate) async fn artifact(
@@ -536,10 +469,7 @@ impl Upstream {
                 .await
                 .map_err(FetchFailure::terminal)?;
         }
-        let clock = self.capture_clock(source);
-        let observed_us = clock
-            .map_or_else(now_us, Ok)
-            .map_err(FetchFailure::terminal)?;
+        let observed_us = now_us().map_err(FetchFailure::terminal)?;
         let mut request = self
             .http
             .get(format!("{}{}", self.https_origin, source.path()))
@@ -674,9 +604,7 @@ impl Upstream {
             staged: result.staged,
             unchanged: false,
             observed_us,
-            fetched_us: clock
-                .map_or_else(now_us, |us| Ok(us + 1))
-                .map_err(FetchFailure::terminal)?,
+            fetched_us: now_us().map_err(FetchFailure::terminal)?,
             etag,
             last_modified,
         }))
@@ -761,139 +689,6 @@ impl Upstream {
         };
         Ok(Body { bytes, staged })
     }
-
-    fn capture_clock(&self, _source: Source) -> Option<i64> {
-        #[cfg(feature = "phase2-fixtures")]
-        if let Some(base) = self.fixture_clock.as_ref() {
-            return Some(match _source {
-                Source::Catalog => 1 + base.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                Source::Txt(id) => 1_790_000_010_000_000 + i64::from(id.get()),
-                Source::Xml(id) => 1_790_000_020_000_000 + i64::from(id.get()),
-                Source::Feed(_) => return None,
-            });
-        }
-        None
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn rsync_observed_us(&self) -> Result<i64> {
-        #[cfg(feature = "phase2-fixtures")]
-        if self.fixture_clock.is_some() {
-            return Ok(1_790_000_009_000_000);
-        }
-        now_us()
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) async fn stage(&self, ids: &[RfcNumber], shutdown: &Shutdown) -> Result<RsyncBatch> {
-        let _timing = self.metrics.span(Stage::Rsync);
-        let rsync = self.config().ingestion.rsync;
-        if ids.is_empty() || ids.len() > rsync.batch_size {
-            return Err("rsync batch count exceeds bounds".into());
-        }
-        let lease = self.metrics.stage_start();
-        let temp = tempfile::Builder::new()
-            .prefix("rfc-rsync-")
-            .tempdir_in("/tmp")?;
-        let files = temp.path().join("files");
-        let incoming = temp.path().join("incoming");
-        std::fs::create_dir(&incoming)?;
-        let names: BTreeSet<_> = ids.iter().copied().map(filename).collect();
-        std::fs::write(
-            &files,
-            names
-                .iter()
-                .map(|name| format!("{name}\n"))
-                .collect::<String>(),
-        )?;
-
-        let mut command = Command::new("/usr/bin/rsync");
-        command
-            .env_clear()
-            .arg("--no-motd")
-            .arg("--contimeout=5")
-            .arg("--timeout=30")
-            .arg(format!("--max-size={TXT_LIMIT}"))
-            .arg("--files-from")
-            .arg(&files)
-            .arg("--")
-            .arg(self.rsync_module)
-            .arg(&incoming)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .kill_on_drop(true);
-        // Bound writes even if the peer supplies an incorrect file size.
-        unsafe {
-            command.pre_exec(|| {
-                let limit = libc::rlimit {
-                    rlim_cur: TXT_LIMIT as _,
-                    rlim_max: TXT_LIMIT as _,
-                };
-                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn()?;
-        let mut group = ProcessGroup(child.id().map(i32::try_from).transpose()?);
-        let status = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                group.kill();
-                child.wait().await?;
-                return Err("rsync batch cancelled".into());
-            }
-            _ = time::sleep(Duration::from_secs(rsync.transfer_timeout_seconds)) => {
-                group.kill();
-                child.wait().await?;
-                return Err("rsync batch deadline exceeded".into());
-            }
-            status = child.wait() => status?,
-        };
-        if status.success() {
-            group.0 = None;
-        } else {
-            group.kill();
-        }
-        if !status.success() && !matches!(status.code(), Some(23 | 24)) {
-            return Err(format!("rsync batch failed ({status})").into());
-        }
-        let mut seen = BTreeSet::new();
-        let mut staged_bytes = 0;
-        for entry in std::fs::read_dir(&incoming)? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "non-ASCII rsync filename")?;
-            if !names.contains(&name) || !entry.file_type()?.is_file() {
-                return Err("unexpected or non-regular rsync input".into());
-            }
-            let length = entry.metadata()?.len();
-            if length > TXT_LIMIT as u64 {
-                return Err("rsync TXT size exceeds bounds".into());
-            }
-            staged_bytes += length;
-            seen.insert(name);
-        }
-        if let Some(missing) = names.difference(&seen).next() {
-            return Err(format!("rsync missing expected TXT {missing}").into());
-        }
-        if !status.success() {
-            return Err(format!("rsync batch failed ({status})").into());
-        }
-        self.metrics
-            .staged(staged_bytes, staged_bytes, scratch_used(), seen.len(), 0);
-        Ok(RsyncBatch {
-            temp,
-            incoming,
-            observed_us: self.rsync_observed_us()?,
-            _lease: lease,
-        })
-    }
 }
 
 fn local_failure(error: std::io::Error) -> FetchFailure {
@@ -914,15 +709,6 @@ async fn cancellable<T>(shutdown: Option<&Shutdown>, work: impl Future<Output = 
         },
         None => Ok(work.await),
     }
-}
-
-#[cfg(feature = "phase2-fixtures")]
-fn scratch_used() -> Option<u64> {
-    let stats = scratch_stats()?;
-    stats
-        .f_blocks
-        .checked_sub(stats.f_bfree)?
-        .checked_mul(stats.f_frsize)
 }
 
 pub(crate) fn filename(id: RfcNumber) -> String {
@@ -977,54 +763,6 @@ impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.kill();
     }
-}
-
-#[cfg(feature = "phase2-fixtures")]
-pub(crate) struct RsyncBatch {
-    temp: tempfile::TempDir,
-    incoming: std::path::PathBuf,
-    pub(crate) observed_us: i64,
-    _lease: StageLease,
-}
-
-#[cfg(feature = "phase2-fixtures")]
-impl RsyncBatch {
-    pub(crate) fn take(&self, store: &BlobWriter, id: RfcNumber) -> Result<Vec<u8>> {
-        let name = filename(id);
-        let bytes = read_staged(store, &self.incoming, &name, None)?;
-        std::fs::remove_file(self.incoming.join(name))?;
-        Ok(bytes)
-    }
-
-    pub(crate) fn close(self) -> Result<()> {
-        self.temp.close()?;
-        Ok(())
-    }
-}
-
-#[cfg(feature = "phase2-fixtures")]
-pub(crate) fn read_staged(
-    store: &BlobWriter,
-    directory: &std::path::Path,
-    name: &str,
-    expected_length: Option<usize>,
-) -> Result<Vec<u8>> {
-    let mut file = store.open_candidate(directory, name)?;
-    let length = usize::try_from(file.metadata()?.len())?;
-    if length == 0
-        || length > TXT_LIMIT
-        || expected_length.is_some_and(|expected| expected != length)
-    {
-        return Err("rsync TXT size exceeds bounds or changed after inventory check".into());
-    }
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(length)?;
-    bytes.resize(length, 0);
-    file.read_exact(&mut bytes)?;
-    if file.read(&mut [0])? != 0 {
-        return Err("rsync TXT changed during read".into());
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]

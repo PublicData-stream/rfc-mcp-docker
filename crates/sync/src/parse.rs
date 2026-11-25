@@ -51,8 +51,6 @@ pub(crate) struct OwnedText {
 pub(crate) struct TextData {
     index: TextIndex<'static>,
     section_numbers: Vec<Option<ByteRange>>,
-    #[cfg(feature = "phase2-fixtures")]
-    pub retained_bytes: usize,
 }
 
 impl OwnedText {
@@ -120,8 +118,6 @@ impl OwnedText {
             data: TextData {
                 index,
                 section_numbers,
-                #[cfg(feature = "phase2-fixtures")]
-                retained_bytes,
             },
         })
     }

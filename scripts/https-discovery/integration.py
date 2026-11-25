@@ -138,8 +138,9 @@ def feed_convergence(project, catalog, initial, config):
             'observed_at', extract(epoch FROM observed_at)::bigint, 'reason', 'feed_publication'
         )) FROM rfc.control_events
     """))
-    for payload in payloads:
-        phase6.recover_event(project, epoch, payload, force_queue_busy=False)
+    phase6.wire_checks(project, epoch, payloads[0])
+    for index, payload in enumerate(payloads):
+        phase6.recover_event(project, epoch, payload, force_queue_busy=index == 0)
     assert project.sql("SELECT count(*) FROM rfc.control_events") == "2"
     assert project.sql("SELECT count(*) FROM rfc.sync_jobs WHERE state IN ('pending','running')") == "0"
     project.run("stop", "feed", "sync")
@@ -831,6 +832,7 @@ def publication_contract(project, client, sources, first):
     document = client.call("get", id=2119)[0]
     assert phase6.phase5.bytes_from(document["original"]) == sources[2119]
     assert document["original"]["source_verification"]["method"] == "rsync_checksum_match", document
+    verify_active_get(client, sources, generation, 1)
     assert client.call("table", id=2119)[0]["source_verification"] == document["original"]["source_verification"]
     assert client.call("list", limit=1)[0]["items"][0]["source_verification"]["method"] == "rsync_checksum_match"
     hits = client.call("search", query='in::title:"RFC 2119"')[0]["hits"]
@@ -878,12 +880,55 @@ def publication_contract(project, client, sources, first):
     print("Manual publication, repaired proof, MCP verification, rollback and daemon restart passed", flush=True)
 
 
-def upgrade_publication(project, old_driver, sources):
+def verify_active_get(client, sources, generation, sequence):
+    document = client.call("get", id=2119, format="base64")[0]
+    assert document["generation_id"] == str(generation)
+    assert document["publication_sequence"] == str(sequence)
+    assert phase6.phase5.bytes_from(document["original"]) == sources[2119]
+    assert document["original"]["source_verification"]["method"] == "rsync_checksum_match"
+
+
+def exercise_cold_daemon(project, client, sources, config):
+    valid = config.read_bytes()
+    config.write_text("schema_version = 1\n")
+    try:
+        phase1.failed(project.app("sync", args=()), project.env, "migrate to schema v2")
+        phase1.failed(project.app("sync", args=("--phase2-reconcile", "--full")), project.env,
+                      "migrate to schema v2")
+        assert project.sql("SELECT count(*) FROM rfc.sync_jobs") == "0"
+        assert publication_snapshot(project) == "-1|0|0|0"
+    finally:
+        config.write_bytes(valid)
+
+    project.restart_sync()
+    observed = wait_report(project, state="published", publication_sequence=1)
+    assert observed["metrics"]["minimum_start_spacing_us"] >= 1_000_000, observed
+    assert observed["acquisition"]["txt_downloaded"] == observed["acquisition"]["txt_audited"] == len(sources)
+    wait_job(project, observed["job_id"], "published")
+    phase6.wait(lambda: project.admin("/ready").returncode == 0)
+    load_mcp_schemas(client)
+    verify_active_get(client, sources, observed["generation_id"], 1)
+    verify_cas(project, sources)
+
+    # The disposable receiver exercises resending the same committed event
+    # after an invalid identity and an invalid authenticated acknowledgement.
+    phase6.wait(lambda: "forged identity" in project.capture("logs", "control-probe"))
+    (project.directory.parent / "spoof-mode").write_text("acknowledgment")
+    phase6.wait(lambda: "forged acknowledgment" in project.capture("logs", "control-probe"))
+    assert project.sql("SELECT count(*) FROM rfc.notification_outbox WHERE delivery_state='pending'") == "1"
+    project.restart_sync(PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782")
+    phase6.wait(lambda: project.sql("SELECT delivery_state FROM rfc.notification_outbox "
+                                    "WHERE publication_sequence=1") == "delivered")
+    assert project.sql("SELECT count(*) FROM rfc.notification_outbox WHERE publication_sequence=1") == "1"
+    print("Cold daemon published byte-exact originals and retried the same authenticated outbox event", flush=True)
+
+
+def upgrade_publication(project, old_driver, sources, old_schema):
     current = project.env["PHASE2_DRIVER"]
     overlay = project.ingestion_overlay
     del project.ingestion_overlay
     project.env["PHASE2_DRIVER"] = str(old_driver)
-    with phase2.capped_stage(project, label="schema10-bootstrap") as stage:
+    with phase2.capped_stage(project, label=f"schema{old_schema}-bootstrap") as stage:
         old_options = phase2.bulk_options(project, stage, bootstrap=True)
         command = project.app("sync", "-T", *old_options, "-e", "RFC_SYNC_CONFIG_FILE=/phase2/bulk.toml",
                               "--entrypoint", "/phase2/fixture-driver", args=("full",))
@@ -928,11 +973,11 @@ def upgrade_publication(project, old_driver, sources):
     assert document["original"]["source_verification"]["method"] == "rsync_checksum_match"
     publication_command(project, {"generation_id": str(first), "expected_publication_sequence": 3}, rollback=True)
     assert client.call("get", id=2119)[0]["original"]["source_verification"] == {"method": "rsync_integrity"}
-    print("Populated schema 10 upgraded twice and retained byte-exact rollback with original proof", flush=True)
+    print(f"Populated schema {old_schema} upgraded twice and retained byte-exact rollback with original proof", flush=True)
 
 
 def exercise(project, work, spool, audit, incumbent_only, old_driver=None, scheduler_only=False, audit_only=False,
-             publication_only=False, upgrade=False):
+             publication_only=False, old_schema=None, cold_daemon_only=False):
     sources = phase2.prepare(project, include_nul=True)
     original = project.source / "catalog.xml"
     initial = original.read_text()
@@ -940,7 +985,7 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
     (project.source / "feed-mode").write_text("normal")
     project.start()
     if old_driver:
-        phase2.migrate_to_historical_schema(project, 10 if upgrade else 9)
+        phase2.migrate_to_historical_schema(project, old_schema)
     else:
         project.migrate()
     project.run("up", "-d", "--wait", "fixtures", "control-probe", timeout=35)
@@ -954,20 +999,22 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
     overlay = work / "discovery-compose.json"
     overlay.write_text(json.dumps({"services": {
         "sync": {
-            "environment": {"RFC_SYNC_CONFIG_FILE": CONFIG_PATH, "RFC_DISCOVERY_FIXTURES": "1"},
+            "environment": {"RFC_SYNC_CONFIG_FILE": CONFIG_PATH},
             "volumes": [f"{config}:{CONFIG_PATH}:ro", f"{spool}:/rfc-https-spool", f"{audit}:/rfc-rsync-audit"],
         },
-        "feed": {"environment": {"RFC_DISCOVERY_FIXTURES": "1"}},
     }}))
     project.ingestion_overlay = overlay
     if old_driver:
-        upgrade_publication(project, old_driver, sources)
+        upgrade_publication(project, old_driver, sources, old_schema)
         return
     if incumbent_only:
         exercise_incumbent(project, sources, client)
         return
     empty = publication_snapshot(project)
     assert empty == "-1|0|0|0"
+    if cold_daemon_only:
+        exercise_cold_daemon(project, client, sources, config)
+        return
     fresh = manual(project)
     assert fresh["expected_txt"] == fresh["new_txt"] == len(sources)
     assert fresh["catalog_without_txt"] == 1
@@ -1112,6 +1159,7 @@ def main():
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", required=True)
     modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--cold-daemon-only", action="store_true", help="qualify automatic first publication")
     modes.add_argument("--audit-only", action="store_true", help="exercise audit and exact-byte repair")
     modes.add_argument("--publication-only", action="store_true", help="exercise audited publication and recovery")
     modes.add_argument("--incumbent-only", action="store_true",
@@ -1142,7 +1190,9 @@ def main():
             try:
                 exercise(project, work, spool, audit, args.incumbent_only or bool(old_driver), old_driver,
                          scheduler_only=args.scheduler_only, audit_only=args.audit_only,
-                         publication_only=args.publication_only, upgrade=bool(args.upgrade_from_schema10))
+                         publication_only=args.publication_only,
+                         old_schema=10 if args.upgrade_from_schema10 else 9 if args.upgrade_from_schema9 else None,
+                         cold_daemon_only=args.cold_daemon_only)
             except Exception:
                 project.run("logs", "--no-color", "--tail", "15", "sync", "fixtures", "feed")
                 raise

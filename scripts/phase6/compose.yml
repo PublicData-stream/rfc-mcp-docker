@@ -15,7 +15,7 @@ services:
     stop_grace_period: 1s
     entrypoint: [/phase6/sync]
     environment:
-      RFC_PHASE6_FIXTURES: "1"
+      RFC_DISCOVERY_FIXTURES: "1"
       RFC_PHASE6_HOURLY_SECS: ${PHASE6_HOURLY:-3600}
       RFC_PHASE6_DAILY_SECS: ${PHASE6_DAILY:-3600}
       RFC_PHASE3_CRASH: ${PHASE6_CRASH:-}
@@ -36,7 +36,7 @@ services:
     stop_grace_period: 1s
     entrypoint: [/phase6/feed]
     environment:
-      RFC_PHASE6_FIXTURES: "1"
+      RFC_DISCOVERY_FIXTURES: "1"
       RFC_FEED_FORMAT: ${PHASE6_FORMAT:-atom}
       RFC_FEED_SYNC_ADDR: ${PHASE6_NET}.2:8783
       RFC_FEED_SYNC_KEY_ID: fixture-feed
@@ -44,10 +44,8 @@ services:
     volumes:
       - ${PHASE6_DIR}/feed:/phase6/feed:ro
       - ${PHASE6_DIR}/feed-feed:/run/secrets/rfc_feed:ro
-      - ${PHASE1_DIR}/certs/ca.crt:/phase2/ca.crt:ro
     networks:
       feed_control: {ipv4_address: "${PHASE6_NET}.3"}
-      fixture_source: {}
   proxy:
     stop_grace_period: 1s
     networks:

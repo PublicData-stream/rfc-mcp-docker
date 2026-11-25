@@ -238,8 +238,7 @@ async fn execute_with_registry(
             .until(deadline, writer.acquire_coordinator())
             .await?;
         Spool::sweep().await?;
-        crate::egress::preflight(config.ingestion.max_accepted_bytes)?;
-        audit::preflight()?;
+        config.preflight()?;
         let resumed = if let Some(job) = job {
             resume_candidate(&writer, job, &mut report).await?
         } else {

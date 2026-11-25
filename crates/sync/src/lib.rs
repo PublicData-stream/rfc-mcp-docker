@@ -11,8 +11,6 @@ use tokio_postgres::{Client, GenericClient, Transaction};
 
 mod acquisition;
 mod audit;
-#[cfg(feature = "phase2-fixtures")]
-mod bulk;
 mod candidate;
 mod checkpoint;
 mod config;
@@ -22,16 +20,10 @@ mod egress;
 mod feed_broker;
 #[cfg(feature = "phase1-fixtures")]
 mod fixture_storage;
-#[cfg(feature = "phase2-fixtures")]
-mod ingest;
 mod inventory;
-#[cfg(feature = "phase2-fixtures")]
-mod legacy_config;
 mod manual;
 mod metrics;
 mod parse;
-#[cfg(feature = "phase2-fixtures")]
-mod pipeline;
 mod policy;
 mod publication;
 mod recovery;
@@ -43,21 +35,11 @@ mod upstream;
 mod xml;
 
 pub use config::check_config;
-#[cfg(feature = "phase6-fixtures")]
-#[doc(hidden)]
-pub use daemon::legacy_fixtures;
 pub use daemon::run_daemon;
 #[cfg(feature = "phase3-fixtures")]
 pub use discovery::reconcile_audited_fixture;
 pub use discovery::{Scope, reconcile};
-#[cfg(feature = "phase2-fixtures")]
-pub use ingest::reconcile_fixture;
-#[cfg(feature = "phase2-fixtures")]
-#[doc(hidden)]
-pub use legacy_config::check_config as check_legacy_fixture_config;
 pub use publication::promote;
-#[cfg(feature = "phase2-fixtures")]
-pub use publication::promote_fixture;
 pub use recovery::{Maintenance, maintain};
 pub use xml::validate_feed;
 

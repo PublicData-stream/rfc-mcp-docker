@@ -186,17 +186,12 @@ struct Resources {
 }
 
 pub fn check_config() -> Result<()> {
-    #[cfg(feature = "phase6-fixtures")]
-    if crate::daemon::legacy_fixtures() {
-        return crate::legacy_config::check_config();
-    }
     let summary = SyncConfig::load_summary()?;
-    let (spool_available_bytes, spool_available_inodes) =
-        crate::egress::preflight(summary.config.ingestion.max_accepted_bytes)?;
+    let (spool, audit) = summary.config.preflight()?;
     let mut output = serde_json::to_value(summary)?;
-    output["resources"]["spool_available_bytes"] = spool_available_bytes.into();
-    output["resources"]["spool_available_inodes"] = spool_available_inodes.into();
-    output["resources"]["audit"] = serde_json::to_value(crate::audit::preflight()?)?;
+    output["resources"]["spool_available_bytes"] = spool.0.into();
+    output["resources"]["spool_available_inodes"] = spool.1.into();
+    output["resources"]["audit"] = serde_json::to_value(audit)?;
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
@@ -204,6 +199,11 @@ pub fn check_config() -> Result<()> {
 impl SyncConfig {
     pub(crate) fn load() -> Result<Self> {
         Ok(Self::load_summary()?.config)
+    }
+
+    pub(crate) fn preflight(&self) -> Result<((u64, u64), crate::audit::Capacity)> {
+        let spool = crate::egress::preflight(self.ingestion.max_accepted_bytes)?;
+        Ok((spool, crate::audit::preflight()?))
     }
 
     fn load_summary() -> Result<Summary> {

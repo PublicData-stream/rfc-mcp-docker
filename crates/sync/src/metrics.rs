@@ -20,8 +20,6 @@ pub(crate) enum Stage {
     XmlQueue,
     ParserQueue,
     Database,
-    #[cfg(feature = "phase2-fixtures")]
-    Validation,
     Queue,
 }
 
@@ -84,24 +82,10 @@ pub(crate) struct Record {
     pub staged_peak: u64,
     pub retries: u64,
     pub progress: Progress,
-    #[cfg(feature = "phase2-fixtures")]
-    pub rsync_files: usize,
-    #[cfg(feature = "phase2-fixtures")]
-    pub rsync_payload_bytes: u64,
-    #[cfg(feature = "phase2-fixtures")]
-    pub peak_rss_bytes: Option<u64>,
-    #[cfg(feature = "phase2-fixtures")]
-    pub https_start_window_us: Option<u64>,
-    #[cfg(feature = "phase2-fixtures")]
-    #[serde(skip)]
-    first_start: Option<Instant>,
     #[serde(skip)]
     active: u64,
     #[serde(skip)]
     parsing: u64,
-    #[cfg(feature = "phase2-fixtures")]
-    #[serde(skip)]
-    staging: u64,
     #[serde(skip)]
     last_start: Option<Instant>,
 }
@@ -125,11 +109,6 @@ impl Metrics {
         record.https_requests += 1;
         record.active += 1;
         record.https_peak = record.https_peak.max(record.active);
-        #[cfg(feature = "phase2-fixtures")]
-        {
-            let first = *record.first_start.get_or_insert(span.start);
-            record.https_start_window_us = Some(micros(span.start.duration_since(first)));
-        }
         if let Some(last) = record.last_start.replace(span.start) {
             let interval = micros(span.start.duration_since(last));
             record.minimum_start_spacing_us = Some(
@@ -166,14 +145,6 @@ impl Metrics {
         }
     }
 
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn stage_start(&self) -> StageLease {
-        let mut record = self.0.lock().unwrap();
-        record.staging += 1;
-        record.staged_peak = record.staged_peak.max(record.staging);
-        StageLease(self.clone())
-    }
-
     pub(crate) fn staged(
         &self,
         bytes: u64,
@@ -188,71 +159,10 @@ impl Metrics {
         record.scratch_peak_bytes = record.scratch_peak_bytes.max(scratch);
         record.rsync_transferred_files += transferred;
         record.rsync_checksum_hits += unchanged;
-        #[cfg(feature = "phase2-fixtures")]
-        {
-            record.rsync_files += transferred + unchanged;
-            record.rsync_payload_bytes += bytes;
-        }
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn out_of_order(&self) {
-        self.0.lock().unwrap().out_of_order += 1;
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn admitted(&self, entries: usize) {
-        let mut record = self.0.lock().unwrap();
-        record.progress.admitted = entries;
-        record.admitted_peak = record.admitted_peak.max(entries as u64);
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn xml_reserved(&self, entries: usize, raw_bytes: usize) {
-        let mut record = self.0.lock().unwrap();
-        record.progress.xml_reserved = entries;
-        record.xml_window_peak = record.xml_window_peak.max(entries as u64);
-        record.raw_reserved_peak = record.raw_reserved_peak.max(raw_bytes as u64);
     }
 
     pub(crate) fn retry(&self) {
         self.0.lock().unwrap().retries += 1;
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn selected(&self, count: usize) {
-        let mut record = self.0.lock().unwrap();
-        record.progress.selected = count;
-        record.progress.txt_remaining = count;
-        record.progress.xml_remaining = count;
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn txt_completed(&self) {
-        let mut record = self.0.lock().unwrap();
-        record.progress.txt_completed += 1;
-        record.progress.txt_remaining -= 1;
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn xml_completed(&self, admitted: usize) {
-        let mut record = self.0.lock().unwrap();
-        record.progress.xml_completed += 1;
-        record.progress.xml_remaining -= 1;
-        record.progress.xml_reserved -= 1;
-        record.progress.admitted = admitted;
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn progress(&self) -> Progress {
-        self.0.lock().unwrap().progress
-    }
-
-    #[cfg(feature = "phase2-fixtures")]
-    pub(crate) fn queue_wait(&self, elapsed: Duration) {
-        let mut record = self.0.lock().unwrap();
-        record.queue.calls += 1;
-        record.queue.elapsed_us += micros(elapsed);
     }
 
     pub(crate) fn snapshot(&self, elapsed: Duration) -> Record {
@@ -267,23 +177,7 @@ impl Metrics {
             .and_then(cpu_micros)
             .zip(usage(libc::RUSAGE_CHILDREN).as_ref().and_then(cpu_micros))
             .map(|(this, children)| this + children);
-        #[cfg(feature = "phase2-fixtures")]
-        {
-            record.peak_rss_bytes = sync_usage
-                .and_then(|usage| u64::try_from(usage.ru_maxrss).ok())
-                .and_then(|kib| kib.checked_mul(1024));
-        }
         record
-    }
-}
-
-#[cfg(feature = "phase2-fixtures")]
-pub(crate) struct StageLease(Metrics);
-
-#[cfg(feature = "phase2-fixtures")]
-impl Drop for StageLease {
-    fn drop(&mut self) {
-        self.0.0.lock().unwrap().staging -= 1;
     }
 }
 
@@ -323,8 +217,6 @@ impl Drop for Span {
             Stage::XmlQueue => &mut record.rfcxml_queue,
             Stage::ParserQueue => &mut record.parser_queue,
             Stage::Database => &mut record.database,
-            #[cfg(feature = "phase2-fixtures")]
-            Stage::Validation => &mut record.validation,
             Stage::Queue => &mut record.queue,
         };
         timing.calls += 1;

@@ -1,5 +1,6 @@
 use crate::{
     Scope, Writer,
+    acquisition::Spool,
     config::SyncConfig,
     discovery,
     egress::Lease,
@@ -8,10 +9,6 @@ use crate::{
     shutdown::Shutdown,
     upstream::Upstream,
 };
-#[cfg(feature = "phase6-fixtures")]
-use crate::{ingest::ingest_locked, legacy_config, policy::Registry, publication::promote_locked};
-#[cfg(feature = "phase6-fixtures")]
-use rfc_core::GenerationId;
 use rfc_mcp_docker::control::{
     self, Client, Command, GenerationCommitted, Keys, Link, Outcome, Rejection, SyncRequested,
     jitter,
@@ -37,7 +34,7 @@ struct Schedule {
 impl Schedule {
     fn new(daily: Duration) -> Result<Self> {
         #[cfg(feature = "phase6-fixtures")]
-        if legacy_fixtures() || acquisition_fixture() {
+        if acquisition_fixture() {
             let setting = |name, default| -> Result<Duration> {
                 let seconds = env::var(name)
                     .ok()
@@ -68,95 +65,19 @@ pub(crate) fn acquisition_fixture() -> bool {
     env::var("RFC_DISCOVERY_FIXTURES").as_deref() == Ok("1")
 }
 
-#[cfg(feature = "phase6-fixtures")]
-pub fn legacy_fixtures() -> bool {
-    env::var("RFC_PHASE6_FIXTURES").as_deref() == Ok("1") && !acquisition_fixture()
-}
-
-enum Engine {
-    Discovery {
-        config: SyncConfig,
-        upstream: Box<Upstream>,
-    },
-    #[cfg(feature = "phase6-fixtures")]
-    Legacy(legacy_config::SyncConfig),
-}
-
-impl Engine {
-    fn load() -> Result<Self> {
-        #[cfg(feature = "phase6-fixtures")]
-        if legacy_fixtures() {
-            return Ok(Self::Legacy(legacy_config::SyncConfig::load()?));
-        }
-        let config = SyncConfig::load()?;
-        let upstream = discovery::upstream(&config)?;
-        Ok(Self::Discovery {
-            config,
-            upstream: Box::new(upstream),
-        })
-    }
-
-    fn upstream(&self) -> Option<&Upstream> {
-        match self {
-            Self::Discovery { upstream, .. } => Some(upstream),
-            #[cfg(feature = "phase6-fixtures")]
-            Self::Legacy(_) => None,
-        }
-    }
-
-    fn with_lease(&mut self, lease: &Lease) -> Result<()> {
-        match self {
-            Self::Discovery { upstream, .. } => {
-                **upstream = upstream.as_ref().clone().with_lease(lease)?
-            }
-            #[cfg(feature = "phase6-fixtures")]
-            Self::Legacy(_) => {}
-        }
-        Ok(())
-    }
-
-    fn daily(&self) -> Duration {
-        match self {
-            Self::Discovery { config, .. } => Duration::from_secs(
-                config
-                    .ingestion
-                    .discovery
-                    .full_reconcile_interval_seconds
-                    .min(config.ingestion.revalidation.interval_seconds),
-            ),
-            #[cfg(feature = "phase6-fixtures")]
-            Self::Legacy(_) => Duration::from_secs(3600),
-        }
-    }
-
-    async fn catalog_changed(&self, shutdown: &Shutdown) -> Result<bool> {
-        match self {
-            Self::Discovery { config, upstream } => {
-                catalog_changed(upstream, config.ingestion.max_accepted_bytes, shutdown).await
-            }
-            #[cfg(feature = "phase6-fixtures")]
-            Self::Legacy(config) => {
-                catalog_changed(
-                    &Upstream::fixture(*config)?,
-                    config.ingestion.max_accepted_bytes,
-                    shutdown,
-                )
-                .await
-            }
-        }
-    }
-}
-
 pub async fn run_daemon() -> Result<()> {
-    let mut engine = Engine::load()?;
-    let lease = if engine.upstream().is_some() {
-        let lease = Lease::acquire()?;
-        engine.with_lease(&lease)?;
-        Some(lease)
-    } else {
-        None
-    };
-    let schedule = Schedule::new(engine.daily())?;
+    let config = SyncConfig::load()?;
+    let lease = Lease::acquire()?;
+    Spool::sweep().await?;
+    config.preflight()?;
+    let upstream = discovery::upstream(&config)?.with_lease(&lease)?;
+    let settings = &config.ingestion;
+    let schedule = Schedule::new(Duration::from_secs(
+        settings
+            .discovery
+            .full_reconcile_interval_seconds
+            .min(settings.revalidation.interval_seconds),
+    ))?;
     let listen = control::address(&env::var("RFC_SYNC_CONTROL_BIND")?)?;
     let notify = control::address(&env::var("RFC_SYNC_SERVE_ADDR")?)?;
     let feed_keys = Keys::load(Link::FeedSync)?;
@@ -180,39 +101,31 @@ pub async fn run_daemon() -> Result<()> {
         }
     };
     let manual = Manual::default();
-    let operator = if lease.is_some() {
-        Some(Manual::bind()?)
-    } else {
-        None
-    };
+    let operator = Manual::bind()?;
     let (broker, feed_requests) = Broker::new();
     let broker_control = broker.clone();
-    let broker_upstream = engine.upstream().cloned();
+    let broker_upstream = upstream.clone();
     let broker_shutdown = shutdown.clone();
     let mut feed_worker = tokio::spawn(async move {
-        match broker_upstream {
-            Some(upstream) => broker.run(feed_requests, &upstream, &broker_shutdown).await,
-            None => {
-                broker_shutdown.cancelled().await;
-                Ok(())
-            }
-        }
+        broker
+            .run(feed_requests, &broker_upstream, &broker_shutdown)
+            .await
     });
     let worker_shutdown = shutdown.clone();
     let worker_manual = manual.clone();
-    let mut worker =
-        tokio::spawn(
-            async move { worker(engine, &schedule, &worker_shutdown, &worker_manual).await },
-        );
-    let operator_shutdown = shutdown.clone();
-    let mut operator_worker = tokio::spawn(async move {
-        if let Some(listener) = operator {
-            manual.serve(listener, &operator_shutdown).await
-        } else {
-            operator_shutdown.cancelled().await;
-            Ok(())
-        }
+    let mut worker = tokio::spawn(async move {
+        worker(
+            config,
+            &upstream,
+            &schedule,
+            &worker_shutdown,
+            &worker_manual,
+        )
+        .await
     });
+    let operator_shutdown = shutdown.clone();
+    let mut operator_worker =
+        tokio::spawn(async move { manual.serve(operator, &operator_shutdown).await });
     let services = async {
         tokio::try_join!(
             control::serve(listener, Link::FeedSync, feed_keys, move |command| {
@@ -466,73 +379,6 @@ async fn schedule_retry(writer: &mut Writer, job: i64, status: JobStatus) -> Res
     Ok(())
 }
 
-#[cfg(feature = "phase6-fixtures")]
-async fn reconcile_legacy(
-    job: i64,
-    config: legacy_config::SyncConfig,
-    shutdown: &Shutdown,
-) -> Result<()> {
-    let mut writer = Writer::connect().await?;
-    let _corpus = writer.acquire_coordinator().await?;
-    let row = writer.client.query_one(
-        "SELECT j.generation_id, j.expected_publication_sequence, g.state
-         FROM rfc.sync_jobs j LEFT JOIN rfc.generations g ON j.generation_id = g.id WHERE j.id = $1 AND j.state = 'running'",
-        &[&job],
-    ).await?;
-    let state: Option<&str> = row.try_get(2)?;
-    let (candidate, sequence) = match state {
-        Some("ready") => {
-            let id =
-                GenerationId::new(row.try_get::<_, i64>(0)?).ok_or("invalid ready candidate ID")?;
-            (id, row.try_get(1)?)
-        }
-        Some("published" | "retained") => {
-            let tx = writer.client.transaction().await?;
-            tx.batch_execute("SET LOCAL synchronous_commit = on")
-                .await?;
-            finish_published_job(&tx, job).await?;
-            tx.commit().await?;
-            return Ok(());
-        }
-        _ => {
-            let (id, _) = ingest_locked(
-                &mut writer,
-                Upstream::fixture(config),
-                Registry::load(),
-                Scope::Full,
-                Some(job),
-                shutdown,
-            )
-            .await?;
-            let sequence = writer
-                .client
-                .query_one(
-                    "SELECT expected_publication_sequence FROM rfc.sync_jobs WHERE id = $1",
-                    &[&job],
-                )
-                .await?
-                .try_get(0)?;
-            (id, sequence)
-        }
-    };
-    shutdown.check()?;
-    let started = Instant::now();
-    let result = promote_locked(&mut writer, candidate, sequence, false, Some(job)).await;
-    eprintln!(
-        "{}",
-        serde_json::json!({
-            "event": "publication",
-            "state": if result.is_ok() { "published" } else { "failed" },
-            "job_id": job.to_string(),
-            "generation_id": candidate.get().to_string(),
-            "expected_publication_sequence": sequence.to_string(),
-            "publication_sequence": result.as_ref().ok().map(i64::to_string),
-            "elapsed_seconds": started.elapsed().as_secs_f64(),
-        })
-    );
-    result.map(|_| ())
-}
-
 async fn catalog_changed(
     upstream: &Upstream,
     accepted_bytes: u64,
@@ -572,7 +418,8 @@ async fn catalog_changed(
 }
 
 async fn worker(
-    engine: Engine,
+    config: SyncConfig,
+    upstream: &Upstream,
     schedule: &Schedule,
     shutdown: &Shutdown,
     manual: &Manual,
@@ -582,16 +429,10 @@ async fn worker(
     let mut hourly = Instant::now() + jitter(schedule.hourly);
     while shutdown.check().is_ok() {
         if let Some(scope) = manual.claim() {
-            match &engine {
-                Engine::Discovery { config, upstream } => {
-                    let _ = report_execution(
-                        discovery::execute(scope, None, config, upstream, shutdown).await,
-                        manual,
-                    );
-                }
-                #[cfg(feature = "phase6-fixtures")]
-                Engine::Legacy(_) => unreachable!("fixture engine has no operator listener"),
-            }
+            let _ = report_execution(
+                discovery::execute(scope, None, &config, upstream, shutdown).await,
+                manual,
+            );
             continue;
         }
         if Instant::now() >= daily && enqueue(&mut writer, None, false).await.is_ok() {
@@ -599,7 +440,7 @@ async fn worker(
         }
         match claim(&mut writer).await {
             Ok(NextJob::Ready(job)) => {
-                let result = process_job(&engine, job, shutdown, manual).await;
+                let result = process_job(&config, upstream, job, shutdown, manual).await;
                 if let Some(status) = result
                     && shutdown.check().is_ok()
                     && schedule_retry(&mut writer, job, status).await.is_err()
@@ -609,7 +450,8 @@ async fn worker(
             }
             Ok(NextJob::Idle) if Instant::now() >= hourly => {
                 hourly = Instant::now() + jitter(schedule.hourly);
-                let changed = engine.catalog_changed(shutdown).await;
+                let changed =
+                    catalog_changed(upstream, config.ingestion.max_accepted_bytes, shutdown).await;
                 if shutdown.check().is_err() {
                     break;
                 }
@@ -636,31 +478,18 @@ async fn worker(
 }
 
 async fn process_job(
-    engine: &Engine,
+    config: &SyncConfig,
+    upstream: &Upstream,
     job: i64,
     shutdown: &Shutdown,
     manual: &Manual,
 ) -> Option<JobStatus> {
-    match engine {
-        Engine::Discovery { config, upstream } => {
-            manual.start_automatic();
-            let result =
-                discovery::execute(Scope::Full, Some(job), config, upstream, shutdown).await;
-            let outcome = report_execution(result, manual);
-            match outcome {
-                Ok(discovery::Outcome::Complete) => None,
-                Ok(discovery::Outcome::Deferred) => Some(JobStatus::Deferred),
-                Err(_) => Some(JobStatus::Failed),
-            }
-        }
-        #[cfg(feature = "phase6-fixtures")]
-        Engine::Legacy(config) => match reconcile_legacy(job, *config, shutdown).await {
-            Ok(()) => None,
-            Err(_) => {
-                eprintln!("reconciliation job {job} encountered an error");
-                Some(JobStatus::Failed)
-            }
-        },
+    manual.start_automatic();
+    let result = discovery::execute(Scope::Full, Some(job), config, upstream, shutdown).await;
+    match report_execution(result, manual) {
+        Ok(discovery::Outcome::Complete) => None,
+        Ok(discovery::Outcome::Deferred) => Some(JobStatus::Deferred),
+        Err(_) => Some(JobStatus::Failed),
     }
 }
 

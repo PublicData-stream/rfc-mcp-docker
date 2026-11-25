@@ -8,19 +8,6 @@ use rfc_storage::{
 
 /// Promote a verified full candidate or roll back to a retained generation.
 pub async fn promote(generation: GenerationId, expected: i64, rollback: bool) -> Result<i64> {
-    promote_explicit(generation, expected, rollback).await
-}
-
-#[cfg(feature = "phase2-fixtures")]
-pub async fn promote_fixture(
-    generation: GenerationId,
-    expected: i64,
-    rollback: bool,
-) -> Result<i64> {
-    promote_explicit(generation, expected, rollback).await
-}
-
-async fn promote_explicit(generation: GenerationId, expected: i64, rollback: bool) -> Result<i64> {
     if expected < 0 {
         return Err("publication sequence must be nonnegative".into());
     }

@@ -38,7 +38,7 @@ def fixture_driver(docker, prefix, target):
 
 class Project(phase2.Project):
     def __init__(self, directory, driver, prefix, docker):
-        super().__init__(directory, driver, prefix, docker, False)
+        super().__init__(directory, driver, prefix, docker)
         self.ingestion_mounts = ExitStack()
 
     def start(self):

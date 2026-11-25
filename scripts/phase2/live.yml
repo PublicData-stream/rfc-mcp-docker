@@ -1,9 +1,0 @@
-services:
-  sync:
-    tmpfs: !override
-      - /tmp:size=512m,mode=1777,noexec,nosuid,nodev
-    networks:
-      source_egress: {}
-
-networks:
-  source_egress: {}
