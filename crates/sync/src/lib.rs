@@ -9,6 +9,7 @@ use rfc_storage::{
 use std::os::fd::OwnedFd;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
+mod acquisition;
 #[cfg(feature = "phase2-fixtures")]
 mod bulk;
 #[cfg(feature = "phase2-fixtures")]
@@ -16,11 +17,14 @@ mod checkpoint;
 mod config;
 mod daemon;
 mod discovery;
+mod egress;
+mod feed_broker;
 #[cfg(feature = "phase2-fixtures")]
 mod ingest;
 mod inventory;
 #[cfg(feature = "phase2-fixtures")]
 mod legacy_config;
+mod manual;
 mod metrics;
 mod parse;
 #[cfg(feature = "phase2-fixtures")]
@@ -29,8 +33,8 @@ mod pipeline;
 mod policy;
 mod publication;
 mod recovery;
+mod request_order;
 mod shutdown;
-#[cfg(any(test, feature = "phase2-fixtures"))]
 mod text;
 mod upstream;
 mod xml;
@@ -79,6 +83,18 @@ impl Writer {
         ).await?;
         let id = GenerationId::new(row.try_get(0)?).ok_or("invalid candidate ID")?;
         Ok(Candidate { id, tx })
+    }
+
+    async fn acquire_egress_leader(&self) -> Result<()> {
+        let held: bool = self
+            .client
+            .query_one("SELECT pg_catalog.pg_try_advisory_lock(-3::bigint)", &[])
+            .await?
+            .try_get(0)?;
+        if !held {
+            return Err("another synchronization process owns the HTTPS deployment lease".into());
+        }
+        Ok(())
     }
 
     async fn acquire_coordinator(&self) -> Result<OwnedFd> {

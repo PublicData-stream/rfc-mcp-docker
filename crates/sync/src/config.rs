@@ -20,7 +20,7 @@ const MEMORY_LIMIT: u64 = 2048 * MIB;
 const SCRATCH_LIMIT: u64 = 512 * MIB;
 const SCRATCH_REQUIRED: u64 = 8 * MIB;
 const MIN_HTTPS_INTERVAL_MS: u64 = 1000;
-const RAW_PER_DOCUMENT: u64 = (2 * TXT_LIMIT + XML_LIMIT) as u64;
+pub(crate) const RAW_PER_DOCUMENT: u64 = (2 * TXT_LIMIT + XML_LIMIT) as u64;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -170,7 +170,7 @@ struct Summary {
     config: SyncConfig,
     phase: &'static str,
     publication_gate: &'static str,
-    pending_consumers: [&'static str; 3],
+    pending_consumers: [&'static str; 2],
     informational: [&'static str; 1],
     resources: Resources,
 }
@@ -190,7 +190,13 @@ pub fn check_config() -> Result<()> {
     if crate::daemon::legacy_fixtures() {
         return crate::legacy_config::check_config();
     }
-    println!("{}", serde_json::to_string(&SyncConfig::load_summary()?)?);
+    let summary = SyncConfig::load_summary()?;
+    let (spool_available_bytes, spool_available_inodes) =
+        crate::egress::preflight(summary.config.ingestion.max_accepted_bytes)?;
+    let mut output = serde_json::to_value(summary)?;
+    output["resources"]["spool_available_bytes"] = spool_available_bytes.into();
+    output["resources"]["spool_available_inodes"] = spool_available_inodes.into();
+    println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
 
@@ -222,13 +228,9 @@ impl SyncConfig {
         Ok(Summary {
             source,
             config,
-            phase: "discovery",
+            phase: "acquisition",
             publication_gate: crate::discovery::PUBLICATION_GATE,
-            pending_consumers: [
-                "ingestion.pipeline",
-                "ingestion.revalidation",
-                "ingestion.database",
-            ],
+            pending_consumers: ["ingestion.revalidation", "ingestion.database"],
             informational: ["ingestion.target_bootstrap_seconds"],
             resources,
         })

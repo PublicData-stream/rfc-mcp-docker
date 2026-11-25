@@ -2,11 +2,13 @@
 
 use crate::{
     Writer,
+    acquisition::{Accepted, Counts, Original, Selection, Spool},
     config::SyncConfig,
+    egress::Lease,
     inventory,
     metrics::{Record, Stage},
     shutdown::Shutdown,
-    upstream::{Capture, MAX_CATALOG_ENTRIES, Source, TXT_LIMIT, Upstream},
+    upstream::{Capture, MAX_CATALOG_ENTRIES, Source, TXT_LIMIT, Upstream, XML_LIMIT},
     xml,
 };
 use rfc_core::{BlobDigest, RfcNumber};
@@ -19,6 +21,7 @@ use rfc_storage::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::Duration,
 };
 use tokio::time::Instant;
@@ -77,6 +80,7 @@ struct Report {
     hints_awaiting_catalog: usize,
     hints_awaiting_mirror: usize,
     hints_present: usize,
+    acquisition: Counts,
     metrics: Record,
     error: Option<String>,
 }
@@ -94,20 +98,33 @@ struct Observation {
 struct PriorTxt {
     digest: BlobDigest,
     length: u64,
-    has_https: bool,
+    https: Option<Original>,
 }
 
 pub(crate) fn upstream(config: &SyncConfig) -> Result<Upstream> {
     #[cfg(feature = "phase6-fixtures")]
-    if std::env::var("RFC_DISCOVERY_FIXTURES").as_deref() == Ok("1") {
-        return Upstream::discovery_fixture(config.ingestion.https);
+    if crate::daemon::acquisition_fixture() {
+        return Ok(Upstream::discovery_fixture(config.ingestion.https)?
+            .with_parsers(config.ingestion.pipeline.parser_workers));
     }
-    Upstream::official(config.ingestion.https)
+    Ok(Upstream::official(config.ingestion.https)?
+        .with_parsers(config.ingestion.pipeline.parser_workers))
 }
 
 pub async fn reconcile(scope: Scope) -> Result<()> {
+    if let Some(reply) = crate::manual::request(scope).await? {
+        println!("{}", reply.report);
+        return if reply.success {
+            Ok(())
+        } else {
+            Err("daemon acquisition did not complete".into())
+        };
+    }
     let config = SyncConfig::load()?;
-    let upstream = upstream(&config)?;
+    let lease = Lease::acquire()?;
+    let leader = Writer::connect().await?;
+    leader.acquire_egress_leader().await?;
+    let upstream = upstream(&config)?.with_lease(&lease)?;
     let shutdown = Shutdown::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -121,14 +138,35 @@ pub async fn reconcile(scope: Scope) -> Result<()> {
     tokio::pin!(work);
     let outcome = tokio::select! {
         result = &mut work => result?,
+        monitor = crate::daemon::watch_leader(&leader) => {
+            shutdown.stop();
+            work.await?;
+            monitor?;
+            return Err("HTTPS lease monitor stopped".into());
+        }
         _ = stopping => {
             shutdown.stop();
             work.await?
         }
     };
-    match outcome {
+    println!("{}", outcome.report);
+    match outcome.outcome? {
         Outcome::Complete => Ok(()),
-        Outcome::Deferred => Err("discovery deferred while sources converge".into()),
+        Outcome::Deferred => Err("acquisition deferred while sources converge".into()),
+    }
+}
+
+pub(crate) struct Execution {
+    pub outcome: Result<Outcome>,
+    pub report: String,
+}
+
+impl Execution {
+    pub(crate) fn operator(&self) -> crate::manual::Reply {
+        crate::manual::Reply {
+            success: matches!(self.outcome, Ok(Outcome::Complete)),
+            report: self.report.clone(),
+        }
     }
 }
 
@@ -138,11 +176,11 @@ pub(crate) async fn execute(
     config: &SyncConfig,
     upstream: &Upstream,
     shutdown: &Shutdown,
-) -> Result<Outcome> {
+) -> Result<Execution> {
     let started = Instant::now();
     let upstream = upstream.with_fresh_metrics();
     let mut report = Report {
-        event: "discovery",
+        event: "acquisition",
         scope: scope.as_str(),
         publication_gate: PUBLICATION_GATE,
         job_id: job,
@@ -154,6 +192,8 @@ pub(crate) async fn execute(
         let _corpus = shutdown
             .until(deadline, writer.acquire_coordinator())
             .await?;
+        Spool::sweep().await?;
+        crate::egress::preflight(config.ingestion.max_accepted_bytes)?;
         discover(
             &writer,
             config,
@@ -167,16 +207,18 @@ pub(crate) async fn execute(
     }
     .await;
     report.state = match &result {
-        Ok(Outcome::Complete) => "discovery_complete",
-        Ok(Outcome::Deferred) => "discovery_deferred",
+        Ok(Outcome::Complete) => "acquisition_complete",
+        Ok(Outcome::Deferred) => "acquisition_deferred",
         Err(error) => {
             report.error = Some(error.to_string().chars().take(512).collect());
-            "discovery_failed"
+            "acquisition_failed"
         }
     };
     report.metrics = upstream.metrics().snapshot(started.elapsed());
-    println!("{}", serde_json::to_string(&report)?);
-    result
+    Ok(Execution {
+        outcome: result,
+        report: serde_json::to_string(&report)?,
+    })
 }
 
 async fn discover(
@@ -222,7 +264,8 @@ async fn discover(
     let accepted = config.ingestion.max_accepted_bytes;
     remaining(accepted, before.bytes.len() as u64)?;
     let catalog = {
-        let _stage = upstream.metrics().span(Stage::Parse);
+        let _permit = upstream.parse_slot(shutdown).await?;
+        let _stage = upstream.metrics().parse_start();
         let bytes = before.bytes.clone();
         tokio::task::spawn_blocking(move || parse_catalog(&bytes)).await??
     };
@@ -290,6 +333,7 @@ async fn discover(
     }
 
     let mut local = BTreeMap::new();
+    let mut reuse_txt = BTreeMap::new();
     let mut local_with_https = 0;
     let mut local_without_https = 0;
     for (&id, listed) in &inventory {
@@ -300,8 +344,11 @@ async fn discover(
                         report.inventory_size_changes += 1;
                     }
                     local.insert(prior.digest, prior.length);
-                    if prior.has_https {
+                    if let Some(original) = &prior.https
+                        && original.length == listed.length
+                    {
                         local_with_https += 1;
+                        reuse_txt.insert(id, original.clone());
                     } else {
                         local_without_https += 1;
                     }
@@ -311,43 +358,100 @@ async fn discover(
         }
     }
     let available = remaining(accepted, before.bytes.len() as u64)?;
-    let verified_bytes = if local.is_empty() {
-        0
-    } else {
+    if !local.is_empty() {
         let shutdown = shutdown.clone();
         tokio::task::spawn_blocking(move || verify_local(local, available, &shutdown, deadline))
-            .await??
-    };
+            .await??;
+    }
     report.local_https_txt_audit_pending = local_with_https;
     report.local_txt_needs_https = local_without_https;
-    let after = shutdown.until(deadline, upstream.catalog()).await?;
-    remaining(
-        remaining(available, verified_bytes)?,
-        after.bytes.len() as u64,
-    )?;
-    let end_digest = BlobDigest::hash(&after.bytes);
-    report.catalog_after = Some(observation(&after, end_digest));
-    if catalog_digest != end_digest || before.bytes != after.bytes {
-        return Err("catalog changed during discovery".into());
-    }
     let registry: RegistryVersion = serde_json::from_str(include_str!("policy.json"))?;
-    report.selection_id = Some(
-        identity(
-            "rfc-https-discovery-v1",
-            &(
-                scope.as_str(),
-                catalog_digest.to_string(),
-                POLICY,
-                PARSER,
-                INDEX,
-                &registry.version,
-                active,
-                sequence,
-            ),
-        )?
-        .to_string(),
-    );
-    Ok(Outcome::Complete)
+    let selection_id = identity(
+        "rfc-https-discovery-v1",
+        &(
+            scope.as_str(),
+            catalog_digest.to_string(),
+            POLICY,
+            PARSER,
+            INDEX,
+            &registry.version,
+            active,
+            sequence,
+        ),
+    )?
+    .to_string();
+    report.selection_id = Some(selection_id.clone());
+
+    let reuse_xml = if let Some(active) = active {
+        shutdown
+            .until(
+                deadline,
+                load_prior_xml(writer, active, catalog_digest, &registry.version),
+            )
+            .await?
+    } else {
+        BTreeMap::new()
+    };
+    let accepted = Arc::new(Accepted::new(accepted));
+    accepted.charge(before.bytes.len() as u64)?;
+    let spool = Spool::open().await?;
+    let result = async {
+        spool.stage_catalog("catalog-before", &before).await?;
+        let work_stop = Shutdown::new();
+        let selection = Selection {
+            header: serde_json::json!({
+                "selection_id": selection_id,
+                "catalog_digest": catalog_digest.to_string(),
+                "inventory_digest": report.inventory_digest,
+                "scope": scope.as_str(),
+                "active_generation_id": active,
+                "publication_sequence": sequence,
+                "policy_version": POLICY,
+                "parser_version": PARSER,
+                "index_version": INDEX,
+                "registry_version": registry.version,
+            }),
+            expected: expected.into_iter().collect(),
+            txt: reuse_txt,
+            xml: reuse_xml,
+            accepted: accepted.clone(),
+        };
+        {
+            let work = spool.acquire(
+                selection,
+                config,
+                upstream,
+                &work_stop,
+                &mut report.acquisition,
+            );
+            tokio::pin!(work);
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    work_stop.stop();
+                    work.await?;
+                    shutdown.check()?;
+                }
+                result = &mut work => result?,
+            }
+        }
+        let fence_deadline = Instant::now()
+            + Duration::from_secs(config.ingestion.https.request_timeout_seconds * 3 + 120);
+        let after = shutdown.until(fence_deadline, upstream.catalog()).await?;
+        accepted.charge(after.bytes.len() as u64)?;
+        report.acquisition.accepted_bytes = accepted.used();
+        let end_digest = BlobDigest::hash(&after.bytes);
+        report.catalog_after = Some(observation(&after, end_digest));
+        if catalog_digest != end_digest || before.bytes != after.bytes {
+            return Err("catalog changed during acquisition".into());
+        }
+        spool.stage_catalog("catalog-after", &after).await?;
+        Ok(Outcome::Complete)
+    }
+    .await;
+    let cleanup = spool.remove().await;
+    cleanup?;
+    result
 }
 
 #[derive(Deserialize)]
@@ -401,7 +505,9 @@ async fn load_prior(writer: &Writer, generation: i64) -> Result<BTreeMap<RfcNumb
         "SELECT d.rfc_id::integer, b.digest::bytea, b.byte_length::bigint, b.integrity_state,
             coalesce(o.https_verification = 'verified' AND o.kind = 'txt'
                 AND o.raw_digest = v.txt_digest
-                AND o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || d.rfc_id || '.txt', false)
+                AND o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || d.rfc_id || '.txt', false),
+            o.identity::bytea, (extract(epoch FROM o.observed_at) * 1000000)::bigint,
+            (extract(epoch FROM o.fetched_at) * 1000000)::bigint
          FROM rfc.generation_documents d
          JOIN rfc.document_versions v ON v.identity = d.document_version
          JOIN rfc.blobs b ON b.digest = v.txt_digest
@@ -430,11 +536,88 @@ async fn load_prior(writer: &Writer, generation: i64) -> Result<BTreeMap<RfcNumb
                 PriorTxt {
                     digest,
                     length,
-                    has_https: row.try_get(4)?,
+                    https: if row.try_get(4)? {
+                        Some(original(&row, digest, length, 5)?)
+                    } else {
+                        None
+                    },
                 },
             ))
         })
         .collect()
+}
+
+async fn load_prior_xml(
+    writer: &Writer,
+    generation: i64,
+    catalog: BlobDigest,
+    registry: &str,
+) -> Result<BTreeMap<RfcNumber, Original>> {
+    let rows = writer
+        .client
+        .query(
+            "SELECT d.rfc_id::integer, b.digest::bytea, b.byte_length::bigint, b.integrity_state,
+            o.identity::bytea, (extract(epoch FROM o.observed_at) * 1000000)::bigint,
+            (extract(epoch FROM o.fetched_at) * 1000000)::bigint
+         FROM rfc.generation_documents d
+         JOIN rfc.generations g ON g.id = d.generation_id
+         JOIN rfc.generation_ingestion i ON i.generation_id = g.id
+         JOIN rfc.source_observations c ON c.identity = i.catalog_before
+         JOIN rfc.source_observations o ON o.identity = d.rfcxml_observation
+         JOIN rfc.blobs b ON b.digest = o.raw_digest
+         WHERE d.generation_id = $1 AND c.raw_digest = $2::bytea
+           AND g.parser_version = $3 AND g.index_version = $4 AND i.policy_registry = $5
+           AND o.kind = 'rfcxml' AND o.https_verification = 'verified'
+           AND o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || d.rfc_id || '.xml'
+           AND o.fetched_at BETWEEN clock_timestamp() - interval '24 hours' AND clock_timestamp()
+         ORDER BY d.rfc_id LIMIT $6",
+            &[
+                &generation,
+                &catalog.as_bytes().as_slice(),
+                &PARSER,
+                &INDEX,
+                &registry,
+                &(MAX_CATALOG_ENTRIES as i64 + 1),
+            ],
+        )
+        .await?;
+    if rows.len() > MAX_CATALOG_ENTRIES {
+        return Err("active RFCXML membership exceeds discovery bounds".into());
+    }
+    rows.into_iter()
+        .map(|row| {
+            let id = RfcNumber::new(row.try_get(0)?).ok_or("invalid active RFC number")?;
+            let digest = BlobDigest::from_bytes(row.try_get::<_, &[u8]>(1)?.try_into()?);
+            let length = u64::try_from(row.try_get::<_, i64>(2)?)?;
+            if length == 0 || length > XML_LIMIT as u64 || row.try_get::<_, &str>(3)? != "verified"
+            {
+                return Err(format!(
+                    "canonical RFCXML for RFC {} is outside verified bounds",
+                    id.get()
+                )
+                .into());
+            }
+            Ok((id, original(&row, digest, length, 4)?))
+        })
+        .collect()
+}
+
+fn original(
+    row: &tokio_postgres::Row,
+    digest: BlobDigest,
+    length: u64,
+    index: usize,
+) -> Result<Original> {
+    let observation = BlobDigest::from_bytes(row.try_get::<_, &[u8]>(index)?.try_into()?);
+    Ok(Original {
+        digest,
+        length,
+        observation: Some(observation.to_string()),
+        observed_us: row.try_get(index + 1)?,
+        fetched_us: row.try_get(index + 2)?,
+        etag: None,
+        last_modified: None,
+    })
 }
 
 async fn load_hints(writer: &Writer, job: i64) -> Result<BTreeSet<BlobDigest>> {

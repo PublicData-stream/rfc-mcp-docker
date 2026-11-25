@@ -1,6 +1,6 @@
 use super::{
-    Ack, Command, GenerationCommitted, Keys, Link, Outcome, Rejection, Result, Route,
-    SyncRequested,
+    Ack, Command, FeedPoll, FeedReply, GenerationCommitted, Keys, Link, Outcome, Rejection, Result,
+    Route, SyncRequested,
     auth::{Authentication, Envelope, Receiver, decimal, decode, encode, random},
     invalid, unix_seconds,
 };
@@ -125,7 +125,13 @@ where
             Err(Rejection::Conflict) => return error_response(stream, 409).await,
             Err(Rejection::Unavailable) => return error_response(stream, 503).await,
         };
-        serde_json::to_vec(&Ack { event_id, outcome })?
+        match (event_id, outcome) {
+            (None, Outcome::Feed(reply)) => serde_json::to_vec(&reply)?,
+            (Some(event_id), outcome) if !matches!(outcome, Outcome::Feed(_)) => {
+                serde_json::to_vec(&Ack { event_id, outcome })?
+            }
+            _ => return Err(invalid("invalid control handler response").into()),
+        }
     };
     let nonce = envelope.nonce;
     let signature = encode(
@@ -278,7 +284,25 @@ impl Client {
         .await
     }
 
-    async fn deliver(&mut self, route: Route, event_id: uuid::Uuid, body: Vec<u8>) -> Result<()> {
+    pub async fn poll_feed(&mut self, poll: &FeedPoll) -> Result<FeedReply> {
+        if self.link != Link::FeedSync {
+            return Err(invalid("wrong control link").into());
+        }
+        let body = self
+            .request(Route::FeedPoll, &serde_json::to_vec(poll)?)
+            .await?;
+        let reply: FeedReply = serde_json::from_slice(&body)?;
+        if let FeedReply::Publications(ids) = &reply
+            && (ids.len() > super::feed::ENTRY_LIMIT
+                || ids.iter().any(|&id| id == 0 || id > i32::MAX as u32)
+                || ids.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            return Err(invalid("invalid feed publication response").into());
+        }
+        Ok(reply)
+    }
+
+    async fn request(&mut self, route: Route, body: &[u8]) -> Result<Vec<u8>> {
         if self.epoch.is_none() {
             let response = self.exchange(Route::Identify, "bootstrap", b"{}").await?;
             let identity: Identity = serde_json::from_slice(&response)?;
@@ -286,7 +310,13 @@ impl Client {
             self.epoch = Some(identity.epoch);
         }
         let epoch = self.epoch.take().expect("identified receiver");
-        let response = self.exchange(route, &epoch, &body).await?;
+        let response = self.exchange(route, &epoch, body).await?;
+        self.epoch = Some(epoch);
+        Ok(response)
+    }
+
+    async fn deliver(&mut self, route: Route, event_id: uuid::Uuid, body: Vec<u8>) -> Result<()> {
+        let response = self.request(route, &body).await?;
         let ack: Ack = serde_json::from_slice(&response)?;
         if ack.event_id != event_id
             || !matches!(
@@ -297,7 +327,6 @@ impl Client {
         {
             return Err(invalid("invalid control acknowledgment").into());
         }
-        self.epoch = Some(epoch);
         Ok(())
     }
 

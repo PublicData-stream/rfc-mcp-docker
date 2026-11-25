@@ -10,6 +10,7 @@ name = "rfc-mcp-docker-sync"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 rfc-core = { path = "../core" }
 rfc-mcp-docker = { path = "../../apps" }
 rfc-storage = { path = "../storage" }
@@ -19,7 +20,7 @@ httpdate = "1"
 serde.workspace = true
 serde_json.workspace = true
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }
-tokio = { workspace = true, features = ["process", "rt-multi-thread", "signal", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "rt-multi-thread", "signal", "sync"] }
 tempfile = { version = "3", optional = true }
 libc.workspace = true
 roxmltree = "0.21"

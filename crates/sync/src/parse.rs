@@ -1,42 +1,31 @@
 //! Parse work and its owned handoff to the single database writer.
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 use crate::shutdown::Shutdown;
+use crate::text::TextIndex;
 #[cfg(feature = "phase2-fixtures")]
-use crate::{
-    Chunk, Section,
-    text::{self, TextIndex},
-};
-#[cfg(feature = "phase2-fixtures")]
+use crate::{Chunk, Section, text};
 use rfc_core::ByteRange;
-#[cfg(any(test, feature = "phase2-fixtures"))]
 use rfc_storage::postgres::Result;
-#[cfg(any(test, feature = "phase2-fixtures"))]
 use std::fmt;
 
 pub(crate) const DOCUMENT_BYTES: usize = 128 * 1024 * 1024;
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 #[derive(Debug)]
 pub(crate) struct BudgetExceeded;
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 impl fmt::Display for BudgetExceeded {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("document parse budget exceeded")
     }
 }
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 impl std::error::Error for BudgetExceeded {}
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 pub(crate) struct Budget<'a> {
     pub bytes: usize,
     pub shutdown: &'a Shutdown,
 }
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 impl Budget<'_> {
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
         self.shutdown.check()?;
@@ -162,8 +151,7 @@ impl TextData {
     }
 }
 
-#[cfg(feature = "phase2-fixtures")]
-fn validate_ranges(bytes: &[u8], indexed: &TextIndex<'_>) -> Result<()> {
+pub(crate) fn validate_ranges(bytes: &[u8], indexed: &TextIndex<'_>) -> Result<()> {
     let valid = |range: ByteRange| {
         indexed
             .text

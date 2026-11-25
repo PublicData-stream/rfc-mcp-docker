@@ -1,0 +1,12 @@
+# Phase 2 qualification and shadow operation. Provision the private spool first.
+services:
+  rfc-mcp-docker-sync:
+    volumes:
+      - type: bind
+        source: ${RFC_SYNC_SPOOL_HOST_DIR:?Provision a private disk-backed HTTPS spool}
+        target: /rfc-https-spool
+        bind:
+          create_host_path: false
+  rfc-mcp-docker-feed:
+    networks: !override
+      feed_control: {}

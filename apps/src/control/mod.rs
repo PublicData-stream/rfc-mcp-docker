@@ -1,6 +1,7 @@
 //! Private, single-host control traffic. The public MCP router does not use this module.
 
 mod auth;
+mod feed;
 mod wire;
 
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use std::{
 use uuid::Uuid;
 
 pub use auth::Keys;
+pub use feed::{FEED_LIMIT, FeedFormat, publications};
 pub use wire::{Client, address, serve};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -40,6 +42,7 @@ impl Link {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Route {
     Identify,
+    FeedPoll,
     Sync,
     Generation,
 }
@@ -48,6 +51,7 @@ impl Route {
     fn path(self) -> &'static str {
         match self {
             Self::Identify => "/internal/v1/identify",
+            Self::FeedPoll => "/internal/v1/feed-poll",
             Self::Sync => "/internal/v1/sync-requested",
             Self::Generation => "/internal/v1/generation-committed",
         }
@@ -58,6 +62,9 @@ impl Route {
             Link::FeedSync => Self::Sync,
             Link::SyncServe => Self::Generation,
         };
+        if link == Link::FeedSync && path == Self::FeedPoll.path() {
+            return Some(Self::FeedPoll);
+        }
         [Self::Identify, business]
             .into_iter()
             .find(|route| route.path() == path)
@@ -110,6 +117,7 @@ pub struct GenerationCommitted {
 }
 
 pub enum Command {
+    FeedPoll(FeedPoll),
     Sync(SyncRequested),
     Generation(GenerationCommitted),
 }
@@ -117,6 +125,13 @@ pub enum Command {
 impl Command {
     fn decode(route: Route, body: &[u8]) -> Result<Self> {
         match route {
+            Route::FeedPoll => {
+                let poll: FeedPoll = serde_json::from_slice(body)?;
+                if let Some(known) = &poll.known {
+                    digest(known)?;
+                }
+                Ok(Self::FeedPoll(poll))
+            }
             Route::Identify => Err(invalid("unexpected control operation").into()),
             Route::Sync => {
                 let event: SyncRequested = serde_json::from_slice(body)?;
@@ -143,10 +158,11 @@ impl Command {
         }
     }
 
-    fn event_id(&self) -> Uuid {
+    fn event_id(&self) -> Option<Uuid> {
         match self {
-            Self::Sync(event) => event.event_id,
-            Self::Generation(event) => event.event_id,
+            Self::FeedPoll(_) => None,
+            Self::Sync(event) => Some(event.event_id),
+            Self::Generation(event) => Some(event.event_id),
         }
     }
 }
@@ -162,9 +178,34 @@ fn digest(value: &str) -> Result<[u8; 32]> {
     Ok(*blake3::Hash::from_hex(value)?.as_bytes())
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedPoll {
+    pub format: FeedFormat,
+    pub known: Option<String>,
+}
+
+pub fn feed_snapshot(ids: impl IntoIterator<Item = u32>) -> String {
+    let mut hash = blake3::Hasher::new_derive_key("rfc-mcp feed snapshot v1");
+    for id in ids {
+        hash.update(&id.to_be_bytes());
+    }
+    hash.finalize().to_hex().to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum FeedReply {
+    Pending,
+    Unchanged,
+    Retry(u64),
+    Publications(Vec<u32>),
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
+    Feed(FeedReply),
     Accepted,
     Observed,
     Superseded,

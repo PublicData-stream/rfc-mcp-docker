@@ -9,13 +9,11 @@ use std::{
 #[derive(Clone, Copy)]
 pub(crate) enum Stage {
     Catalog,
-    #[cfg(feature = "phase2-fixtures")]
     Txt,
-    #[cfg(feature = "phase2-fixtures")]
     Xml,
+    Feed,
     Rsync,
     Parse,
-    #[cfg(feature = "phase2-fixtures")]
     Install,
     Database,
     #[cfg(feature = "phase2-fixtures")]
@@ -48,6 +46,7 @@ pub(crate) struct Record {
     pub catalog: Timing,
     pub txt: Timing,
     pub rfcxml: Timing,
+    pub feed: Timing,
     pub rsync: Timing,
     pub parse: Timing,
     pub install: Timing,
@@ -130,7 +129,6 @@ impl Metrics {
         span
     }
 
-    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn parse_start(&self) -> Span {
         let mut span = self.span(Stage::Parse);
         span.parser = true;
@@ -285,13 +283,11 @@ impl Drop for Span {
         }
         let timing = match self.stage {
             Stage::Catalog => &mut record.catalog,
-            #[cfg(feature = "phase2-fixtures")]
             Stage::Txt => &mut record.txt,
-            #[cfg(feature = "phase2-fixtures")]
+            Stage::Feed => &mut record.feed,
             Stage::Xml => &mut record.rfcxml,
             Stage::Rsync => &mut record.rsync,
             Stage::Parse => &mut record.parse,
-            #[cfg(feature = "phase2-fixtures")]
             Stage::Install => &mut record.install,
             Stage::Database => &mut record.database,
             #[cfg(feature = "phase2-fixtures")]

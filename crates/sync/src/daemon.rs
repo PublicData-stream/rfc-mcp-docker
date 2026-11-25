@@ -1,4 +1,13 @@
-use crate::{Scope, Writer, config::SyncConfig, discovery, shutdown::Shutdown, upstream::Upstream};
+use crate::{
+    Scope, Writer,
+    config::SyncConfig,
+    discovery,
+    egress::Lease,
+    feed_broker::Broker,
+    manual::{Manual, Reply},
+    shutdown::Shutdown,
+    upstream::Upstream,
+};
 #[cfg(feature = "phase6-fixtures")]
 use crate::{ingest::ingest_locked, legacy_config, policy::Registry, publication::promote_locked};
 #[cfg(feature = "phase6-fixtures")]
@@ -28,7 +37,7 @@ struct Schedule {
 impl Schedule {
     fn new(daily: Duration) -> Result<Self> {
         #[cfg(feature = "phase6-fixtures")]
-        if legacy_fixtures() || env::var("RFC_DISCOVERY_FIXTURES").as_deref() == Ok("1") {
+        if legacy_fixtures() || acquisition_fixture() {
             let setting = |name, default| -> Result<Duration> {
                 let seconds = env::var(name)
                     .ok()
@@ -55,9 +64,13 @@ impl Schedule {
 }
 
 #[cfg(feature = "phase6-fixtures")]
+pub(crate) fn acquisition_fixture() -> bool {
+    env::var("RFC_DISCOVERY_FIXTURES").as_deref() == Ok("1")
+}
+
+#[cfg(feature = "phase6-fixtures")]
 pub fn legacy_fixtures() -> bool {
-    env::var("RFC_PHASE6_FIXTURES").as_deref() == Ok("1")
-        && env::var("RFC_DISCOVERY_FIXTURES").as_deref() != Ok("1")
+    env::var("RFC_PHASE6_FIXTURES").as_deref() == Ok("1") && !acquisition_fixture()
 }
 
 enum Engine {
@@ -83,6 +96,25 @@ impl Engine {
         })
     }
 
+    fn upstream(&self) -> Option<&Upstream> {
+        match self {
+            Self::Discovery { upstream, .. } => Some(upstream),
+            #[cfg(feature = "phase6-fixtures")]
+            Self::Legacy(_) => None,
+        }
+    }
+
+    fn with_lease(&mut self, lease: &Lease) -> Result<()> {
+        match self {
+            Self::Discovery { upstream, .. } => {
+                **upstream = upstream.as_ref().clone().with_lease(lease)?
+            }
+            #[cfg(feature = "phase6-fixtures")]
+            Self::Legacy(_) => {}
+        }
+        Ok(())
+    }
+
     fn daily(&self) -> Duration {
         match self {
             Self::Discovery { config, .. } => {
@@ -93,16 +125,17 @@ impl Engine {
         }
     }
 
-    async fn catalog_changed(&self) -> Result<bool> {
+    async fn catalog_changed(&self, shutdown: &Shutdown) -> Result<bool> {
         match self {
             Self::Discovery { config, upstream } => {
-                catalog_changed(upstream, config.ingestion.max_accepted_bytes).await
+                catalog_changed(upstream, config.ingestion.max_accepted_bytes, shutdown).await
             }
             #[cfg(feature = "phase6-fixtures")]
             Self::Legacy(config) => {
                 catalog_changed(
                     &Upstream::fixture(*config)?,
                     config.ingestion.max_accepted_bytes,
+                    shutdown,
                 )
                 .await
             }
@@ -111,7 +144,14 @@ impl Engine {
 }
 
 pub async fn run_daemon() -> Result<()> {
-    let engine = Engine::load()?;
+    let mut engine = Engine::load()?;
+    let lease = if engine.upstream().is_some() {
+        let lease = Lease::acquire()?;
+        engine.with_lease(&lease)?;
+        Some(lease)
+    } else {
+        None
+    };
     let schedule = Schedule::new(engine.daily())?;
     let listen = control::address(&env::var("RFC_SYNC_CONTROL_BIND")?)?;
     let notify = control::address(&env::var("RFC_SYNC_SERVE_ADDR")?)?;
@@ -121,14 +161,7 @@ pub async fn run_daemon() -> Result<()> {
         return Err("feed and notification key sets overlap".into());
     }
     let mut leader = Writer::connect().await?;
-    let held: bool = leader
-        .client
-        .query_one("SELECT pg_catalog.pg_try_advisory_lock(-3::bigint)", &[])
-        .await?
-        .try_get(0)?;
-    if !held {
-        return Err("another synchronization daemon owns the scheduler".into());
-    }
+    leader.acquire_egress_leader().await?;
     enqueue(&mut leader, None, true).await?;
     let listener = TcpListener::bind(listen).await?;
     let notify = Client::new(notify, Link::SyncServe, notify_keys);
@@ -142,40 +175,94 @@ pub async fn run_daemon() -> Result<()> {
             _ = interrupt.recv() => (),
         }
     };
+    let manual = Manual::default();
+    let operator = if lease.is_some() {
+        Some(Manual::bind()?)
+    } else {
+        None
+    };
+    let (broker, feed_requests) = Broker::new();
+    let broker_control = broker.clone();
+    let broker_upstream = engine.upstream().cloned();
+    let broker_shutdown = shutdown.clone();
+    let mut feed_worker = tokio::spawn(async move {
+        match broker_upstream {
+            Some(upstream) => broker.run(feed_requests, &upstream, &broker_shutdown).await,
+            None => {
+                broker_shutdown.cancelled().await;
+                Ok(())
+            }
+        }
+    });
     let worker_shutdown = shutdown.clone();
-    let mut worker = tokio::spawn(async move { worker(engine, &schedule, &worker_shutdown).await });
+    let worker_manual = manual.clone();
+    let mut worker =
+        tokio::spawn(
+            async move { worker(engine, &schedule, &worker_shutdown, &worker_manual).await },
+        );
+    let operator_shutdown = shutdown.clone();
+    let mut operator_worker = tokio::spawn(async move {
+        if let Some(listener) = operator {
+            manual.serve(listener, &operator_shutdown).await
+        } else {
+            operator_shutdown.cancelled().await;
+            Ok(())
+        }
+    });
     let services = async {
         tokio::try_join!(
-            control::serve(listener, Link::FeedSync, feed_keys, accept),
+            control::serve(listener, Link::FeedSync, feed_keys, move |command| {
+                let broker = broker_control.clone();
+                async move { accept(command, &broker).await }
+            }),
             dispatch(notify, outbox_retry),
-            watch_leader(leader),
+            watch_leader(&leader),
         )?;
         Result::Ok(())
     };
     tokio::pin!(services);
-    tokio::select! {
-        result = &mut worker => result?,
-        result = &mut services => {
-            shutdown.stop();
-            result.and(worker.await?)
-        }
-        _ = stopping => {
-            shutdown.stop();
-            worker.await?
-        }
-    }
+    let (result, finished_worker) = tokio::select! {
+        result = &mut worker => (result, 1),
+        result = &mut feed_worker => (result, 2),
+        result = &mut operator_worker => (result, 3),
+        result = &mut services => (Ok(result), 0),
+        _ = stopping => (Ok(Ok(())), 0),
+    };
+    shutdown.stop();
+    let worker_result = if finished_worker == 1 {
+        Ok(Ok(()))
+    } else {
+        worker.await
+    };
+    let feed_result = if finished_worker == 2 {
+        Ok(Ok(()))
+    } else {
+        feed_worker.await
+    };
+    let operator_result = if finished_worker == 3 {
+        Ok(Ok(()))
+    } else {
+        operator_worker.await
+    };
+    drop(lease);
+    result?
+        .and(worker_result?)
+        .and(feed_result?)
+        .and(operator_result?)
 }
 
-async fn watch_leader(leader: Writer) -> Result<()> {
+pub(crate) async fn watch_leader(leader: &Writer) -> Result<()> {
     loop {
         sleep(HEARTBEAT).await;
         timeout(HEARTBEAT, leader.client.simple_query("SELECT 1")).await??;
     }
 }
 
-async fn accept(command: Command) -> std::result::Result<Outcome, Rejection> {
-    let Command::Sync(event) = command else {
-        return Err(Rejection::Conflict);
+async fn accept(command: Command, broker: &Broker) -> std::result::Result<Outcome, Rejection> {
+    let event = match command {
+        Command::FeedPoll(poll) => return Ok(Outcome::Feed(broker.poll(&poll))),
+        Command::Sync(event) => event,
+        Command::Generation(_) => return Err(Rejection::Conflict),
     };
     let mut writer = Writer::connect()
         .await
@@ -321,7 +408,7 @@ pub(crate) async fn finish_published_job(tx: &Transaction<'_>, job: i64) -> Resu
 
 #[derive(Clone, Copy)]
 enum JobStatus {
-    Discovered,
+    Acquired,
     Deferred,
     Failed,
     #[cfg(feature = "phase3-fixtures")]
@@ -330,8 +417,8 @@ enum JobStatus {
 
 async fn complete(tx: &Transaction<'_>, job: i64, status: JobStatus) -> Result<()> {
     let (state, outcome, event_status) = match status {
-        JobStatus::Discovered => ("succeeded", "discovery_complete", "completed"),
-        JobStatus::Deferred => ("failed", "discovery_deferred", "failed"),
+        JobStatus::Acquired => ("succeeded", "acquisition_complete", "completed"),
+        JobStatus::Deferred => ("failed", "acquisition_deferred", "failed"),
         JobStatus::Failed => ("failed", "reconciliation_failed", "failed"),
         #[cfg(feature = "phase3-fixtures")]
         JobStatus::Published => ("succeeded", "published", "completed"),
@@ -447,40 +534,73 @@ async fn reconcile_legacy(
     result.map(|_| ())
 }
 
-async fn catalog_changed(upstream: &Upstream, accepted_bytes: u64) -> Result<bool> {
+async fn catalog_changed(
+    upstream: &Upstream,
+    accepted_bytes: u64,
+    shutdown: &Shutdown,
+) -> Result<bool> {
     // Use a short-lived session so the advisory lock is released on return.
-    let writer = Writer::connect().await?;
-    let _corpus = writer.acquire_coordinator().await?;
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let writer = shutdown.until(deadline, Writer::connect()).await?;
+    let _corpus = shutdown
+        .until(deadline, writer.acquire_coordinator())
+        .await?;
     upstream.after_fence().await;
-    let stored: Option<String> = writer.client.query_opt(
-        "SELECT encode(o.raw_digest, 'hex')
-         FROM rfc.active_generation a JOIN rfc.generation_ingestion i ON i.generation_id = a.generation_id
-         JOIN rfc.source_observations o ON o.identity = i.catalog_after WHERE a.singleton",
-        &[],
-    ).await?.map(|row| row.try_get(0)).transpose()?;
-    let capture = upstream.catalog().await?;
+    let stored: Option<String> = shutdown.until(deadline, async {
+        Ok(writer.client.query_opt(
+            "SELECT encode(o.raw_digest, 'hex')
+             FROM rfc.active_generation a JOIN rfc.generation_ingestion i ON i.generation_id = a.generation_id
+             JOIN rfc.source_observations o ON o.identity = i.catalog_after WHERE a.singleton",
+            &[],
+        ).await?.map(|row| row.try_get(0)).transpose()?)
+    }).await?;
+    let capture = shutdown.until(deadline, upstream.catalog()).await?;
     if capture.bytes.len() as u64 > accepted_bytes {
         return Err("catalog probe exceeds accepted byte limit".into());
     }
-    let digest = rfc_core::BlobDigest::hash(&capture.bytes).to_string();
-    if stored.as_ref() == Some(&digest) {
-        return Ok(false);
-    }
-    tokio::task::spawn_blocking(move || discovery::parse_catalog(&capture.bytes)).await??;
-    Ok(true)
+    let _permit = upstream.parse_slot(shutdown).await?;
+    let changed = tokio::task::spawn_blocking(move || {
+        let digest = rfc_core::BlobDigest::hash(&capture.bytes).to_string();
+        if stored.as_ref() == Some(&digest) {
+            return Ok(false);
+        }
+        discovery::parse_catalog(&capture.bytes)?;
+        Result::Ok(true)
+    })
+    .await??;
+    shutdown.check()?;
+    Ok(changed)
 }
 
-async fn worker(engine: Engine, schedule: &Schedule, shutdown: &Shutdown) -> Result<()> {
+async fn worker(
+    engine: Engine,
+    schedule: &Schedule,
+    shutdown: &Shutdown,
+    manual: &Manual,
+) -> Result<()> {
     let mut writer = Writer::connect().await?;
     let mut daily = Instant::now() + jitter(schedule.daily);
     let mut hourly = Instant::now() + jitter(schedule.hourly);
     while shutdown.check().is_ok() {
+        if let Some(scope) = manual.claim() {
+            match &engine {
+                Engine::Discovery { config, upstream } => {
+                    let _ = report_execution(
+                        discovery::execute(scope, None, config, upstream, shutdown).await,
+                        manual,
+                    );
+                }
+                #[cfg(feature = "phase6-fixtures")]
+                Engine::Legacy(_) => unreachable!("fixture engine has no operator listener"),
+            }
+            continue;
+        }
         if Instant::now() >= daily && enqueue(&mut writer, None, false).await.is_ok() {
             daily = Instant::now() + jitter(schedule.daily);
         }
         match claim(&mut writer).await {
             Ok(NextJob::Ready(job)) => {
-                let result = process_job(&engine, &mut writer, job, shutdown).await;
+                let result = process_job(&engine, &mut writer, job, shutdown, manual).await;
                 if let Some(status) = result
                     && shutdown.check().is_ok()
                     && schedule_retry(&mut writer, job, status).await.is_err()
@@ -490,11 +610,10 @@ async fn worker(engine: Engine, schedule: &Schedule, shutdown: &Shutdown) -> Res
             }
             Ok(NextJob::Idle) if Instant::now() >= hourly => {
                 hourly = Instant::now() + jitter(schedule.hourly);
-                let changed = tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => break,
-                    result = async { timeout(Duration::from_secs(600), engine.catalog_changed()).await? } => result,
-                };
+                let changed = engine.catalog_changed(shutdown).await;
+                if shutdown.check().is_err() {
+                    break;
+                }
                 match changed {
                     Ok(true) if enqueue(&mut writer, None, false).await.is_err() => {
                         eprintln!("catalog change could not be queued");
@@ -522,11 +641,14 @@ async fn process_job(
     writer: &mut Writer,
     job: i64,
     shutdown: &Shutdown,
+    manual: &Manual,
 ) -> Option<JobStatus> {
     match engine {
         Engine::Discovery { config, upstream } => {
-            let outcome =
+            manual.start_automatic();
+            let result =
                 discovery::execute(Scope::Full, Some(job), config, upstream, shutdown).await;
+            let outcome = report_execution(result, manual);
             match outcome {
                 Ok(discovery::Outcome::Complete) => {
                     let finished: Result<()> = async {
@@ -534,7 +656,7 @@ async fn process_job(
                         tx.batch_execute("SET LOCAL synchronous_commit = on")
                             .await?;
                         lock_queue(&tx).await?;
-                        complete(&tx, job, JobStatus::Discovered).await?;
+                        complete(&tx, job, JobStatus::Acquired).await?;
                         tx.commit().await?;
                         Ok(())
                     }
@@ -557,6 +679,26 @@ async fn process_job(
                 Some(JobStatus::Failed)
             }
         },
+    }
+}
+
+fn report_execution(
+    result: Result<discovery::Execution>,
+    manual: &Manual,
+) -> Result<discovery::Outcome> {
+    match result {
+        Ok(execution) => {
+            println!("{}", execution.report);
+            manual.finish(execution.operator());
+            execution.outcome
+        }
+        Err(error) => {
+            manual.finish(Reply {
+                success: false,
+                report: r#"{"state":"acquisition_failed","error":"could not encode acquisition report"}"#.to_owned(),
+            });
+            Err(error)
+        }
     }
 }
 

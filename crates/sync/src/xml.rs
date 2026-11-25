@@ -1,11 +1,8 @@
 //! Bounded parsing of official catalog, RFCXML and feed inputs.
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 use crate::parse::{Budget, BudgetExceeded};
 use crate::upstream::CATALOG_LIMIT;
-#[cfg(any(test, feature = "phase2-fixtures"))]
 use crate::upstream::XML_LIMIT;
-#[cfg(any(test, feature = "phase2-fixtures"))]
 use rfc_core::Coverage;
 use rfc_core::{RelationKind, RfcNumber};
 use rfc_storage::postgres::Result;
@@ -231,7 +228,6 @@ fn publication_date(node: Element<'_, '_>) -> Result<(Option<String>, Option<Str
     Ok((Some(format!("{year:04}-{month:02}-{day:02}")), None))
 }
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 pub(crate) struct XmlReference {
     pub kind: RelationKind,
     pub target: RfcNumber,
@@ -239,14 +235,12 @@ pub(crate) struct XmlReference {
     pub locator: String,
 }
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 pub(crate) struct XmlReferences {
     pub edges: Vec<XmlReference>,
     pub all: Coverage,
     pub classified: Coverage,
 }
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 pub(crate) fn references(
     bytes: &[u8],
     expected: RfcNumber,
@@ -377,7 +371,6 @@ pub(crate) fn references(
     })
 }
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 pub(crate) fn classification(name: &str) -> Option<RelationKind> {
     if name.trim().eq_ignore_ascii_case("normative references") {
         Some(RelationKind::NormativeReference)
@@ -388,7 +381,6 @@ pub(crate) fn classification(name: &str) -> Option<RelationKind> {
     }
 }
 
-#[cfg(any(test, feature = "phase2-fixtures"))]
 pub(crate) fn rfc_link(value: &str) -> bool {
     value.contains("/rfc/") || value.contains("/info/rfc") || value.contains("10.17487/RFC")
 }

@@ -1,16 +1,18 @@
 //! Fixed upstream destinations and bounded, private transfers.
 
 use crate::{
+    acquisition::{Accepted, LocalFailure},
     config::Https,
+    egress::{Cooldown, Lease},
     metrics::{Metrics, Stage},
+    request_order::{Lane, Order},
+    shutdown::Shutdown,
 };
 #[cfg(feature = "phase2-fixtures")]
-use crate::{
-    config::scratch_stats, legacy_config::SyncConfig, metrics::StageLease, shutdown::Shutdown,
-};
+use crate::{config::scratch_stats, legacy_config::SyncConfig, metrics::StageLease};
 use reqwest::{Client, StatusCode, header};
-use rfc_core::RfcNumber;
-use rfc_mcp_docker::control::jitter;
+use rfc_core::{BlobDigest, RfcNumber};
+use rfc_mcp_docker::control::{FEED_LIMIT, FeedFormat, jitter};
 #[cfg(feature = "phase2-fixtures")]
 use rfc_storage::blob::BlobWriter;
 use rfc_storage::postgres::Result;
@@ -18,6 +20,7 @@ use rfc_storage::postgres::Result;
 use std::{collections::BTreeSet, io::Read, process::Stdio};
 use std::{
     future::{Future, poll_fn},
+    path::Path,
     sync::Arc,
     task::Poll,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -25,6 +28,7 @@ use std::{
 #[cfg(feature = "phase2-fixtures")]
 use tokio::process::Command;
 use tokio::{
+    io::AsyncWriteExt,
     sync::{Mutex, Semaphore},
     time,
 };
@@ -40,19 +44,17 @@ pub(crate) const MAX_CATALOG_ENTRIES: usize = 20_000;
 #[derive(Clone, Copy)]
 pub(crate) enum Source {
     Catalog,
-    #[cfg(feature = "phase2-fixtures")]
     Txt(RfcNumber),
-    #[cfg(feature = "phase2-fixtures")]
     Xml(RfcNumber),
+    Feed(FeedFormat),
 }
 
 impl Source {
     fn path(self) -> String {
         match self {
             Self::Catalog => "/rfc-index.xml".into(),
-            #[cfg(feature = "phase2-fixtures")]
+            Self::Feed(format) => format.path().into(),
             Self::Txt(id) => format!("/rfc/rfc{}.txt", id.get()),
-            #[cfg(feature = "phase2-fixtures")]
             Self::Xml(id) => format!("/rfc/rfc{}.xml", id.get()),
         }
     }
@@ -61,12 +63,18 @@ impl Source {
         format!("{OFFICIAL_HTTPS}{}", self.path())
     }
 
+    pub(crate) fn audit_state(self) -> &'static str {
+        match self {
+            Self::Txt(_) => "pending",
+            _ => "not_applicable",
+        }
+    }
+
     pub(crate) fn kind(self) -> &'static str {
         match self {
             Self::Catalog => "catalog",
-            #[cfg(feature = "phase2-fixtures")]
+            Self::Feed(_) => "feed",
             Self::Txt(_) => "txt",
-            #[cfg(feature = "phase2-fixtures")]
             Self::Xml(_) => "rfcxml",
         }
     }
@@ -74,9 +82,8 @@ impl Source {
     pub(crate) fn limit(self) -> usize {
         match self {
             Self::Catalog => CATALOG_LIMIT,
-            #[cfg(feature = "phase2-fixtures")]
+            Self::Feed(_) => FEED_LIMIT,
             Self::Txt(_) => TXT_LIMIT,
-            #[cfg(feature = "phase2-fixtures")]
             Self::Xml(_) => XML_LIMIT,
         }
     }
@@ -84,8 +91,8 @@ impl Source {
     fn accepts(self, media_type: &str) -> bool {
         let media_type = media_type.split(';').next().unwrap_or("").trim();
         match self {
-            #[cfg(feature = "phase2-fixtures")]
             Self::Txt(_) => media_type.eq_ignore_ascii_case("text/plain"),
+            Self::Feed(format) => format.accepts(media_type),
             _ => ["application/xml", "text/xml", "application/octet-stream"]
                 .iter()
                 .any(|allowed| media_type.eq_ignore_ascii_case(allowed)),
@@ -96,6 +103,8 @@ impl Source {
 #[derive(Debug)]
 pub(crate) struct Capture {
     pub bytes: Arc<Vec<u8>>,
+    pub staged: Option<(BlobDigest, u64)>,
+    pub unchanged: bool,
     pub observed_us: i64,
     pub fetched_us: i64,
     pub etag: Option<String>,
@@ -104,11 +113,9 @@ pub(crate) struct Capture {
 
 pub(crate) enum Download {
     Captured(Capture),
-    #[cfg(feature = "phase2-fixtures")]
     Missing(MissingXml),
 }
 
-#[cfg(feature = "phase2-fixtures")]
 pub(crate) enum MissingXml {
     NotFound,
     Gone,
@@ -174,6 +181,9 @@ pub(crate) struct Upstream {
     // None represents a Retry-After beyond the range of the monotonic clock.
     next_request: Arc<Mutex<Option<time::Instant>>>,
     in_flight: Arc<Semaphore>,
+    order: Arc<Order>,
+    parsers: Arc<Semaphore>,
+    cooldown: Option<Cooldown>,
 }
 
 impl Upstream {
@@ -240,6 +250,7 @@ impl Upstream {
             .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(https.max_in_flight_requests)
             .timeout(timeout)
             .user_agent("rfc-mcp-docker-sync/0.0.0");
         if let Some(ca) = ca {
@@ -260,7 +271,31 @@ impl Upstream {
             fixture_clock: None,
             next_request: Arc::new(Mutex::new(Some(time::Instant::now()))),
             in_flight: Arc::new(Semaphore::new(https.max_in_flight_requests)),
+            order: Arc::default(),
+            parsers: Arc::new(Semaphore::new(2)),
+            cooldown: None,
         })
+    }
+
+    pub(crate) fn with_parsers(mut self, parser_workers: u64) -> Self {
+        self.parsers = Arc::new(Semaphore::new(parser_workers as usize));
+        self
+    }
+
+    pub(crate) async fn parse_slot(
+        &self,
+        shutdown: &Shutdown,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        Ok(cancellable(Some(shutdown), self.parsers.acquire()).await??)
+    }
+
+    pub(crate) fn with_lease(mut self, lease: &Lease) -> Result<Self> {
+        let (cooldown, remaining) = lease.cooldown()?;
+        self.next_request = Arc::new(Mutex::new(
+            time::Instant::now().checked_add(remaining.max(self.start_interval())),
+        ));
+        self.cooldown = Some(cooldown);
+        Ok(self)
     }
 
     #[cfg(feature = "phase2-fixtures")]
@@ -300,7 +335,7 @@ impl Upstream {
 
     #[cfg(feature = "phase2-fixtures")]
     pub(crate) async fn fetch(&self, source: Source) -> Result<Download> {
-        self.fetch_once(source, false)
+        self.fetch_once(source, false, None, None, None)
             .await
             .map_err(|failure| match failure {
                 FetchFailure::Retryable { error, .. } | FetchFailure::Terminal(error) => error,
@@ -308,9 +343,8 @@ impl Upstream {
     }
 
     pub(crate) async fn catalog(&self) -> Result<Capture> {
-        match self.fetch_with_retries(Source::Catalog).await {
+        match self.fetch_with_retries(Source::Catalog, None, None).await {
             Ok(Download::Captured(capture)) => Ok(capture),
-            #[cfg(feature = "phase2-fixtures")]
             Ok(Download::Missing(_)) => Err("required catalog is unavailable".into()),
             Err(FetchAttempts::Exhausted(error) | FetchAttempts::Terminal(error)) => Err(error),
         }
@@ -321,17 +355,63 @@ impl Upstream {
         &self,
         id: RfcNumber,
     ) -> std::result::Result<Download, FetchAttempts> {
-        self.fetch_with_retries(Source::Xml(id)).await
+        self.fetch_with_retries(Source::Xml(id), None, None).await
+    }
+
+    pub(crate) async fn artifact(
+        &self,
+        source: Source,
+        path: &Path,
+        shutdown: &Shutdown,
+        accepted: &Accepted,
+    ) -> std::result::Result<Download, FetchAttempts> {
+        self.fetch_with_retries(source, Some((path, accepted)), Some(shutdown))
+            .await
+    }
+
+    pub(crate) async fn feed(
+        &self,
+        format: FeedFormat,
+        validators: (&Option<String>, &Option<String>),
+    ) -> Result<Capture> {
+        match self
+            .fetch_once(Source::Feed(format), false, None, None, Some(validators))
+            .await
+        {
+            Ok(Download::Captured(capture)) => Ok(capture),
+            Ok(Download::Missing(_)) => Err("feed returned an invalid result".into()),
+            Err(FetchFailure::Terminal(error) | FetchFailure::Retryable { error, .. }) => {
+                Err(error)
+            }
+        }
     }
 
     async fn fetch_with_retries(
         &self,
         source: Source,
+        path: Option<(&Path, &Accepted)>,
+        shutdown: Option<&Shutdown>,
     ) -> std::result::Result<Download, FetchAttempts> {
         let max_attempts = self.https.max_attempts;
         let mut attempt = 1;
         loop {
-            match self.fetch_once(source, attempt > 1).await {
+            let result = self
+                .fetch_once(source, attempt > 1, path, shutdown, None)
+                .await;
+            if let Some((partial, _)) = path
+                && result.is_err()
+            {
+                match tokio::fs::remove_file(partial).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(FetchAttempts::Terminal(Box::new(LocalFailure(
+                            error.into(),
+                        ))));
+                    }
+                }
+            }
+            match result {
                 Ok(download) => return Ok(download),
                 Err(FetchFailure::Terminal(error)) => return Err(FetchAttempts::Terminal(error)),
                 Err(FetchFailure::Retryable { error, retry_after }) => {
@@ -340,7 +420,12 @@ impl Upstream {
                     {
                         return Err(FetchAttempts::Exhausted(error));
                     }
-                    time::sleep(jitter(Duration::from_secs(1 << (attempt - 1)))).await;
+                    cancellable(
+                        shutdown,
+                        time::sleep(jitter(Duration::from_secs(1 << (attempt - 1)))),
+                    )
+                    .await
+                    .map_err(FetchAttempts::Terminal)?;
                     attempt += 1;
                 }
             }
@@ -358,21 +443,32 @@ impl Upstream {
         &self,
         source: Source,
         retry: bool,
+        path: Option<(&Path, &Accepted)>,
+        shutdown: Option<&Shutdown>,
+        conditional: Option<(&Option<String>, &Option<String>)>,
     ) -> std::result::Result<Download, FetchFailure> {
         let queue = self.metrics.span(Stage::Queue);
+        let lane = match source {
+            Source::Txt(_) => Lane::Txt,
+            Source::Xml(_) => Lane::Xml,
+            Source::Catalog => Lane::Catalog,
+            Source::Feed(_) => Lane::Feed,
+        };
+        let queued = cancellable(shutdown, self.order.wait(lane))
+            .await
+            .map_err(FetchFailure::terminal)?;
         let mut next;
         let _permit;
         loop {
-            let permit = self
-                .in_flight
-                .acquire()
+            let permit = cancellable(shutdown, self.in_flight.acquire())
                 .await
+                .map_err(FetchFailure::terminal)?
                 .map_err(FetchFailure::terminal)?;
             let gate = self.next_request.lock().await;
             let Some(deadline) = *gate else {
                 drop(gate);
                 drop(permit);
-                return std::future::pending().await;
+                return Err(FetchFailure::terminal("HTTPS cooldown exceeds clock range"));
             };
             if deadline <= time::Instant::now() {
                 next = gate;
@@ -381,28 +477,44 @@ impl Upstream {
             }
             drop(gate);
             drop(permit);
-            time::sleep_until(deadline).await;
+            if self.cooldown.is_some()
+                && deadline.saturating_duration_since(time::Instant::now())
+                    > MAX_RETRY_AFTER.max(self.start_interval())
+            {
+                return Err(FetchFailure::terminal(
+                    "HTTPS deployment is in upstream cooldown",
+                ));
+            }
+            cancellable(shutdown, time::sleep_until(deadline))
+                .await
+                .map_err(FetchFailure::terminal)?;
         }
         let clock = self.capture_clock(source);
         let observed_us = clock
             .map_or_else(now_us, Ok)
             .map_err(FetchFailure::terminal)?;
-        let request = self
+        let mut request = self
             .http
             .get(format!("{}{}", self.https_origin, source.path()))
-            .header(header::ACCEPT_ENCODING, "identity")
-            .build()
-            .map_err(FetchFailure::terminal)?;
+            .header(header::ACCEPT_ENCODING, "identity");
+        if let Some((etag, last_modified)) = conditional {
+            if let Some(value) = etag {
+                request = request.header(header::IF_NONE_MATCH, value);
+            }
+            if let Some(value) = last_modified {
+                request = request.header(header::IF_MODIFIED_SINCE, value);
+            }
+        }
+        let request = request.build().map_err(FetchFailure::terminal)?;
         drop(queue);
         if retry {
             self.metrics.retry();
         }
         let _http = self.metrics.http_start(match source {
             Source::Catalog => Stage::Catalog,
-            #[cfg(feature = "phase2-fixtures")]
             Source::Txt(_) => Stage::Txt,
-            #[cfg(feature = "phase2-fixtures")]
             Source::Xml(_) => Stage::Xml,
+            Source::Feed(_) => Stage::Feed,
         });
         let response = self.http.execute(request);
         tokio::pin!(response);
@@ -413,15 +525,30 @@ impl Upstream {
             *next = Some(time::Instant::now() + self.start_interval());
         }
         drop(next);
+        drop(queued);
         let mut response = match initial {
             Poll::Ready(result) => result,
-            Poll::Pending => response.await,
+            Poll::Pending => cancellable(shutdown, response)
+                .await
+                .map_err(FetchFailure::terminal)?,
         }
         .map_err(|error| FetchFailure::transport(source, error))?;
         let status = response.status();
+        if status == StatusCode::NOT_MODIFIED
+            && conditional.is_some_and(|(etag, modified)| etag.is_some() || modified.is_some())
+        {
+            return Ok(Download::Captured(Capture {
+                bytes: Arc::default(),
+                staged: None,
+                unchanged: true,
+                observed_us,
+                fetched_us: now_us().map_err(FetchFailure::terminal)?,
+                etag: None,
+                last_modified: None,
+            }));
+        }
         if status != StatusCode::OK {
             let error = format!("{} unexpected HTTPS status {status}", source.kind());
-            #[cfg(feature = "phase2-fixtures")]
             if matches!(source, Source::Xml(_)) {
                 match status {
                     StatusCode::NOT_FOUND => return Ok(Download::Missing(MissingXml::NotFound)),
@@ -432,8 +559,16 @@ impl Upstream {
             match status {
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
                     let retry_after = retry_after(response.headers(), SystemTime::now());
-                    if let Some(delay) = retry_after {
-                        self.delay_starts(delay).await;
+                    let delay = retry_after.unwrap_or(self.start_interval());
+                    let mut next = self.next_request.lock().await;
+                    *next = next
+                        .zip(time::Instant::now().checked_add(delay))
+                        .map(|(current, proposed)| current.max(proposed));
+                    if let Some(cooldown) = &self.cooldown
+                        && let Err(error) = cooldown.record(delay)
+                    {
+                        *next = None;
+                        return Err(FetchFailure::terminal(LocalFailure(error)));
                     }
                     return Err(FetchFailure::Retryable {
                         error: error.into(),
@@ -481,26 +616,13 @@ impl Upstream {
         {
             return Err(FetchFailure::terminal("HTTPS transfer exceeds byte limit"));
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(limit)
-            .map_err(FetchFailure::terminal)?;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| FetchFailure::transport(source, error))?
-        {
-            if chunk.len() > limit - bytes.len() {
-                return Err(FetchFailure::terminal("HTTPS transfer exceeds byte limit"));
-            }
-            self.metrics.received(chunk.len());
-            bytes.extend_from_slice(&chunk);
-        }
-        if bytes.is_empty() {
-            return Err(FetchFailure::terminal("HTTPS body is empty"));
-        }
+        let result = self
+            .read_body(source, &mut response, path, shutdown)
+            .await?;
         Ok(Download::Captured(Capture {
-            bytes: Arc::new(bytes),
+            bytes: Arc::new(result.bytes),
+            staged: result.staged,
+            unchanged: false,
             observed_us,
             fetched_us: clock
                 .map_or_else(now_us, |us| Ok(us + 1))
@@ -510,15 +632,86 @@ impl Upstream {
         }))
     }
 
+    async fn read_body(
+        &self,
+        source: Source,
+        response: &mut reqwest::Response,
+        path: Option<(&Path, &Accepted)>,
+        shutdown: Option<&Shutdown>,
+    ) -> std::result::Result<Body, FetchFailure> {
+        let limit = source.limit();
+        let mut bytes = Vec::new();
+        let mut charge = path.map(|(_, accepted)| accepted.attempt());
+        let mut file = match path {
+            Some((path, _)) => Some(
+                tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)
+                    .await
+                    .map_err(local_failure)?,
+            ),
+            None => {
+                bytes
+                    .try_reserve_exact(limit)
+                    .map_err(FetchFailure::terminal)?;
+                None
+            }
+        };
+        let expected = response.content_length();
+        let mut length = 0;
+        let mut hash = blake3::Hasher::new();
+        while let Some(chunk) = cancellable(shutdown, response.chunk())
+            .await
+            .map_err(FetchFailure::terminal)?
+            .map_err(|error| FetchFailure::transport(source, error))?
+        {
+            if chunk.len() > limit - length {
+                return Err(FetchFailure::terminal("HTTPS transfer exceeds byte limit"));
+            }
+            self.metrics.received(chunk.len());
+            length += chunk.len();
+            if let Some(file) = &mut file {
+                charge
+                    .as_mut()
+                    .expect("staged payload budget")
+                    .charge(chunk.len() as u64)
+                    .map_err(FetchFailure::terminal)?;
+                hash.update(&chunk);
+                file.write_all(&chunk).await.map_err(local_failure)?;
+            } else {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        if length == 0 || expected.is_some_and(|size| size != length as u64) {
+            return Err(FetchFailure::terminal("empty or truncated HTTPS body"));
+        }
+        let staged = if let Some(mut file) = file {
+            let _timing = self.metrics.span(Stage::Install);
+            file.flush().await.map_err(local_failure)?;
+            file.sync_all().await.map_err(local_failure)?;
+            charge.expect("staged payload budget").retain();
+            Some((
+                BlobDigest::from_bytes(*hash.finalize().as_bytes()),
+                length as u64,
+            ))
+        } else {
+            None
+        };
+        Ok(Body { bytes, staged })
+    }
+
     fn capture_clock(&self, _source: Source) -> Option<i64> {
         #[cfg(feature = "phase2-fixtures")]
         if let Some(base) = self.fixture_clock.as_ref() {
             return Some(match _source {
                 Source::Catalog => 1 + base.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                #[cfg(feature = "phase2-fixtures")]
                 Source::Txt(id) => 1_790_000_010_000_000 + i64::from(id.get()),
-                #[cfg(feature = "phase2-fixtures")]
                 Source::Xml(id) => 1_790_000_020_000_000 + i64::from(id.get()),
+                Source::Feed(_) => return None,
             });
         }
         None
@@ -645,6 +838,26 @@ impl Upstream {
     }
 }
 
+fn local_failure(error: std::io::Error) -> FetchFailure {
+    FetchFailure::terminal(LocalFailure(error.into()))
+}
+
+struct Body {
+    bytes: Vec<u8>,
+    staged: Option<(BlobDigest, u64)>,
+}
+
+async fn cancellable<T>(shutdown: Option<&Shutdown>, work: impl Future<Output = T>) -> Result<T> {
+    match shutdown {
+        Some(shutdown) => tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Err("HTTPS request cancelled".into()),
+            result = work => Ok(result),
+        },
+        None => Ok(work.await),
+    }
+}
+
 #[cfg(feature = "phase2-fixtures")]
 fn scratch_used() -> Option<u64> {
     let stats = scratch_stats()?;
@@ -659,16 +872,16 @@ pub(crate) fn filename(id: RfcNumber) -> String {
 }
 
 fn validator(headers: &header::HeaderMap, name: header::HeaderName) -> Result<Option<String>> {
-    headers
-        .get(name)
-        .map(|value| {
-            let value = value.to_str()?;
-            if value.len() > 4096 {
-                return Err("HTTPS validator exceeds byte limit".into());
-            }
-            Ok(value.to_owned())
-        })
-        .transpose()
+    let all = headers.get_all(name);
+    let mut values = all.iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    let value = value.to_str()?;
+    if values.next().is_some() || value.len() > 4096 {
+        return Err("duplicate or oversized HTTPS validator".into());
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn retry_after(headers: &header::HeaderMap, now: SystemTime) -> Option<Duration> {
