@@ -1517,3 +1517,120 @@ were removed.
 
 The private probes use packaged rsync and local HTTPS stand-ins. Official
 corpus timing and public activation have their own qualification gates.
+
+## HTTPS-first RFC synchronization Phase 7
+
+The Compose `https-faults` case uses the stock Sync image and private
+fixtures to check that acceleration stays in the fixture build. It also
+exercises a required TXT timeout, an audit filesystem that fills after
+preflight, and a database disconnect before publication commit. In each
+fault case the incumbent remains readable and the active pointer and
+outbox stay at their prior state. Retrying after the faults produces one
+new publication.
+
+The full local gate adds alternate rsync checksum negotiation, explicit
+RFCXML evidence and coverage checks, independent XML freshness, and
+byte-exact MCP reads for synthetic NUL and invalid UTF-8 inputs. The NUL
+fixture uses RFC number 542 with synthetic content. The full gate reuses
+the paced pipeline, recovery, migration, and confinement probes.
+
+### Local qualification on 2026-11-25
+
+The native Linux amd64 images were built from `b92e67f`. The probes used
+Docker Engine 29.10.0 rootless and 29.10.1 rootful, Compose 5.8.0,
+PostgreSQL 19.0, packaged rsync 3.5.2, and Rust 1.100.0. The verified image
+bundle identified stock Sync as
+`sha256:d8f2de005f3369a44a83a2a4d2a08292cf32f0659ff86b165671bc5ffc20e15a`.
+
+- The locked fetch, frozen Rust gate, all-feature Clippy and tests, stock
+  feature resolution, `actionlint`, and the HTTP boundary smoke exited 0.
+  The CI image loader accepted the native amd64 bundle for `https-faults`.
+- The Phase 0 Compose and Phase 7 deployment probes both exited 0 on
+  each Docker engine. They checked service and cgroup isolation, verified
+  TLS, Landlock and seccomp, worker cancellation and reaping, and reader
+  fence release.
+- The `https-faults` CI runner exited 0 on both engines. Stock Sync sent
+  zero requests to the fixture with the acceleration switches set, and
+  the fixture build rejected a redirect. The required TXT timed out
+  within its retry budget. Real `ENOSPC` after preflight and a terminated
+  PostgreSQL session preserved the incumbent until a successful retry.
+- The rootless full HTTPS-first, audit, and incumbent cases exited 0.
+  The cold fixture made 14 HTTPS starts, with a minimum observed start
+  interval of 1,000,424 µs. A checkpoint recovery made five starts with
+  the same processing digest. An expired RFCXML capture refreshed while
+  all six TXT originals were reused and audited. The restricted rsync
+  peer negotiated `md5` through `auto` with zero payload-transfer bytes.
+- The publication cases exited 0 on both engines, including byte-exact MCP
+  reads for both synthetic binary inputs, the sequence race, retained
+  rollback, and daemon recovery of the ready candidate and outbox.
+- The rootless cold-daemon and both populated upgrade cases exited 0.
+  The daemon retried the same authenticated outbox event and reconciled
+  again on schedule with Feed stopped. Schema 9 and 10 each migrated
+  twice, retaining historical observations and manifests, then published
+  an audited candidate and rolled back to byte-exact retained reads.
+- The rootless destructive restore exited 0. It verified 16 canonical
+  blobs, 794 byte ranges and line starts, three manifests, and the active
+  pointer at sequence 2. The restored proxy served the retained and
+  active generations over MCP `2026-07-28`.
+- Rootless Minikube 1.39.0 with Kubernetes 1.37.0 and containerd exited 0.
+  Both paths passed stock preflight, byte-exact reads, and authenticated
+  delivery. The manual path recovered its repair pair after pod
+  replacement, and the daemon handled a brokered Feed publication. The
+  warm run reused six TXT and three RFCXML originals with five HTTPS
+  starts. The profile and capped mounts were removed.
+
+The first fault and publication attempts exited 1 because of assertions
+about the warm selection ID and the MCP wire encoding. The first expanded
+Rust check exited 101 because the new receipt assertion reused a moved
+map. The corrected runs passed. The qualification uses private fixtures
+on Linux amd64. Hosted ARM64 verification and official corpus timing are
+separate gates.
+
+The command logs, exit statuses, image manifest, and restore receipt are
+under `/tmp/rfc-https-phase7.ZCoy6eeA` on the qualification host. The run
+removed its disposable Compose resources, test image tags, and Minikube
+profile and mounts.
+
+### Repeat the checks
+
+Use matching stock and fixture images from the native Compose bundle and
+run timing-sensitive probes serially. Use `rfc-https-phase7-schema9` and
+`rfc-https-phase7-schema10` as example prefixes for historical
+`phase3-fixture` builds from `376fdc6` and `29896b5` respectively.
+
+~~~sh
+export TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target RFC_E2E_PRELOADED=1
+cargo fetch --locked
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+cargo tree --workspace --frozen -e features
+actionlint
+python3 -B scripts/phase8/http-smoke.py
+
+evidence=$(mktemp -d /tmp/rfc-phase7.XXXXXXXX)
+for context in rootless default; do
+    python3 -B scripts/phase0/integration.py --context "$context" --project "$prefix" --skip-build
+    python3 -B scripts/phase7/integration.py --context "$context" --image-prefix "$prefix"
+    python3 -B scripts/ci/docker-e2e.py --context "$context" --image-prefix "$prefix" \
+        run https-faults "$evidence/faults-$context"
+done
+
+python3 -B scripts/https-discovery/integration.py --context rootless --image-prefix "$prefix"
+for mode in --publication-only --audit-only --incumbent-only --cold-daemon-only; do
+    python3 -B scripts/https-discovery/integration.py --context rootless --image-prefix "$prefix" "$mode"
+done
+for schema in 9 10; do
+    python3 -B scripts/https-discovery/integration.py --context rootless --image-prefix "$prefix" \
+        "--upgrade-from-schema$schema" "rfc-https-phase7-schema$schema"
+done
+
+mkdir "$evidence/restore"
+python3 -B scripts/phase8/integration.py --context rootless --image-prefix "$prefix" \
+    --evidence "$evidence/restore"
+~~~
+
+Use the disposable rootless Minikube setup described in Phase 6 for its
+separate runtime smoke. Pass the two capped ext4 mount paths under the
+node's `/tmp` to `scripts/https-discovery/minikube.py`. Keep the host
+profile, kubeconfig, and evidence under `/tmp`.
