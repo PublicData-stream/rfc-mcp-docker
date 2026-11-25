@@ -1273,3 +1273,34 @@ Logs, image IDs, exit statuses, and the host mount helper are under
 
 All RFC requests used private fixtures. Official rsync compatibility,
 official corpus timing, and new-policy publication are later gates.
+
+## Phase 8 Compose restore regression
+
+The AMD64 restore job failed when Phase 8 called the Phase 7 deployment
+constructor without the HTTPS spool. The shared deployment fixture now
+provisions separate disk-backed spool and rsync audit mounts and releases
+them after Compose teardown.
+[Failed CI job](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/45551939950/job/138998232001)
+
+On 2026-11-25, the frozen Phase 0 Rust gate passed, including the MCP wire
+probe. An injected probe exception confirmed that the shared fixture
+closes the stack before releasing the two mounts.
+
+Phase 0 Compose passed on both engines. The full Phase 7 probe passed on
+rootful Docker, including service recreation and worker confinement. The
+config-only probe passed on rootless Docker and verified the spool and
+audit mount preflight.
+
+The Phase 8 CI runner passed on native AMD64 with rootful Docker Engine
+29.10.1 and rootless Docker Engine 29.10.0, both with Compose 5.8.0. Both
+reports restored generation 2 at publication sequence 2, with generation
+1 retained and generation 3 ready. Each verified 16 canonical blobs, 794
+persisted ranges and line starts, and three manifests. Each rejected a
+missing blob and a same-length corrupted blob before opening the restored
+proxy and replaying all five MCP reads over HTTPS.
+
+The rootless capacity probe passed for 1,000 and 10,000 synthetic RFCs.
+Both profiles completed at concurrency 1, 4, 16, and 32, exercised
+admission limits, and returned to zero active readers, requests, and
+ripgrep workers. The disposable Compose resources, mounts, and loop
+devices were released after the probes.

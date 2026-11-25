@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 
-from integration import arguments, deployment, dump, phase3, phase5, phase7, project, SERVE
+from integration import arguments, dump, phase3, phase5, phase7, project, SERVE
 from load_client import exchange, MIX
 
 HERE = Path(__file__).resolve().parent
@@ -180,7 +180,7 @@ def run_profile(root, args, publication_driver, search_driver, size):
                 plans[label] = result["result"]
         dump(seed.command(), seed.env, work / "fixture.dump")
         seed.run("stop", "fixtures", "postgres", timeout=50)
-        with deployment(work, seed, args) as stack:
+        with phase7.deployment(work, seed, args.image_prefix) as stack:
             stack.start()
             stack.sql("-c", "ANALYZE")
             baseline = sample(stack)

@@ -2,7 +2,7 @@
 """Exercise rootless production Compose with synthetic originals and local TLS."""
 
 import argparse
-from contextlib import ExitStack
+from contextlib import contextmanager, ExitStack
 import importlib.util
 from ipaddress import ip_address, ip_network
 import json
@@ -460,6 +460,17 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
                 self.key_ownership("chown 0:0 /keys/*")
 
 
+@contextmanager
+def deployment(work, seed, prefix):
+    with (phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool,
+          phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label="audit") as audit):
+        stack = Deployment(work, seed, prefix, spool, audit)
+        try:
+            yield stack
+        finally:
+            stack.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", default="rootless")
@@ -475,14 +486,9 @@ def main():
         if args.config_only:
             seed = phase1.Project(work / "config-fixture", work / "unused", args.image_prefix, docker, work.name)
             seed.key = secrets.token_bytes(48)
-            with (phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool,
-                  phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label="audit") as audit):
-                deployment = Deployment(work, seed, args.image_prefix, spool, audit)
-                try:
-                    deployment.check_config()
-                    deployment.check_config_mount()
-                finally:
-                    deployment.close()
+            with deployment(work, seed, args.image_prefix) as stack:
+                stack.check_config()
+                stack.check_config_mount()
             return
         phase5.phase3.fixture_driver(docker, args.image_prefix, work / "publication-driver")
         seed = phase5.Project(work / work.name, work / "publication-driver", args.image_prefix, docker)
@@ -505,22 +511,17 @@ def main():
                                             "-U", "postgres", "-d", "rfc"), env=seed.env,
                                stdout=wire, check=True, timeout=45)
             seed.run("stop", "fixtures", "postgres", timeout=50)
-            with (phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool,
-                  phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label="audit") as audit):
-                deployment = Deployment(work, seed, args.image_prefix, spool, audit)
-                try:
-                    deployment.check_config()
-                    deployment.start()
-                    deployment.verify()
-                    deployment.run("up", "-d", "--force-recreate", "--wait", "--wait-timeout", "55",
-                                   timeout=90)
-                    port = int(deployment.capture("port", "test-proxy", "8443").rsplit(":", 1)[1])
-                    deployment.client.port = port
-                    deployment.verify()
-                    deployment.worker_lifecycle()
-                    deployment.fail_closed()
-                finally:
-                    deployment.close()
+            with deployment(work, seed, args.image_prefix) as stack:
+                stack.check_config()
+                stack.start()
+                stack.verify()
+                stack.run("up", "-d", "--force-recreate", "--wait", "--wait-timeout", "55",
+                          timeout=90)
+                port = int(stack.capture("port", "test-proxy", "8443").rsplit(":", 1)[1])
+                stack.client.port = port
+                stack.verify()
+                stack.worker_lifecycle()
+                stack.fail_closed()
         finally:
             seed.close()
 

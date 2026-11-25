@@ -61,15 +61,6 @@ def project(work, args, driver, fixture_type=phase5.Project):
         seed.close()
 
 
-@contextmanager
-def deployment(work, seed, args):
-    stack = phase7.Deployment(work, seed, args.image_prefix)
-    try:
-        yield stack
-    finally:
-        stack.close()
-
-
 def dump(command, env, path):
     with path.open("wb") as output:
         subprocess.run([*command, "exec", "-T", "postgres", "pg_dump", "-Fc", "--schema=rfc",
@@ -183,7 +174,7 @@ def prepare_backup(root, args, driver, backup):
         ready = seed.reconcile()["generation_id"]
         dump(seed.command(), seed.env, work / "fixture.dump")
         seed.run("stop", "fixtures", "postgres", timeout=50)
-        with deployment(work, seed, args) as stack:
+        with phase7.deployment(work, seed, args.image_prefix) as stack:
             stack.provision()
             stack.restore(work / "fixture.dump")
             baseline_verify = json.loads(driver_call(stack, driver, SERVE, "verify-restore"))
@@ -211,7 +202,7 @@ def restore(root, args, driver, backup, baseline, baseline_verify):
     inventory = json.loads((backup / "inventory.json").read_text())
     work = root / f"{root.name}-destination"
     with project(work, args, driver) as seed:
-        with deployment(work, seed, args) as stack:
+        with phase7.deployment(work, seed, args.image_prefix) as stack:
             stack.provision()
             stack.restore(backup / "corpus.dump")
             # Check preflight failures before any public or sync container starts.
