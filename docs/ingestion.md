@@ -93,6 +93,13 @@ appear on the mirror defers the run. Loss of incumbent required TXT,
 invalid inventory, local canonical corruption, and unequal opening and
 ending catalog bytes fail the run.
 
+Inventory discovery selects only canonical numeric RFC TXT regular files.
+It ignores known ancillary entries, including the exact listed
+`rfc-ref.txt -> rfc-ref.txt.new` symbolic link. The list-only command
+reads metadata, and later rsync operations request canonical filenames.
+A rejected listing adds `inventory_rejection` to the acquisition report
+with the reason, one-based line number, and a bounded, escaped entry preview.
+
 On a cold run, the two queues request required TXT and RFCXML from HTTPS.
 An existing TXT observation can be reused if it proves capture from the
 official HTTPS URL, the canonical file rehashes correctly, and the mirror

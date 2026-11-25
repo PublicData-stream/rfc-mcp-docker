@@ -7,7 +7,8 @@ use crate::{
 };
 use rfc_core::RfcNumber;
 use rfc_storage::postgres::Result;
-use std::{collections::BTreeMap, process::Stdio, time::Duration};
+use serde::Serialize;
+use std::{collections::BTreeMap, fmt, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -18,12 +19,87 @@ const STDOUT_LIMIT: u64 = 8 * 1024 * 1024;
 const STDERR_LIMIT: u64 = 64 * 1024;
 pub(crate) const OUTPUT_RESERVATION: u64 = STDOUT_LIMIT + STDERR_LIMIT;
 const LINE_LIMIT: usize = 256;
+const PREVIEW_LIMIT: usize = 96;
+const ANCILLARY_LINK: &str = "rfc-ref.txt";
+const ANCILLARY_TARGET: &str = "rfc-ref.txt.new";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
     pub length: u64,
     pub modified_utc: String,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Rejection {
+    TruncatedListing,
+    EntryLimit,
+    LineLimit,
+    InvalidCharacters,
+    MalformedRow,
+    InvalidSize,
+    InvalidMetadata,
+    InvalidRoot,
+    InvalidPath,
+    UnexpectedLink,
+    UnexpectedFileKind,
+    UnexpectedFilename,
+    RfcSizeLimit,
+    DuplicateRfc,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ParseError {
+    reason: Rejection,
+    line: usize,
+    entry_preview: String,
+}
+
+impl ParseError {
+    fn new(reason: Rejection, line: usize, entry: &[u8]) -> Self {
+        let mut entry_preview = String::new();
+        for &byte in entry {
+            let escaped = std::ascii::escape_default(byte);
+            if entry_preview.len() + escaped.len() > PREVIEW_LIMIT {
+                break;
+            }
+            entry_preview.extend(escaped.map(char::from));
+        }
+        Self {
+            reason,
+            line,
+            entry_preview,
+        }
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self.reason {
+            Rejection::TruncatedListing => "truncated rsync inventory listing",
+            Rejection::EntryLimit => "rsync inventory exceeds entry limit",
+            Rejection::LineLimit => "rsync inventory exceeds line limit",
+            Rejection::InvalidCharacters => "rsync inventory contains invalid characters",
+            Rejection::MalformedRow => "malformed rsync inventory row",
+            Rejection::InvalidSize => "invalid rsync inventory size",
+            Rejection::InvalidMetadata => "invalid rsync inventory metadata",
+            Rejection::InvalidRoot => "invalid rsync inventory root",
+            Rejection::InvalidPath => "rsync inventory path is not a canonical root basename",
+            Rejection::UnexpectedLink => "unexpected rsync inventory symbolic link",
+            Rejection::UnexpectedFileKind => "rsync inventory entry is not a regular file",
+            Rejection::UnexpectedFilename => "unexpected or noncanonical rsync inventory filename",
+            Rejection::RfcSizeLimit => "rsync inventory RFC TXT size exceeds bounds",
+            Rejection::DuplicateRfc => "duplicate RFC in rsync inventory",
+        };
+        write!(
+            f,
+            "{message} at line {}: \"{}\"",
+            self.line, self.entry_preview
+        )
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 pub(crate) async fn list(
     module: &str,
@@ -95,7 +171,7 @@ pub(crate) async fn list(
                 return Err(format!("rsync inventory failed ({status})").into());
             }
             group.0 = None;
-            parse(&stdout)
+            Ok(parse(&stdout)?)
         }
         Err(error) => {
             group.kill();
@@ -115,61 +191,78 @@ pub(crate) async fn read_bounded(input: impl AsyncRead + Unpin, limit: u64) -> R
     Ok(bytes)
 }
 
-fn parse(bytes: &[u8]) -> Result<BTreeMap<RfcNumber, Entry>> {
-    let input = std::str::from_utf8(bytes)?;
-    if !bytes.ends_with(b"\n") {
-        return Err("rsync inventory has a truncated listing".into());
+fn parse(bytes: &[u8]) -> std::result::Result<BTreeMap<RfcNumber, Entry>, ParseError> {
+    if bytes.is_empty() {
+        return Err(ParseError::new(Rejection::InvalidRoot, 1, bytes));
     }
-    let mut root = false;
     let mut entries = BTreeMap::new();
-    for (index, line) in input.split_terminator('\n').enumerate() {
-        if index > MAX_CATALOG_ENTRIES
-            || line.len() > LINE_LIMIT
-            || !line
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    for (index, line) in bytes.split_inclusive(|&byte| byte == b'\n').enumerate() {
+        let row = line
+            .strip_suffix(b"\n")
+            .ok_or_else(|| ParseError::new(Rejection::TruncatedListing, index + 1, line))?;
+        let row_error = |reason| ParseError::new(reason, index + 1, row);
+        if index > MAX_CATALOG_ENTRIES {
+            return Err(row_error(Rejection::EntryLimit));
+        }
+        if row.len() > LINE_LIMIT {
+            return Err(row_error(Rejection::LineLimit));
+        }
+        if !row
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
         {
-            return Err("rsync inventory exceeds entry bounds or has invalid characters".into());
+            return Err(row_error(Rejection::InvalidCharacters));
         }
+        let line = std::str::from_utf8(row).map_err(|_| row_error(Rejection::InvalidCharacters))?;
         let mut fields = line.split_ascii_whitespace();
-        let [
-            Some(mode),
-            Some(length),
-            Some(date),
-            Some(time),
-            Some(name),
-            None,
-        ] = std::array::from_fn(|_| fields.next())
+        let [Some(mode), Some(length), Some(date), Some(time), Some(name)] =
+            std::array::from_fn(|_| fields.next())
         else {
-            return Err("malformed rsync inventory row".into());
+            return Err(row_error(Rejection::MalformedRow));
         };
+        let entry_error = |reason| ParseError::new(reason, index + 1, name.as_bytes());
         if !length.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("invalid rsync inventory size".into());
+            return Err(entry_error(Rejection::InvalidSize));
         }
-        let length: u64 = length.parse().map_err(|_| "invalid rsync inventory size")?;
+        let length: u64 = length
+            .parse()
+            .map_err(|_| entry_error(Rejection::InvalidSize))?;
         if !valid_mode(mode) || !valid_timestamp(date, time) {
-            return Err("invalid rsync inventory metadata".into());
+            return Err(entry_error(Rejection::InvalidMetadata));
         }
-        if name == "." {
-            if index != 0 || !mode.starts_with('d') {
-                return Err("invalid rsync inventory root".into());
+        if index == 0 || name == "." {
+            if index != 0 || name != "." || !mode.starts_with('d') || fields.next().is_some() {
+                return Err(entry_error(Rejection::InvalidRoot));
             }
-            root = true;
             continue;
         }
-        if !root
-            || name.starts_with('.')
+        if name.starts_with('.')
             || !name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
         {
-            return Err("rsync inventory path is not a canonical root basename".into());
+            return Err(entry_error(Rejection::InvalidPath));
+        }
+        if mode.starts_with('l') {
+            if name != ANCILLARY_LINK
+                || fields.next() != Some("->")
+                || fields.next() != Some(ANCILLARY_TARGET)
+                || fields.next().is_some()
+                || length != ANCILLARY_TARGET.len() as u64
+            {
+                return Err(row_error(Rejection::UnexpectedLink));
+            }
+            // The listing reports link metadata only. No link reaches the corpus map.
+            continue;
+        }
+        if fields.next().is_some() {
+            return Err(row_error(Rejection::MalformedRow));
         }
         if matches!(name, "bcp" | "fyi" | "std" | "ien") && mode.starts_with('d') {
             continue;
         }
         if !mode.starts_with('-') {
-            return Err("rsync inventory entry is not a regular file".into());
+            return Err(entry_error(Rejection::UnexpectedFileKind));
         }
         if is_ancillary(name) {
             continue;
@@ -179,9 +272,9 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<RfcNumber, Entry>> {
             .and_then(|stem| stem.strip_suffix(".txt"))
             .and_then(xml::number)
             .filter(|&id| filename(id) == name)
-            .ok_or("unexpected or noncanonical rsync inventory filename")?;
+            .ok_or_else(|| entry_error(Rejection::UnexpectedFilename))?;
         if !(1..=TXT_LIMIT as u64).contains(&length) {
-            return Err("rsync inventory RFC TXT size exceeds bounds".into());
+            return Err(entry_error(Rejection::RfcSizeLimit));
         }
         if entries
             .insert(
@@ -193,11 +286,8 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<RfcNumber, Entry>> {
             )
             .is_some()
         {
-            return Err("duplicate RFC in rsync inventory".into());
+            return Err(entry_error(Rejection::DuplicateRfc));
         }
-    }
-    if !root {
-        return Err("rsync inventory root is missing".into());
     }
     Ok(entries)
 }
@@ -205,7 +295,21 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<RfcNumber, Entry>> {
 fn is_ancillary(name: &str) -> bool {
     matches!(
         name,
-        "rfc-index.txt" | "rfc-ref.txt" | "README" | "README.txt"
+        "RFCs_for_errata.txt"
+            | "bcp-index.txt"
+            | "bcp-ref.txt"
+            | "fyi-index.txt"
+            | "ien-index.txt"
+            | "rfc-index-latest.txt"
+            | "rfc-index.txt"
+            | "rfc-ref-old.txt"
+            | ANCILLARY_LINK
+            | "rfc17a.txt"
+            | "rfcxx00.txt"
+            | "std-index.txt"
+            | "std-ref.txt"
+            | "README"
+            | "README.txt"
     ) || ["bcp", "fyi", "std", "ien"].iter().any(|prefix| {
         name.strip_prefix(prefix)
             .and_then(|stem| stem.strip_suffix(".txt"))
@@ -231,7 +335,7 @@ fn valid_mode(mode: &str) -> bool {
     else {
         return false;
     };
-    b"-d".contains(&kind)
+    b"-dl".contains(&kind)
         && [owner_r, group_r, other_r]
             .iter()
             .all(|byte| b"r-".contains(byte))
@@ -243,25 +347,49 @@ fn valid_mode(mode: &str) -> bool {
 }
 
 fn valid_timestamp(date: &str, time: &str) -> bool {
-    fn component(text: &[u8], min: u16, max: u16) -> bool {
-        text.iter().all(u8::is_ascii_digit)
-            && std::str::from_utf8(text)
-                .ok()
-                .and_then(|text| text.parse::<u16>().ok())
-                .is_some_and(|value| (min..=max).contains(&value))
+    fn component(text: &[u8]) -> Option<u16> {
+        if !text.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(text).ok()?.parse().ok()
     }
-    date.len() == 10
-        && time.len() == 8
-        && date.as_bytes()[4] == b'/'
-        && date.as_bytes()[7] == b'/'
-        && time.as_bytes()[2] == b':'
-        && time.as_bytes()[5] == b':'
-        && component(&date.as_bytes()[..4], 1, 9999)
-        && component(&date.as_bytes()[5..7], 1, 12)
-        && component(&date.as_bytes()[8..], 1, 31)
-        && component(&time.as_bytes()[..2], 0, 23)
-        && component(&time.as_bytes()[3..5], 0, 59)
-        && component(&time.as_bytes()[6..], 0, 60)
+    let date = date.as_bytes();
+    let time = time.as_bytes();
+    if date.len() != 10
+        || time.len() != 8
+        || date[4] != b'/'
+        || date[7] != b'/'
+        || time[2] != b':'
+        || time[5] != b':'
+    {
+        return false;
+    }
+    let [
+        Some(year),
+        Some(month),
+        Some(day),
+        Some(hour),
+        Some(minute),
+        Some(second),
+    ] = [
+        component(&date[..4]),
+        component(&date[5..7]),
+        component(&date[8..]),
+        component(&time[..2]),
+        component(&time[3..5]),
+        component(&time[6..]),
+    ]
+    else {
+        return false;
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => 28 + u16::from(leap),
+        _ => return false,
+    };
+    year > 0 && (1..=days).contains(&day) && hour <= 23 && minute <= 59 && second <= 60
 }
 
 #[cfg(test)]
@@ -270,6 +398,7 @@ mod tests {
 
     const ROOT: &str = "drwxr-xr-x             80 2026/11/24 16:21:43 .\n";
     const REGULAR: &str = "-rw-r--r--              5 2026/11/24 16:21:43 ";
+    const LINK: &str = "lrwxrwxrwx             15 2026/11/24 16:21:43 ";
 
     #[test]
     fn packaged_listing_selects_only_canonical_rfc_files() {
@@ -279,6 +408,69 @@ mod tests {
             [1, 100]
         );
         assert_eq!(inventory[&RfcNumber::new(100).unwrap()].length, 5);
+    }
+
+    #[test]
+    fn complete_rfc_editor_inventory_preserves_canonical_metadata() {
+        let bytes = include_bytes!("../../../fixtures/rfc/rsync-inventory-2026-11-25.txt");
+        let inventory = parse(bytes).unwrap();
+        assert_eq!(inventory.len(), 9862);
+        let rows = std::str::from_utf8(bytes).unwrap().lines();
+        assert_eq!(rows.clone().count(), 9880);
+        for row in rows {
+            let mut fields = row.split_ascii_whitespace();
+            let (mode, length, date, time, name) = (
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+            );
+            if mode.starts_with('-')
+                && let Some(number) = name
+                    .strip_prefix("rfc")
+                    .and_then(|name| name.strip_suffix(".txt"))
+                && let Ok(number) = number.parse()
+            {
+                let id = RfcNumber::new(number).unwrap();
+                assert_eq!(
+                    inventory[&id],
+                    Entry {
+                        length: length.parse().unwrap(),
+                        modified_utc: format!("{date} {time}"),
+                    },
+                    "{name}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_only_the_known_ancillary_link() {
+        let inventory = parse(
+            format!("{ROOT}{LINK}rfc-ref.txt -> rfc-ref.txt.new\n{REGULAR}rfc1.txt\n").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(inventory.keys().map(|id| id.get()).collect::<Vec<_>>(), [1]);
+
+        for name in [
+            "rfc1.txt -> rfc-ref.txt.new",
+            "bcp-index.txt -> rfc-ref.txt.new",
+            "rfc-ref.txt -> rfc1.txt",
+            "rfc-ref.txt -> ../rfc-ref.txt.new",
+            "rfc-ref.txt -> /rfc-ref.txt.new",
+            "rfc-ref.txt -> rfc-ref.txt.new extra",
+            "rfc-ref.txt",
+        ] {
+            let error = parse(format!("{ROOT}{LINK}{name}\n").as_bytes()).unwrap_err();
+            assert_eq!(error.reason, Rejection::UnexpectedLink, "{name}");
+            assert_eq!(error.line, 2);
+            assert!(error.entry_preview.ends_with(name), "{error}");
+        }
+        let wrong_size = LINK.replace("15", "14");
+        let error = parse(format!("{ROOT}{wrong_size}rfc-ref.txt -> rfc-ref.txt.new\n").as_bytes())
+            .unwrap_err();
+        assert_eq!(error.reason, Rejection::UnexpectedLink);
     }
 
     #[test]
@@ -308,10 +500,41 @@ mod tests {
             format!("{ROOT}-rw-r--r-- 18446744073709551616 2026/11/24 16:21:43 rfc1.txt\n"),
             format!("{ROOT}-rw-r--r-- 4194305 2026/11/24 16:21:43 rfc1.txt\n"),
             format!("{ROOT}-rw-r--r-- 5 2026/11/24 25:21:43 rfc1.txt\n"),
+            format!("{ROOT}-rw-r--r-- 5 2026/02/29 16:21:43 rfc1.txt\n"),
             format!("{ROOT}{REGULAR}{}.txt\n", "a".repeat(LINE_LIMIT)),
+            format!("{ROOT}-rw-r--r-- 0 2026/11/24 16:21:43 rfc1.txt\n"),
+            format!("{ROOT}prw-r--r-- 0 2026/11/24 16:21:43 bcp-index.txt\n"),
+            format!("{ROOT}crw-r--r-- 0 2026/11/24 16:21:43 rfc1.txt\n"),
+            format!("{ROOT}-zw-r--r-- 5 2026/11/24 16:21:43 rfc1.txt\n"),
+            format!("{ROOT}{REGULAR}rfc18a.txt\n"),
+            format!("{ROOT}{REGULAR}rfc-ref.txt.new\n"),
         ] {
             assert!(parse(bad.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn escapes_and_bounds_rejection_diagnostics() {
+        let row = [b"invalid\"\\\r\x1b\xff ".as_slice(), &[b'x'; 110]].concat();
+        let bytes = [ROOT.as_bytes(), &row, b"\n"].concat();
+        let error = parse(&bytes).unwrap_err();
+        let report = serde_json::to_value(&error).unwrap();
+        assert_eq!(report["reason"], "invalid_characters");
+        assert_eq!(report["line"], 2);
+        assert!(error.entry_preview.starts_with(r#"invalid\"\\\r\x1b\xff "#));
+        assert_eq!(error.entry_preview.len(), PREVIEW_LIMIT);
+        assert!(!error.to_string().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn ancillary_rows_count_towards_inventory_entry_limit() {
+        let listing = format!(
+            "{ROOT}{}",
+            format!("{REGULAR}README\n").repeat(MAX_CATALOG_ENTRIES + 1)
+        );
+        let error = parse(listing.as_bytes()).unwrap_err();
+        assert_eq!(error.reason, Rejection::EntryLimit);
+        assert_eq!(error.line, MAX_CATALOG_ENTRIES + 2);
     }
 
     #[tokio::test]

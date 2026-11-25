@@ -98,6 +98,8 @@ struct Report {
     audit: audit::Report,
     metrics: Record,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory_rejection: Option<inventory::ParseError>,
 }
 
 #[derive(Serialize)]
@@ -286,6 +288,7 @@ async fn execute_with_registry(
         Ok(Outcome::Deferred) => "acquisition_deferred",
         Err(error) => {
             report.error = Some(error.to_string().chars().take(512).collect());
+            report.inventory_rejection = error.downcast_ref::<inventory::ParseError>().cloned();
             "acquisition_failed"
         }
     };
