@@ -25,7 +25,7 @@ parser_workers = 2
 raw_payload_budget_bytes = 50331648
 parse_budget_bytes = 402653184
 
-# Reserved for the later audit and commit phases.
+# One rsync checksum session at a time. Batches also have a 256 MiB byte cap.
 [ingestion.revalidation]
 max_rsync_sessions = 1
 batch_size = 512

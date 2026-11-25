@@ -917,9 +917,9 @@ def prepare_benchmark(project, size):
 
 
 @contextmanager
-def capped_stage(project, *, mebibytes=64, inodes=512):
-    image = project.directory / "rsync.ext4"
-    mountpoint = project.directory / "rsync-mount"
+def capped_stage(project, *, mebibytes=64, inodes=512, label="rsync"):
+    image = project.directory / f"{label}.ext4"
+    mountpoint = project.directory / f"{label}-mount"
     mountpoint.mkdir()
     with image.open("wb") as disk:
         disk.truncate(mebibytes * 1024**2)

@@ -117,9 +117,13 @@ impl Engine {
 
     fn daily(&self) -> Duration {
         match self {
-            Self::Discovery { config, .. } => {
-                Duration::from_secs(config.ingestion.discovery.full_reconcile_interval_seconds)
-            }
+            Self::Discovery { config, .. } => Duration::from_secs(
+                config
+                    .ingestion
+                    .discovery
+                    .full_reconcile_interval_seconds
+                    .min(config.ingestion.revalidation.interval_seconds),
+            ),
             #[cfg(feature = "phase6-fixtures")]
             Self::Legacy(_) => Duration::from_secs(3600),
         }

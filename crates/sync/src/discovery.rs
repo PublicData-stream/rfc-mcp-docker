@@ -3,6 +3,7 @@
 use crate::{
     Writer,
     acquisition::{Accepted, Counts, Original, Selection, Spool},
+    audit,
     checkpoint::Context,
     config::SyncConfig,
     egress::Lease,
@@ -83,6 +84,7 @@ struct Report {
     hints_awaiting_mirror: usize,
     hints_present: usize,
     acquisition: Counts,
+    audit: audit::Report,
     metrics: Record,
     error: Option<String>,
 }
@@ -196,6 +198,7 @@ pub(crate) async fn execute(
             .await?;
         Spool::sweep().await?;
         crate::egress::preflight(config.ingestion.max_accepted_bytes)?;
+        audit::preflight()?;
         discover(
             &mut writer,
             config,
@@ -387,6 +390,15 @@ async fn discover(
         )?,
     };
     let selection_id = checkpoint.key.to_string();
+    let audit_key = identity(
+        "rfc-rsync-audit-cycle-v1",
+        &(&selection_id, &report.inventory_digest),
+    )?;
+    let audit = audit::Audit::open(
+        scope_name,
+        &audit_key.to_string(),
+        &config.ingestion.revalidation,
+    )?;
     report.selection_id = Some(selection_id.clone());
 
     let mut reuse_xml = if let Some(active) = active {
@@ -440,26 +452,27 @@ async fn discover(
             xml: reuse_xml,
             accepted: accepted.clone(),
         };
-        {
+        let audited = {
             let work = spool.acquire(
                 selection,
                 writer,
                 config,
                 upstream,
                 &work_stop,
-                &mut report.acquisition,
+                (&mut report.acquisition, &mut report.audit, audit),
             );
             tokio::pin!(work);
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => {
                     work_stop.stop();
-                    work.await?;
+                    let result = work.await;
                     shutdown.check()?;
+                    result?
                 }
                 result = &mut work => result?,
             }
-        }
+        };
         rfc_storage::fixture_boundary("before_https_catalog_validation");
         let fence_deadline = Instant::now()
             + Duration::from_secs(config.ingestion.https.request_timeout_seconds * 3 + 120);
@@ -469,11 +482,13 @@ async fn discover(
         let end_digest = BlobDigest::hash(&after.bytes);
         report.catalog_after = Some(observation(&after, end_digest));
         if catalog_digest != end_digest || before.bytes != after.bytes {
+            audited.invalidate()?;
             checkpoint.remove(&writer.client, None).await?;
             return Err("catalog changed during acquisition".into());
         }
         spool.stage_catalog("catalog-after", &after).await?;
         rfc_storage::fixture_boundary("after_https_catalog_validation");
+        audited.commit()?;
         Ok(Outcome::Complete)
     }
     .await;

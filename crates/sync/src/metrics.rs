@@ -174,7 +174,6 @@ impl Metrics {
         StageLease(self.clone())
     }
 
-    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn staged(
         &self,
         bytes: u64,

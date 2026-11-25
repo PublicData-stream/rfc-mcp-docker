@@ -92,6 +92,14 @@ and publication fence. The existing active generation and retained rollback
 remain available. TXT audit, repair and promotion are later phases.
 [Shadow runbook](../deployment.md#https-first-phase-3-shadow-runbook)
 
+## Phase 4 rollout
+
+Audit and repair run in shadow mode on schema 10. A separate Sync-only
+volume holds bounded working files, durable receipts, and quarantined
+source pairs. Receipt validation and successful repair feed the existing
+coordinator and its ending catalog fence. The database publication proof
+contract follows in Phase 5.
+
 ## Cold-start timing
 
 Keep the [cold-start timing contract](0009-cold-rfc-bootstrap.md#timing-contract)

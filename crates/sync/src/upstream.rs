@@ -369,6 +369,47 @@ impl Upstream {
             .await
     }
 
+    pub(crate) async fn wait_repair_egress(&self, shutdown: &Shutdown) -> Result<()> {
+        loop {
+            let next = self
+                .next_request
+                .lock()
+                .await
+                .ok_or("HTTPS cooldown exceeds clock range")?;
+            if next.saturating_duration_since(time::Instant::now())
+                <= MAX_RETRY_AFTER.max(self.start_interval())
+            {
+                return Ok(());
+            }
+            cancellable(Some(shutdown), time::sleep_until(next)).await?;
+        }
+    }
+
+    pub(crate) async fn repair_txt(
+        &self,
+        id: RfcNumber,
+        path: &Path,
+        shutdown: &Shutdown,
+        accepted: &Accepted,
+    ) -> Result<Capture> {
+        match self
+            .fetch_once(
+                Source::Txt(id),
+                true,
+                Some((path, accepted)),
+                Some(shutdown),
+                None,
+            )
+            .await
+        {
+            Ok(Download::Captured(capture)) => Ok(capture),
+            Ok(Download::Missing(_)) => Err("required repair TXT is unavailable".into()),
+            Err(FetchFailure::Retryable { error, .. } | FetchFailure::Terminal(error)) => {
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) async fn feed(
         &self,
         format: FeedFormat,
@@ -501,6 +542,9 @@ impl Upstream {
             .http
             .get(format!("{}{}", self.https_origin, source.path()))
             .header(header::ACCEPT_ENCODING, "identity");
+        if retry && matches!(source, Source::Txt(_)) {
+            request = request.header(header::CACHE_CONTROL, "no-cache");
+        }
         if let Some((etag, last_modified)) = conditional {
             if let Some(value) = etag {
                 request = request.header(header::IF_NONE_MATCH, value);

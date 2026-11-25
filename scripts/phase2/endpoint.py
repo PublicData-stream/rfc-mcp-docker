@@ -36,6 +36,7 @@ class Https(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     drift_captures = 0
     xml_attempts = {}
+    audit_attempts = {}
     benchmark_lock = threading.Lock()
 
     def response(self, body, media_type):
@@ -54,6 +55,14 @@ class Https(BaseHTTPRequestHandler):
         scenario = mode()
         if scenario.startswith("acquisition-"):
             print(f"acquisition start {self.path} {time.monotonic_ns()}", flush=True)
+            if (scenario == "acquisition-audit-cooldown" and self.path == "/rfc/rfc100.txt"
+                    and self.headers.get("Cache-Control") == "no-cache"):
+                with self.benchmark_lock:
+                    attempt = self.audit_attempts.get(scenario, 0)
+                    self.audit_attempts[scenario] = attempt + 1
+                if attempt == 0:
+                    self.status(429, {"Retry-After": "3"})
+                    return
             if scenario == "acquisition-db-delay":
                 print(f"checkpoint fixture request {self.path} {time.time_ns()}", flush=True)
             if scenario in ("acquisition-hold-txt", "acquisition-hold-xml"):
@@ -278,8 +287,22 @@ class Https(BaseHTTPRequestHandler):
 
 
 class Rsync(socketserver.BaseRequestHandler):
+    audit_sessions = {}
+    audit_lock = threading.Lock()
+
     def handle(self):
         scenario = mode()
+        nth = 0
+        if scenario.startswith("acquisition-audit-"):
+            with self.audit_lock:
+                nth = self.audit_sessions.get(scenario, 0) + 1
+                self.audit_sessions[scenario] = nth
+            if nth == 2 and scenario in {
+                "acquisition-audit-overlap", "acquisition-audit-missing", "acquisition-audit-mutation",
+                "acquisition-audit-timeout", "acquisition-audit-size",
+            }:
+                print(f"fixture audit held {scenario}", flush=True)
+                wait_for_release("release-audit")
         if scenario == "hold-rsync":
             time.sleep(15)
         if scenario == "hold-rsync-timeout":
@@ -290,6 +313,8 @@ class Rsync(socketserver.BaseRequestHandler):
         if scenario in ("benchmark", "cold-bootstrap", "phase8-paced"):
             time.sleep(0.20)
         interrupted = {"rsync-interrupted": 1024, "rsync-partial": 65536}.get(scenario)
+        if scenario == "acquisition-audit-truncate" and nth > 1:
+            interrupted = 128
         with socket.create_connection(("127.0.0.1", 9873), 3) as upstream:
             upstream.settimeout(10)
             self.request.settimeout(10)

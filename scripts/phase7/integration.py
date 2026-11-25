@@ -29,13 +29,14 @@ INGESTION_PATH = "/etc/rfc-mcp/ingestion.toml"
 
 
 class Deployment:
-    def __init__(self, work, seed, prefix, spool):
+    def __init__(self, work, seed, prefix, spool, audit):
         self.work, self.docker = work, seed.docker
         self.ca = seed.directory / "certs/ca.crt"
         self.name = work.name + "-prod"
         self.network = self.name + "-ingress"
         self.prefix = prefix
         self.spool = spool
+        self.audit = audit
         self.passwords = seed.passwords
         self.pgdata = work / "production-pgdata"
         self.pgdata.mkdir()
@@ -62,6 +63,7 @@ class Deployment:
                         RFC_MCP_ORIGINS="https://rfc.test",
                         RFC_SYNC_CONFIG_HOST_FILE=str(self.ingestion),
                         RFC_SYNC_SPOOL_HOST_DIR=str(spool),
+                        RFC_SYNC_AUDIT_HOST_DIR=str(audit),
                         RFC_MIRROR_DIR=str(seed.directory / "mirror"),
                         RFC_PGDATA_DIR=str(self.pgdata),
                         RFC_DB_CA=str(seed.directory / "certs/ca.crt"),
@@ -133,6 +135,7 @@ class Deployment:
             mounts = [volume for volume in spec.get("volumes", []) if volume["target"] == INGESTION_PATH]
             path = (spec.get("environment") or {}).get("RFC_SYNC_CONFIG_FILE")
             spool = [volume for volume in spec.get("volumes", []) if volume["target"] == "/rfc-https-spool"]
+            audit = [volume for volume in spec.get("volumes", []) if volume["target"] == "/rfc-rsync-audit"]
             if service == SYNC:
                 mount, = mounts
                 assert mount["type"] == "bind" and mount["source"] == str(self.ingestion)
@@ -141,12 +144,18 @@ class Deployment:
                 staging, = spool
                 assert staging["type"] == "bind" and staging["source"] == str(self.spool)
                 assert not staging.get("read_only") and not staging["bind"]["create_host_path"]
+                audit_volume, = audit
+                assert audit_volume["type"] == "bind" and audit_volume["source"] == str(self.audit)
+                assert not audit_volume.get("read_only") and not audit_volume["bind"]["create_host_path"]
             else:
-                assert not mounts and not spool and path is None
+                assert not mounts and not spool and not audit and path is None
         assert set(project["services"][FEED]["networks"]) == {"feed_control"}
         missing_spool = dict(self.env)
         del missing_spool["RFC_SYNC_SPOOL_HOST_DIR"]
         phase1.failed(self.command("config", "--quiet"), missing_spool, "Provision a private disk-backed")
+        missing_audit = dict(self.env)
+        del missing_audit["RFC_SYNC_AUDIT_HOST_DIR"]
+        phase1.failed(self.command("config", "--quiet"), missing_audit, "Provision a private disk-backed rsync audit")
         missing = dict(self.env)
         del missing["RFC_SYNC_CONFIG_HOST_FILE"]
         phase1.failed(self.command("config", "--quiet"), missing, "Set RFC_SYNC_CONFIG_HOST_FILE")
@@ -163,7 +172,8 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         assert report["resources"]["cgroup_memory_limit_bytes"] == 2 * 1024**3
         assert report["resources"]["scratch_available_bytes"] == 512 * 1024**2
         assert report["resources"]["spool_available_inodes"] >= 40016
-        print("The Phase 2 overlay isolates the spool, v2 config mount, and Feed egress", flush=True)
+        assert report["resources"]["audit"]["available_bytes"] >= 256 * 1024**2
+        print("The shadow overlay isolates the spool, audit volume, v2 config, and Feed egress", flush=True)
 
     def provision(self):
         self.check_config_mount()
@@ -202,11 +212,12 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         self.open()
 
     def check_config(self):
-        def probe(*options, memory="2g", scratch="512m", expected=None, args=("--check-config",)):
+        def probe(*options, memory="2g", scratch="512m", audit=True, expected=None, args=("--check-config",)):
             command = [*self.docker, "run", *phase0.local_image_args(), "--rm", "--network", "none",
                        "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                        "--memory", memory, "--tmpfs", f"/tmp:size={scratch},mode=1777,noexec,nosuid,nodev",
                        "-v", f"{self.spool}:/rfc-https-spool",
+                       *(("-v", f"{self.audit}:/rfc-rsync-audit") if audit else ()),
                        *options, f"{self.prefix}-sync", *args]
             if expected is not None:
                 phase1.failed(command, self.env, expected)
@@ -218,11 +229,12 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         defaults = probe()
         assert defaults["source"] == "defaults"
         assert defaults["ingestion"] == probe(*file_options)["ingestion"]
-        assert defaults["schema_version"] == 2 and defaults["phase"] == "acquisition"
+        assert defaults["schema_version"] == 2 and defaults["phase"] == "audit"
         assert defaults["publication_gate"] == "https_txt_audit_pending"
-        assert set(defaults["pending_consumers"]) == {
-            "ingestion.revalidation",
-        }
+        assert defaults["pending_consumers"] == []
+        probe(audit=False, expected="private rsync audit directory")
+        probe("--tmpfs", "/rfc-rsync-audit:size=1g,uid=10002,gid=10002,mode=0700",
+              audit=False, expected="separate, disk-backed")
         for name in ("RFC_SYNC_HTTP_CONCURRENCY", "RFC_SYNC_PARSE_CONCURRENCY"):
             probe("-e", f"{name}=1", expected=f"{name} was removed")
             probe(*file_options, "-e", f"{name}=1", expected=f"{name} was removed")
@@ -247,8 +259,8 @@ parse_budget_bytes = 134217728
         small.chmod(0o400)
         probe(*small_options, expected="cannot open ingestion config")
         small.chmod(0o444)
-        resources = probe(*small_options, memory="768m", scratch="16m")["resources"]
-        assert resources["cgroup_memory_limit_bytes"] == resources["memory_available_bytes"] == 768 * 1024**2
+        resources = probe(*small_options, memory="800m", scratch="16m")["resources"]
+        assert resources["cgroup_memory_limit_bytes"] == resources["memory_available_bytes"] == 800 * 1024**2
         assert resources["scratch_available_bytes"] == 16 * 1024**2
         for body, expected in (
             (b"schema_version =", "invalid ingestion TOML"),
@@ -463,8 +475,9 @@ def main():
         if args.config_only:
             seed = phase1.Project(work / "config-fixture", work / "unused", args.image_prefix, docker, work.name)
             seed.key = secrets.token_bytes(48)
-            with phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool:
-                deployment = Deployment(work, seed, args.image_prefix, spool)
+            with (phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool,
+                  phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label="audit") as audit):
+                deployment = Deployment(work, seed, args.image_prefix, spool, audit)
                 try:
                     deployment.check_config()
                     deployment.check_config_mount()
@@ -492,8 +505,9 @@ def main():
                                             "-U", "postgres", "-d", "rfc"), env=seed.env,
                                stdout=wire, check=True, timeout=45)
             seed.run("stop", "fixtures", "postgres", timeout=50)
-            with phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool:
-                deployment = Deployment(work, seed, args.image_prefix, spool)
+            with (phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool,
+                  phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label="audit") as audit):
+                deployment = Deployment(work, seed, args.image_prefix, spool, audit)
                 try:
                     deployment.check_config()
                     deployment.start()

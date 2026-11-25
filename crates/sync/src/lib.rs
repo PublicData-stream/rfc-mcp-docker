@@ -10,6 +10,7 @@ use std::os::fd::OwnedFd;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 mod acquisition;
+mod audit;
 #[cfg(feature = "phase2-fixtures")]
 mod bulk;
 mod checkpoint;
@@ -32,6 +33,7 @@ mod policy;
 mod publication;
 mod recovery;
 mod request_order;
+mod rsync;
 mod shutdown;
 mod text;
 mod upstream;

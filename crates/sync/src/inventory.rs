@@ -105,7 +105,7 @@ pub(crate) async fn list(
     }
 }
 
-async fn read_bounded(input: impl AsyncRead + Unpin, limit: u64) -> Result<Vec<u8>> {
+pub(crate) async fn read_bounded(input: impl AsyncRead + Unpin, limit: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(usize::try_from(limit + 1)?)?;
     input.take(limit + 1).read_to_end(&mut bytes).await?;

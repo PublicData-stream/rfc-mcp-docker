@@ -2,11 +2,13 @@
 
 The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It requires a qualified Linux Docker host, an existing HTTPS reverse proxy, and a dedicated Docker ingress network shared with that proxy. Follow the [deployment prerequisites](deployment-prerequisites.md).
 
-## HTTPS-first Phase 3 shadow runbook
+<a id="https-first-phase-3-shadow-runbook"></a>
+
+## HTTPS-first Phase 4 shadow runbook
 
 Keep incumbent Serve online with its qualified schema 9 images and mirror.
-Phase 3 processing is available for private qualification and a separately
-authorized shadow run. Build or preload matching Phase 3 Serve, Sync, and
+Phase 4 audit and repair are available for private qualification and a separately
+authorized shadow run. Build or preload matching Phase 4 Serve, Sync, and
 Feed images. Use a separate Compose project, private networks and
 credentials, and a matched copy of the schema 9 database and mirror. Follow the
 [backup and restore procedure](publication.md#backup-and-restore) to make the
@@ -19,10 +21,14 @@ own keys, and keep the shadow project off production ingress.
    The spool holds run files and HTTPS cooldown state outside the canonical
    mirror and PostgreSQL. Allow at least 4 GiB plus 640 MiB free for the
    default accepted-byte budget and at least 40,016 free inodes.
-2. Set `RFC_SYNC_SPOOL_HOST_DIR` to its mountpoint and
-   `RFC_SYNC_CONFIG_HOST_FILE` to a private copy of the
+2. Provision a separate 1 GiB disk-backed audit filesystem with 4,096
+   inodes, mounted `nosuid,nodev,noexec` and owned by Sync at mode `0700`.
+   Keep it outside the spool, canonical mirror, and PostgreSQL. Preserve
+   this volume across process or pod replacement. Set
+   `RFC_SYNC_SPOOL_HOST_DIR` and `RFC_SYNC_AUDIT_HOST_DIR` to their
+   mountpoints and `RFC_SYNC_CONFIG_HOST_FILE` to a private copy of the
    [v2 TOML example](../deploy/ingestion.toml.example). Render the overlay
-   and verify that Sync alone mounts the spool and that Feed has only its
+   and verify that Sync alone mounts both volumes and that Feed has only its
    internal control network. Run the preflight with the actual runtime UID
    and resource limits.
 3. On the shadow copy, start only PostgreSQL and apply `migrations/migrate.sql`
@@ -31,8 +37,14 @@ own keys, and keep the shadow project off production ingress.
    read using matching schema 10 images. Keep the matched schema 9 backup
    and images for rollback into fresh volumes.
 4. Qualify first against private sources. Check `acquisition_complete`,
-   matching catalogs, pacing, joined-document counts, and spool cleanup.
-   Repeat the run and verify checkpoint hits with original timestamps.
+   matching catalogs, pacing, joined-document counts, and `txt_audited`
+   equal to `expected_txt`. Repeat the run and verify HTTPS checkpoint hits
+   with original timestamps and a fresh checksum audit. After an interruption,
+   rerun the same scope with the original volumes to resume eligible receipts.
+   Use the private audit `quarantine` directory to inspect disagreements.
+   Preserve its receipts and bytes for diagnosis. A full quarantine or
+   exhausted retry budget requires operator review of source convergence
+   before another audit cycle.
    Run `--phase3-recover` when the shadow collector is stopped to reclaim
    expired and abandoned data.
 5. Before any authorized official-source run, agree on sample or full scope,
@@ -42,8 +54,9 @@ own keys, and keep the shadow project off production ingress.
    run. Stop shadow Feed and Sync at the end of the agreed window, wait out
    any recorded cooldown, and resume incumbent collection. Verify the
    incumbent's readiness and queue or outbox progress. Retain the shadow
-   spool's cooldown state through the handoff. Discard the isolated
-   snapshot and credentials when the review is complete.
+   spool's cooldown state through the handoff. Keep quarantine evidence for
+   the recorded retention period or preserve it in a private incident archive
+   before discarding the isolated snapshot and credentials.
 
 ~~~sh
 export RFC_SHADOW_ENV=/path/to/private/shadow.env
@@ -61,6 +74,16 @@ for qualification. The sample command in the snippet uses the stock image
 and is for the authorized official-source window. The remaining production
 procedures apply to the qualified schema 9 release with its matching
 checkout, images, and v1 configuration.
+
+For the shadow publication rollback, stop the shadow Feed and Sync, then
+use a retained generation with its original evidence and the current
+active sequence:
+
+~~~sh
+shadow stop rfc-mcp-docker-feed rfc-mcp-docker-sync
+shadow run --rm --no-deps rfc-mcp-docker-sync \
+  --phase3-rollback "$retained_generation" --expect-sequence "$active_sequence"
+~~~
 
 ## Provision
 

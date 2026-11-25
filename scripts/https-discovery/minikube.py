@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check ConfigMap isolation and HTTPS checkpoint reuse on a disposable Minikube node."""
+"""Check audit volume isolation and repair replay on a disposable Minikube node."""
 
 import argparse
 import json
@@ -23,7 +23,7 @@ POSTGRES = re.search(
 
 
 class Probe:
-    def __init__(self, profile, context, prefix, work):
+    def __init__(self, profile, context, prefix, work, audit_root):
         self.minikube = ["minikube", "-p", profile]
         self.docker = ["docker", "--context", context]
         self.node = profile
@@ -31,6 +31,7 @@ class Probe:
         self.work = work
         self.namespace = f"rfc-processing-{uuid4().hex[:8]}"
         self.node_work = f"/tmp/{self.namespace}"
+        self.node_audit = f"{audit_root.rstrip('/')}/{self.namespace}"
         self.pg_image = f"{self.namespace}-postgres"
         self.kube = [*self.minikube, "kubectl", "--", "-n", self.namespace]
 
@@ -153,6 +154,8 @@ class Probe:
                              "metadata": {"name": self.namespace}})
         self.execute([*self.docker, "exec", "--user", "0", self.node,
                       "mkdir", "-m", "0755", self.node_work])
+        self.execute([*self.docker, "exec", "--user", "10002:10002", self.node,
+                      "mkdir", "-m", "0700", self.node_audit])
         # Docker archives need a named tag for containerd to resolve the local PostgreSQL image.
         self.execute([*self.docker, "tag", POSTGRES, self.pg_image])
         try:
@@ -167,20 +170,24 @@ class Probe:
         })
         config = ("config", "/etc/rfc-mcp", {"configMap": {"name": "ingestion"}}, True)
         spool = self.host("spool", "/rfc-https-spool", "spool", False)
+        audit = ("audit", "/rfc-rsync-audit",
+                 {"hostPath": {"path": self.node_audit, "type": "Directory"}}, False)
         cfg = {"RFC_SYNC_CONFIG_FILE": "/etc/rfc-mcp/ingestion.toml"}
         self.pod("stock-sync", f"{self.prefix}-sync", 10002, [
             "/bin/sh", "-ec", """
                 test "$(id -u)" = 10002
                 test "$(stat -c '%a' /rfc-https-spool)" = 700
+                test "$(stat -c '%a' /rfc-rsync-audit)" = 700
                 if (echo x >/etc/rfc-mcp/ingestion.toml) 2>/dev/null; then exit 1; fi
                 exec /usr/local/bin/rfc-mcp-docker-sync --check-config
             """,
-        ], env=cfg, mounts=(config, spool), scratch="512Mi")
+        ], env=cfg, mounts=(config, spool, audit), scratch="512Mi")
         self.pod("stock-feed", f"{self.prefix}-feed", 10003, [
             "/bin/sh", "-ec", """
                 test "$(id -u)" = 10003
                 test ! -e /etc/rfc-mcp/ingestion.toml
                 test ! -e /rfc-https-spool
+                test ! -e /rfc-rsync-audit
                 echo isolated
             """,
         ])
@@ -188,6 +195,7 @@ class Probe:
         assert preflight["source"] == "file" and preflight["schema_version"] == 2, preflight
         assert preflight["resources"]["cgroup_memory_limit_bytes"] == 2 * 1024**3, preflight
         assert preflight["resources"]["scratch_available_bytes"] >= 511 * 1024**2, preflight
+        assert preflight["resources"]["audit"]["available_bytes"] >= 256 * 1024**2, preflight
         assert self.done("stock-feed") == "isolated"
         print("Stock Minikube preflight passed", flush=True)
 
@@ -223,33 +231,56 @@ class Probe:
         self.database(input=f"ALTER ROLE rfc_sync PASSWORD '{writer}';\n")
         self.database("-f", "/migrations/bootstrap.sql", "-f", "/migrations/migrate.sql")
 
-        reports = []
-        runs = []
-        for _ in range(2):
-            self.pod("sync", f"{self.prefix}-sync", 10002, [
+        def sync(name, crash=None):
+            self.pod(name, f"{self.prefix}-sync", 10002, [
                 "/phase6/sync", "--phase2-reconcile", "--full",
             ], env={
                 **cfg, "RFC_PHASE6_FIXTURES": "1", "RFC_DISCOVERY_FIXTURES": "1",
                 "RFC_DB_HOST": "postgres", "RFC_DB_CA_FILE": "/phase2/ca.crt",
                 "RFC_DB_PASSWORD_FILE": "/phase1/db-password",
-            }, mounts=(config, spool, self.host("mirror", "/mirror", "mirror", False),
+                **({"RFC_PHASE3_CRASH": crash} if crash else {}),
+            }, mounts=(config, spool, audit, self.host("mirror", "/mirror", "mirror", False),
                        self.host("sync", "/phase6/sync", "sync"),
                        self.host("ca", "/phase2/ca.crt", "ca.crt"),
                        self.host("writer", "/phase1/db-password", "writer")),
                 scratch="512Mi")
-            reports.append(json.loads(self.done("sync")))
+
+        reports = []
+        runs = []
+        for name in ("sync-cold", "sync-warm"):
+            sync(name)
+            reports.append(json.loads(self.done(name)))
             runs.append(self.database("-c", """
                 SELECT rfc_id,kind,observation,expires_at FROM rfc.ingestion_checkpoints
                 ORDER BY rfc_id,kind
             """))
-            self.kubectl("delete", "pod", "sync", "--wait=true")
         cold, warm = reports
         assert warm["state"] == cold["state"] == "acquisition_complete", reports
         assert warm["acquisition"]["checkpoint_txt"] == cold["expected_txt"] == expected, reports
         assert warm["acquisition"]["checkpoint_xml"] > 0 and runs[0] == runs[1], reports
         assert cold["acquisition"]["processing_digest"] == warm["acquisition"]["processing_digest"]
         assert warm["metrics"]["https_requests"] < cold["metrics"]["https_requests"]
+        # Update both sources while holding rsync metadata constant. A warm
+        # run detects the change and loses the pod after persisting the pair.
+        self.execute([*self.docker, "exec", "--user", "0", self.node, "sh", "-ec", """
+            rsync="$1/source/rsync/rfc100.txt"
+            https="$1/source/https/rfc100.txt"
+            touch -r "$rsync" "$1/stamp"
+            printf Z | dd of="$rsync" conv=notrunc 2>/dev/null
+            cp "$rsync" "$https"
+            touch -r "$1/stamp" "$rsync"
+        """, "sh", self.node_work])
+        sync("sync-crashing", "after_rsync_repair_pair")
+        self.kubectl("wait", "pod/sync-crashing", "--for=jsonpath={.status.phase}=Failed", "--timeout=55s")
+        assert "crash at after_rsync_repair_pair" in self.kubectl("logs", "sync-crashing")
+        self.kubectl("delete", "pod", "sync-crashing", "--wait=true")
+        sync("sync-replacement")
+        repair = json.loads(self.done("sync-replacement"))
+        assert repair["audit"]["repaired"] == 1 and repair["audit"]["repair_attempts"] == 0, repair
+        assert repair["audit"]["reused"] == expected - 1, repair
+        assert repair["acquisition"]["processing_digest"] != cold["acquisition"]["processing_digest"], repair
         assert self.database("-c", "SELECT publication_sequence FROM rfc.active_generation") == "0"
+        print("Minikube replacement sealed the durable repair pair without another source attempt", flush=True)
         print(f"Minikube pod replacement reused {expected} TXT and "
               f"{warm['acquisition']['checkpoint_xml']} XML checkpoints. HTTPS starts "
               f"{cold['metrics']['https_requests']} cold and {warm['metrics']['https_requests']} warm.",
@@ -257,6 +288,8 @@ class Probe:
 
     def close(self):
         self.kubectl("delete", "namespace", self.namespace, "--ignore-not-found", "--timeout=60s")
+        self.execute([*self.docker, "exec", "--user", "10002:10002", self.node,
+                      "rm", "-rf", "--", self.node_audit])
         self.execute([*self.docker, "exec", "--user", "0", self.node,
                       "rm", "-rf", "--", self.node_work])
 
@@ -266,12 +299,16 @@ def main():
     parser.add_argument("--profile", required=True, help="dedicated single-node Docker Minikube profile")
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", required=True)
+    parser.add_argument("--audit-node-dir", required=True,
+                        help="disk-backed path under the Minikube node's /tmp, writable by UID/GID 10002")
     args = parser.parse_args()
     assert os.environ.get("MINIKUBE_HOME", "").startswith("/tmp/"), "set MINIKUBE_HOME under /tmp"
     assert os.environ.get("KUBECONFIG", "").startswith("/tmp/"), "set KUBECONFIG under /tmp"
+    if not Path(args.audit_node_dir).is_relative_to("/tmp") or ".." in Path(args.audit_node_dir).parts:
+        parser.error("--audit-node-dir must be beneath the node's /tmp")
     os.environ["RFC_E2E_PRELOADED"] = "1"
     with tempfile.TemporaryDirectory(prefix="rfc-minikube-processing-", dir="/tmp") as work:
-        probe = Probe(args.profile, args.context, args.image_prefix, Path(work))
+        probe = Probe(args.profile, args.context, args.image_prefix, Path(work), args.audit_node_dir)
         try:
             probe.run()
         finally:

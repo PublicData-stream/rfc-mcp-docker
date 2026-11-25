@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify durable HTTPS processing against private fixtures and schema 10."""
+"""Qualify durable HTTPS processing and rsync audit against private fixtures."""
 
 import argparse
 import importlib.util
@@ -32,7 +32,7 @@ def publication_snapshot(project):
 
 def manual(project, scope="full", state="acquisition_complete", *, error=None, options=()):
     command = project.app("sync", "-T", *options, args=("--phase2-reconcile", f"--{scope}"))
-    result = subprocess.run(command, env=project.env, text=True, capture_output=True, timeout=75)
+    result = subprocess.run(command, env=project.env, text=True, capture_output=True, timeout=115)
     assert bool(result.returncode) == (state != "acquisition_complete"), result
     report = json.loads(result.stdout)
     assert report["state"] == state and report["publication_gate"] == "https_txt_audit_pending", report
@@ -43,8 +43,9 @@ def manual(project, scope="full", state="acquisition_complete", *, error=None, o
         assert report["catalog_before"]["digest"] == report["catalog_after"]["digest"], report
         counts = report["acquisition"]
         assert counts["txt_sealed"] == counts["xml_classified"] == report["expected_txt"], report
-        assert counts["txt_audited"] == counts["membership_committed"] == 0, report
-        assert counts["documents_joined"] == counts["txt_audit_pending"] == report["expected_txt"], report
+        assert counts["membership_committed"] == counts["txt_audit_pending"] == 0, report
+        assert counts["documents_joined"] == counts["txt_audited"] == report["expected_txt"], report
+        assert report["audit"]["matched"] + report["audit"]["repaired"] == report["expected_txt"], report
         assert counts["processing_digest"], report
         assert counts["stage_peak_jobs"] <= 3, report
         assert report["metrics"]["https_peak"] <= 2, report
@@ -211,7 +212,9 @@ def verify_populated(project, published, sequence, sources, work):
     inventory_before = manual(project)["inventory_digest"]
     missing.write_bytes(changed)
     os.utime(missing, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-    unchanged_metadata = manual(project)
+    unchanged_metadata = manual(project, state="acquisition_failed", error="TXT repair exhausted",
+                                options=fast_audit_config(work))
+    assert unchanged_metadata["audit"]["repair_attempts"] == 2, unchanged_metadata
     assert unchanged_metadata["inventory_digest"] == inventory_before
     assert unchanged_metadata["inventory_size_changes"] == 0
     assert unchanged_metadata["local_https_txt_audit_pending"] == count
@@ -580,7 +583,193 @@ def history(project):
     )
 
 
-def exercise(project, work, spool, incumbent_only, old_driver=None, scheduler_only=False):
+def fast_audit_config(work, *, batch_size=512, session_timeout=20):
+    config = work / f"audit-{batch_size}-{session_timeout}.toml"
+    config.write_text(f"""schema_version = 2
+[ingestion.revalidation]
+batch_size = {batch_size}
+max_attempts = 2
+retry_backoff_seconds = [1]
+session_timeout_seconds = {session_timeout}
+""")
+    config.chmod(0o444)
+    return ("-e", "RFC_SYNC_CONFIG_FILE=/etc/rfc-mcp/audit.toml",
+            "-v", f"{config}:/etc/rfc-mcp/audit.toml:ro")
+
+
+def crash_at(project, boundary, options=()):
+    command = project.app("sync", "-T", *options, "-e", f"RFC_PHASE3_CRASH={boundary}",
+                          args=("--phase2-reconcile", "--full"))
+    result = subprocess.run(command, env=project.env, capture_output=True, text=True, timeout=100)
+    assert result.returncode == 86 and f"crash at {boundary}" in result.stderr, result
+
+
+def exercise_audit(project, work, sources, fresh, audit):
+    assert fresh["audit"]["matched"] == len(sources)
+    assert fresh["audit"]["sessions"] == 1
+    assert fresh["audit"]["repair_attempts"] == 0
+    assert fresh["metrics"]["rsync_checksum_hits"] == len(sources)
+    assert fresh["metrics"]["rsync_transferred_files"] == 0
+    assert fresh["metrics"]["rsync_transferred_payload_bytes"] == 0
+    verify_cas(project, sources)
+    fast = fast_audit_config(work)
+    one = fast_audit_config(work, batch_size=1)
+    mode = project.source / "mode"
+    https = project.source / "https/rfc100.txt"
+    rsync = project.source / "rsync/rfc100.txt"
+    snapshot = publication_snapshot(project)
+
+    # A restart after the complete dry run recovers each match without treating
+    # the next independently completed reconciliation as part of the old run.
+    crash_at(project, "after_rsync_audit_receipt")
+    resumed = manual(project)
+    assert resumed["audit"]["reused"] == len(sources) and resumed["audit"]["sessions"] == 0, resumed
+    assert manual(project)["audit"]["reused"] == 0
+
+    for scenario in ("overlap", "missing", "mutation", "timeout", "size"):
+        if scenario != "size":
+            clear_checkpoints(project)
+        tag = f"acquisition-audit-{scenario}"
+        release = project.source / "release-audit"
+        release.unlink(missing_ok=True)
+        mode.write_text(tag)
+        offset = len(project.capture("logs", "--no-log-prefix", "fixtures").splitlines())
+        options = one if scenario == "overlap" else fast
+        if scenario == "timeout":
+            options = fast_audit_config(work, session_timeout=5)
+        command = project.app("sync", "-T", *options, args=("--phase2-reconcile", "--full"))
+        with subprocess.Popen(command, env=project.env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as collector:
+            try:
+                phase6.wait(lambda: f"fixture audit held {tag}" in project.capture(
+                    "logs", "--no-log-prefix", "fixtures"), seconds=40)
+                if scenario == "overlap":
+                    before = sum(path.endswith(".xml") for path, _ in starts(project, offset))
+                    phase6.wait(lambda: sum(path.endswith(".xml") for path, _ in starts(project, offset))
+                                > before, seconds=12)
+                elif scenario == "missing":
+                    rsync.unlink()
+                elif scenario == "mutation":
+                    staged = audit / "full/snapshot/txt/rfc100.txt"
+                    subprocess.run(["sudo", "-n", "dd", "of=" + str(staged), "conv=notrunc"],
+                                   input=b"x", check=True, capture_output=True, timeout=5)
+                elif scenario == "timeout":
+                    time.sleep(6)
+                elif scenario == "size":
+                    changed_size = sources[100] + b"\nExtra original bytes.\n"
+                    rsync.write_bytes(changed_size)
+                    https.write_bytes(changed_size)
+            finally:
+                release.touch()
+            output, error = collector.communicate(timeout=90)
+        report = json.loads(output)
+        if scenario in ("overlap", "timeout"):
+            assert collector.returncode == 0 and report["audit"]["matched"] == len(sources), (report, error)
+            if scenario == "timeout":
+                assert report["audit"]["failed_sessions"] == 1, report
+        elif scenario == "size":
+            assert collector.returncode == 0 and report["audit"]["repaired"] == 1, (report, error)
+            assert report["metrics"]["rsync_transferred_files"] == 1, report
+            assert report["metrics"]["rsync_transferred_payload_bytes"] == len(changed_size), report
+            verify_cas(project, sources | {100: changed_size})
+            rsync.write_bytes(sources[100])
+            https.write_bytes(sources[100])
+        else:
+            assert collector.returncode != 0 and report["audit"]["matched"] == 0, (report, error)
+            if scenario == "mutation":
+                assert "audit snapshot changed" in report["error"], report
+        if scenario == "missing":
+            rsync.write_bytes(sources[100])
+        mode.write_text("normal")
+    mode.write_text("acquisition-audit-truncate")
+    truncated = manual(project, state="acquisition_failed", error="rsync audit", options=fast)
+    assert truncated["audit"]["failed_sessions"] == 2 and truncated["audit"]["matched"] == 0, truncated
+
+    # Give the remote file newer metadata only, then change both sources while
+    # preserving the size and timestamp to force checksum-based repair.
+    mode.write_text("normal")
+    remote_stamp = time.time_ns()
+    os.utime(rsync, ns=(remote_stamp, remote_stamp))
+    metadata = manual(project, options=fast)
+    assert metadata["audit"]["matched"] == len(sources), metadata
+    changed = bytes([sources[100][0] ^ 1]) + sources[100][1:]
+    https.write_bytes(changed)
+    rsync.write_bytes(changed)
+    os.utime(rsync, ns=(remote_stamp, remote_stamp))
+    crash_at(project, "before_rsync_repair_capture", fast)
+    crash_at(project, "after_rsync_repair_pair", fast)
+    repaired = manual(project, options=fast)
+    assert repaired["audit"]["repaired"] == 1 and repaired["audit"]["repair_attempts"] == 0, repaired
+    assert repaired["inventory_digest"] == metadata["inventory_digest"], repaired
+    verify_cas(project, sources | {100: changed})
+    assert repaired["acquisition"]["processing_digest"] != fresh["acquisition"]["processing_digest"]
+
+    # A repair-specific HTTP 429 applies to the retry through the same gate.
+    second = bytes([changed[0] ^ 2]) + changed[1:]
+    rsync.write_bytes(second)
+    https.write_bytes(second)
+    os.utime(rsync, ns=(remote_stamp, remote_stamp))
+    mode.write_text("acquisition-audit-cooldown")
+    offset = len(project.capture("logs", "--no-log-prefix", "fixtures").splitlines())
+    cooldown = manual(project, options=fast)
+    attempts = [stamp for path, stamp in starts(project, offset) if path == "/rfc/rfc100.txt"]
+    assert cooldown["audit"]["repaired"] == 1 and cooldown["audit"]["repair_attempts"] == 2, cooldown
+    assert len(attempts) == 2 and attempts[1] - attempts[0] >= 2_990_000_000, attempts
+    verify_cas(project, sources | {100: second})
+
+    # Start a divergent pair, then let the HTTPS source converge after the
+    # original pair is durably quarantined.
+    remote_stamp -= 5_000_000_000
+    rsync.write_bytes(second)
+    os.utime(rsync, ns=(remote_stamp, remote_stamp))
+    mode.write_text("normal")
+    operation = project.app("sync", "-T", *fast, args=("--phase2-reconcile", "--full"))
+    with subprocess.Popen(operation, env=project.env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as collector:
+        def quarantined():
+            return subprocess.run(["sudo", "-n", "find", str(audit / "quarantine"), "-name", "receipt",
+                                   "-print", "-quit"], text=True, capture_output=True,
+                                  check=True, timeout=5).stdout
+        phase6.wait(quarantined, seconds=25)
+        https.write_bytes(changed)
+        output, error = collector.communicate(timeout=40)
+    convergence = json.loads(output)
+    assert collector.returncode == 0 and convergence["audit"]["repair_attempts"] == 2, (convergence, error)
+    assert convergence["audit"]["repaired"] == 1, convergence
+    verify_cas(project, sources | {100: changed})
+
+    remote_stamp -= 5_000_000_000
+    rsync.write_bytes(second)
+    os.utime(rsync, ns=(remote_stamp, remote_stamp))
+    mode.write_text("normal")
+    divergent = manual(project, state="acquisition_failed", error="TXT repair exhausted", options=fast)
+    assert divergent["audit"]["repair_attempts"] == 2 and divergent["audit"]["quarantine_bytes"] > 0, divergent
+    exhausted = manual(project, state="acquisition_failed", error="TXT repair exhausted", options=fast)
+    assert exhausted["audit"]["repair_attempts"] == 0, exhausted
+    verify_cas(project, sources | {100: changed})
+
+    # Fill the item quota with copies of an actual quarantined capture.
+    now = time.time_ns() // 1000
+    subprocess.run(["sudo", "-n", "sh", "-ec", """
+        stamp=$2
+        set -- "$1"/*
+        source=$1
+        parent=${source%/*}
+        index=$#
+        while [ "$index" -lt 128 ]; do
+          cp -a "$source" "$parent/$stamp-0-100-$index"
+          index=$((index+1))
+        done
+    """, "sh", str(audit / "quarantine"), str(now)], check=True, timeout=15)
+    os.utime(rsync, ns=(remote_stamp - 5_000_000_000, remote_stamp - 5_000_000_000))
+    full = manual(project, state="acquisition_failed", error="quarantine is full", options=fast)
+    assert full["audit"]["repair_attempts"] == 0, full
+    assert publication_snapshot(project) == snapshot
+    print("Audit overlap, explicit receipts, snapshot mutation, missing and truncated sessions, "
+          "timeout recovery, pair replay, cooldown, exact repaired CAS, and quarantine bounds passed", flush=True)
+
+
+def exercise(project, work, spool, audit, incumbent_only, old_driver=None, scheduler_only=False, audit_only=False):
     sources = phase2.prepare(project, include_nul=True)
     original = project.source / "catalog.xml"
     initial = original.read_text()
@@ -603,7 +792,7 @@ def exercise(project, work, spool, incumbent_only, old_driver=None, scheduler_on
     overlay.write_text(json.dumps({"services": {
         "sync": {
             "environment": {"RFC_SYNC_CONFIG_FILE": CONFIG_PATH, "RFC_DISCOVERY_FIXTURES": "1"},
-            "volumes": [f"{config}:{CONFIG_PATH}:ro", f"{spool}:/rfc-https-spool"],
+            "volumes": [f"{config}:{CONFIG_PATH}:ro", f"{spool}:/rfc-https-spool", f"{audit}:/rfc-rsync-audit"],
         },
         "feed": {"environment": {"RFC_DISCOVERY_FIXTURES": "1"}},
     }}))
@@ -621,7 +810,12 @@ def exercise(project, work, spool, incumbent_only, old_driver=None, scheduler_on
     assert fresh["acquisition"]["txt_contains_nul"] == fresh["acquisition"]["txt_invalid_utf8"] == 1
     print(f"Cold fixture reported {fresh['metrics']['https_requests']} HTTPS starts, "
           f"{fresh['acquisition']['staged_body_bytes']} staged artifact bytes, "
-          f"and peak {fresh['acquisition']['stage_peak_jobs']} active artifact jobs", flush=True)
+          f"and peak {fresh['acquisition']['stage_peak_jobs']} active artifact jobs. "
+          f"Rsync matched {fresh['audit']['matched']} files in {fresh['audit']['session_ms']} ms "
+          f"with a {fresh['audit']['snapshot_peak_bytes']}-byte snapshot.", flush=True)
+    if audit_only:
+        exercise_audit(project, work, sources, fresh, audit)
+        return
     if not scheduler_only:
         checkpoint_restarts(project, sources, fresh)
         assert manual(project, scope="sample")["expected_txt"] == 3
@@ -767,6 +961,7 @@ def main():
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", required=True)
     modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--audit-only", action="store_true", help="exercise audit and exact-byte repair")
     modes.add_argument("--incumbent-only", action="store_true",
                        help="repeat warm reuse, the idle catalog check and retained rollback")
     modes.add_argument("--scheduler-only", action="store_true",
@@ -786,10 +981,11 @@ def main():
         phase6.fixture_binaries(docker, args.image_prefix, work)
         project = phase6.Project(work / work.name.lower(), driver, args.image_prefix, docker)
         project.prepare_phase6(work)
-        with phase2.capped_stage(project, mebibytes=5120, inodes=65536) as spool:
+        with (phase2.capped_stage(project, mebibytes=5120, inodes=65536) as spool,
+              phase2.capped_stage(project, mebibytes=1024, inodes=4096, label="audit") as audit):
             try:
-                exercise(project, work, spool, args.incumbent_only or bool(old_driver), old_driver,
-                         scheduler_only=args.scheduler_only)
+                exercise(project, work, spool, audit, args.incumbent_only or bool(old_driver), old_driver,
+                         scheduler_only=args.scheduler_only, audit_only=args.audit_only)
             except Exception:
                 project.run("logs", "--no-color", "--tail", "15", "sync", "fixtures", "feed")
                 raise

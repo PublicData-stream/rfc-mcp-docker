@@ -170,7 +170,7 @@ struct Summary {
     config: SyncConfig,
     phase: &'static str,
     publication_gate: &'static str,
-    pending_consumers: [&'static str; 1],
+    pending_consumers: [&'static str; 0],
     informational: [&'static str; 1],
     resources: Resources,
 }
@@ -196,6 +196,7 @@ pub fn check_config() -> Result<()> {
     let mut output = serde_json::to_value(summary)?;
     output["resources"]["spool_available_bytes"] = spool_available_bytes.into();
     output["resources"]["spool_available_inodes"] = spool_available_inodes.into();
+    output["resources"]["audit"] = serde_json::to_value(crate::audit::preflight()?)?;
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
@@ -228,9 +229,9 @@ impl SyncConfig {
         Ok(Summary {
             source,
             config,
-            phase: "acquisition",
+            phase: "audit",
             publication_gate: crate::discovery::PUBLICATION_GATE,
-            pending_consumers: ["ingestion.revalidation"],
+            pending_consumers: [],
             informational: ["ingestion.target_bootstrap_seconds"],
             resources,
         })
@@ -389,6 +390,7 @@ impl SyncConfig {
                 bytes.checked_add(512 * MIB + SCRATCH_REQUIRED + 2 * CATALOG_LIMIT as u64)
             })
             .and_then(|bytes| bytes.checked_add(crate::inventory::OUTPUT_RESERVATION))
+            .and_then(|bytes| bytes.checked_add(crate::audit::MEMORY_RESERVATION))
             .and_then(|bytes| bytes.checked_add(p.raw_payload_budget_bytes))
             .and_then(|bytes| bytes.checked_add(p.parse_budget_bytes))
             .ok_or("ingestion memory reservation overflows")?;
@@ -593,7 +595,7 @@ mod tests {
         small.validate().unwrap();
         assert!(
             small
-                .resources(16 * MIB, MEMORY_LIMIT, Some(768 * MIB))
+                .resources(16 * MIB, MEMORY_LIMIT, Some(800 * MIB))
                 .is_ok()
         );
     }

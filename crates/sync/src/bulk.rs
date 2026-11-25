@@ -3,6 +3,7 @@
 use crate::{
     discovery::Scope,
     metrics::{Stage, StageLease},
+    rsync::{RSYNC, check, child_rules, landlock_abi},
     shutdown::Shutdown,
     upstream::{MAX_CATALOG_ENTRIES, ProcessGroup, TXT_LIMIT, Upstream, filename, read_staged},
 };
@@ -15,7 +16,7 @@ use std::{
     io::{self, Write},
     mem::MaybeUninit,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::AsRawFd,
         unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
@@ -28,7 +29,6 @@ const ROOT: &str = "/rfc-rsync-txt";
 const MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_INODES: u64 = 24_576;
 const RECEIPT_BYTES_PER_FILE: usize = 128;
-const RSYNC: &str = "/usr/bin/rsync";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Capacity {
@@ -182,7 +182,7 @@ pub(crate) async fn stage(
     }
     let input = File::open(list.path())?;
     drop(list);
-    let rules = child_rules(&scope)?;
+    let rules = child_rules(&scope, true)?;
     let parent = unsafe { libc::getpid() };
     let mut command = Command::new(RSYNC);
     command
@@ -403,101 +403,4 @@ fn parse_receipt(
         return Err("bulk rsync is missing expected TXT receipt entries".into());
     }
     Ok(files)
-}
-
-#[repr(C, packed)]
-struct PathBeneath {
-    access: u64,
-    fd: i32,
-}
-
-fn check(result: libc::c_long) -> io::Result<libc::c_long> {
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result)
-    }
-}
-
-fn landlock_abi() -> io::Result<libc::c_long> {
-    let abi = check(unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<u8>(),
-            0_usize,
-            1_u32,
-        )
-    })?;
-    if abi < 3 {
-        return Err(io::Error::other(
-            "bulk rsync requires Landlock ABI 3 or newer",
-        ));
-    }
-    Ok(abi)
-}
-
-fn child_rules(scope: &Path) -> io::Result<OwnedFd> {
-    const EXECUTE: u64 = 1;
-    const WRITE: u64 = 1 << 1;
-    const READ_FILE: u64 = 1 << 2;
-    const READ_DIR: u64 = 1 << 3;
-    const REMOVE_FILE: u64 = 1 << 5;
-    const MAKE_REGULAR: u64 = 1 << 8;
-    const REFER: u64 = 1 << 13;
-    const TRUNCATE: u64 = 1 << 14;
-
-    let abi = landlock_abi()?;
-    let handled: u64 = (1 << if abi >= 5 { 16 } else { 15 }) - 1;
-    let rules = check(unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            &handled,
-            size_of::<u64>(),
-            0_u32,
-        )
-    })?;
-    let rules = unsafe { OwnedFd::from_raw_fd(rules as i32) };
-    let allow = |path: &Path, access| {
-        let fd = File::options()
-            .read(true)
-            .custom_flags(libc::O_PATH)
-            .open(path)?;
-        let rule = PathBeneath {
-            access,
-            fd: fd.as_raw_fd(),
-        };
-        check(unsafe {
-            libc::syscall(
-                libc::SYS_landlock_add_rule,
-                rules.as_raw_fd(),
-                1_u32,
-                &rule,
-                0_u32,
-            )
-        })?;
-        Ok::<_, io::Error>(())
-    };
-    allow(
-        scope,
-        WRITE | READ_FILE | READ_DIR | REMOVE_FILE | MAKE_REGULAR | REFER | TRUNCATE,
-    )?;
-    allow(Path::new(RSYNC), EXECUTE | READ_FILE)?;
-    for path in ["/lib", "/usr/lib"] {
-        allow(Path::new(path), EXECUTE | READ_FILE | READ_DIR)?;
-    }
-    for path in [
-        "/etc/resolv.conf",
-        "/etc/hosts",
-        "/etc/services",
-        "/etc/protocols",
-        "/etc/nsswitch.conf",
-        "/dev/urandom",
-    ] {
-        if let Err(error) = allow(Path::new(path), READ_FILE)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            return Err(error);
-        }
-    }
-    Ok(rules)
 }

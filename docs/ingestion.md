@@ -1,10 +1,11 @@
 # RFC discovery and candidate ingestion
 
-HTTPS-first Phase 3 runs the same discovery and durable processing for
+HTTPS-first Phase 4 runs the same discovery and durable processing for
 manual requests and daemon jobs. It installs original HTTPS TXT and RFCXML
 in BLAKE3 CAS, seals TXT indexes in PostgreSQL schema 10, and joins both
-outcomes in the Sync coordinator. Required TXT audit and candidate publication are
-later phases. The qualified schema 9 release supplies production ingestion.
+outcomes in the Sync coordinator. Each required TXT receives a current rsync
+audit or a fresh dual-source byte comparison. Phase 5 owns candidate
+publication. The qualified schema 9 release supplies production ingestion.
 [HTTPS-first design](decisions/0010-https-first-rfc-synchronization.md)
 
 ## Sync configuration
@@ -29,7 +30,7 @@ own format and cadence. [Control and Feed](control.md)
 
 The accepted-byte limit covers original captures and reused inputs. Discovery
 also applies it to canonical TXT rehashes. The ten-minute discovery deadline
-applies independently of acquisition. Sync schedules opening and closing
+applies independently of acquisition and audit. Sync schedules opening and closing
 catalog captures, TXT, RFCXML, Feed polls, and retries under one request
 budget. Valid `Retry-After` on 429 or 503 applies to all classes and survives a
 process handoff. Acquisition makes up to three attempts per artifact. A
@@ -41,14 +42,18 @@ window, parser workers, and raw and parse budgets. The active window
 requires a reservation of 16 MiB of raw capacity and 128 MiB of parse
 capacity per slot. `ingestion.database.batch_size` caps each checkpoint
 transaction at 32 available results by default (range 1–32). The active
-window can make a batch smaller. Revalidation settings apply in the audit
-phase.
+window can make a batch smaller. Revalidation defaults to one rsync session,
+a 512-file batch, a 120-second session timeout, and three attempts with
+jittered backoffs of 5 and 30 seconds. The batch also has a 256 MiB cap.
+Periodic full reconciliation uses the shorter of the discovery and
+revalidation intervals, both one day by default.
 
 Run `rfc-mcp-docker-sync --check-config` with the HTTPS acquisition overlay
 to report effective configuration, the publication gate, scratch and
-cgroup capacity, and the spool's free bytes and inodes. It performs local
+cgroup capacity, and free bytes and inodes on the spool and audit mounts.
+It performs local
 checks before connecting to PostgreSQL or upstream. Sync uses its startup
-snapshot until restart. [Spool and shadow setup](deployment.md#https-first-phase-3-shadow-runbook)
+snapshot until restart. [Spool and shadow setup](deployment.md#https-first-phase-4-shadow-runbook)
 
 ### Translate v1 settings
 
@@ -60,7 +65,7 @@ Rename `rfcxml_max_attempts` to `max_attempts` and
 `RFC_SYNC_HTTP_CONCURRENCY` and `RFC_SYNC_PARSE_CONCURRENCY` values in
 their TOML equivalents and remove both old environment variables. Remove
 `txt_provenance`, `[ingestion.rsync]`, and the legacy bulk overlay.
-Choose inventory and future audit timeouts from their individual v2 fields.
+Choose inventory and audit timeouts from their individual v2 fields.
 Keep the v1 file and its matched images for the existing deployment.
 
 ## Run acquisition
@@ -117,14 +122,36 @@ failure. Expired and evicted artifacts become reclaimable through
 references to them.
 
 The terminal report distinguishes downloaded, reused, sealed and
-audit-pending TXT, classified RFCXML, and joined documents. It includes
+TXT awaiting audit, classified RFCXML, and joined documents. It includes
 the processing digest, queue and disk peaks, parser CPU time, CAS time,
 and DB transaction counts. `acquisition_complete` means both artifacts
 have terminal results for every selected RFC under the ending catalog
-fence. `txt_audited` and `membership_committed` remain zero. The per-run
+fence. `txt_audited` includes qualified matches and repaired originals.
+`membership_committed` remains zero until the publication phase. The per-run
 spool is cleaned after success and cooperative shutdown, or swept on the
 next run after a crash. Deferred and failed manual runs return nonzero.
 [Control behavior](control.md#reconciliation-and-publication)
+
+## Audit and repair
+
+Sync stages private copies of sealed HTTPS TXT bytes and runs an rsync checksum
+dry run with `--checksum-choice=auto`. A complete, successful session must
+explicitly account for every selected file. Sync verifies the staged bytes
+again before committing the receipt. A checksum match records that the
+packaged client compared the local and remote files using its pre-transfer
+checksum. Repair records a stronger byte comparison from fresh HTTPS and
+rsync captures. RFCXML records HTTPS transport provenance and an inapplicable
+rsync audit until an equivalent official XML artifact is qualified.
+
+A required TXT mismatch triggers a fresh capture from each source through
+the same HTTPS start gate and the single rsync session budget. Matching
+originals are sealed and rejoined using the HTTPS bytes. Diverging pairs are
+quarantined with their observation times, source URLs, and digests. The
+private 1 GiB mount holds scope journals capped at 64 MiB total and quarantine
+capped at 256 MiB, 128 pairs, and seven days. Sync reports required TXT as
+unresolved on exhausted retries or full quarantine. Receipts from interrupted
+runs are reusable only within the same fresh selection and source identity.
+A completed run requires a fresh audit on the next reconciliation.
 
 ## Schema 9 release pipeline
 
