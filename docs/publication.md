@@ -7,7 +7,7 @@ The PostgreSQL `rfc.active_generation` row identifies the active generation and 
 Run these commands with the sync binary, sync database credentials, and its writable mirror in the private Compose environment.
 
 The command table describes the published schema 9 collector. With the
-HTTPS-first Phase 2 build, `--phase2-reconcile` reports acquisition and
+HTTPS-first Phase 3 build, `--phase2-reconcile` reports durable processing and
 `--phase3-publish` fails at the publication gate. The retained-generation
 rollback and maintenance commands still use the rules below.
 [Acquisition and rollout](ingestion.md#run-acquisition)
@@ -23,7 +23,7 @@ rollback and maintenance commands still use the rules below.
 
 An expected-sequence conflict leaves the publication untouched. After a lost connection around commit, inspect `rfc.active_generation` and `rfc.notification_outbox` for the intended sequence and generation before retrying. A missing or corrupted file stops promotion. Restore the verified bytes to the original digest path before retrying. Retain the recorded incident for investigation.
 
-Recovery also runs before each reconciliation. It reports blocked and remaining deletion counts. An eligible restart checkpoint can pin a canonical file after the interrupted generation is retired. Expiry and eviction release that pin while generation references still protect published or retained bytes. A queued item with unexpected contents, type, or links remains in place for inspection. Preserve private quarantine. If retiring an eligible generation is busy, repeat GC after the reader has finished. [Interrupted reconciliation](ingestion.md#interrupted-reconciliation)
+The schema 9 collector runs recovery before each reconciliation. Phase 3 sweeps its spool and interrupted CAS staging on the next run. Use `--phase3-recover` for an explicit reclamation pass. It reports blocked and remaining deletion counts. An eligible restart checkpoint can pin a canonical file after the interrupted generation is retired. Expiry and eviction release that pin while generation references still protect published or retained bytes. A queued item with unexpected contents, type, or links remains in place for inspection. Preserve private quarantine. If retiring an eligible generation is busy, repeat GC after the reader has finished. [Interrupted reconciliation](ingestion.md#interrupted-reconciliation)
 
 ## Locks and retention
 

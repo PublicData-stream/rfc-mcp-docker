@@ -1,4 +1,4 @@
-# Phase 2 qualification and shadow operation. Provision the private spool first.
+# HTTPS-first qualification and shadow operation. Provision the private spool first.
 services:
   rfc-mcp-docker-sync:
     volumes:

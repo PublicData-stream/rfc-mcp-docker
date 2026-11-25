@@ -15,7 +15,7 @@ min_request_start_interval_ms = 1000
 request_timeout_seconds = 30
 max_attempts = 3
 
-# Phase 2 uses these bounds for independent TXT and RFCXML acquisition.
+# These bounds cover independent TXT and RFCXML acquisition and processing.
 [ingestion.pipeline]
 txt_queue_items = 64
 xml_queue_items = 64

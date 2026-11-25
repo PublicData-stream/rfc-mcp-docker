@@ -80,7 +80,17 @@ and automatic requests share a single HTTPS owner and preserve the corpus
 fence through cleanup. The spool supports acquisition only. Phase 3 adds
 CAS, durable checkpoints, and joins. The existing PostgreSQL schema and
 publication gate remain in force.
-[Shadow runbook](../deployment.md#https-first-phase-2-shadow-runbook)
+[Phase 2 evidence](../implementation-status.md#https-first-rfc-synchronization-phase-2)
+
+## Phase 3 rollout
+
+Apply schema 10 on the isolated shadow copy. It distinguishes new HTTPS-only
+TXT from historical verification methods and rejects capture-only TXT as
+generation membership evidence. Checkpoints pin verified originals and sealed
+TXT indexes. Both lanes join by selection and RFC identity under the corpus
+and publication fence. The existing active generation and retained rollback
+remain available. TXT audit, repair and promotion are later phases.
+[Shadow runbook](../deployment.md#https-first-phase-3-shadow-runbook)
 
 ## Cold-start timing
 

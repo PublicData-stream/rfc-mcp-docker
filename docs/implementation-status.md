@@ -1005,7 +1005,7 @@ Sync's authenticated broker. Completed runs seal originals and
 classifications in a private disk spool and confirm the ending catalog.
 The spool is removed after each run. PostgreSQL stays at schema 9 and
 new publication remains gated. [Acquisition](ingestion.md#run-acquisition) ·
-[Shadow runbook](deployment.md#https-first-phase-2-shadow-runbook)
+[Shadow runbook](deployment.md#https-first-phase-3-shadow-runbook)
 
 ### Offline verification on 2026-11-25
 
@@ -1066,3 +1066,104 @@ python3 -B scripts/phase7/integration.py --config-only --context "$context" --im
 
 Add `--incumbent-only` to the acquisition command to repeat the warm
 reuse, idle catalog, and rollback cases in a fresh fixture.
+
+## HTTPS-first RFC synchronization Phase 3
+
+Manual and daemon reconciliation install original HTTPS TXT and RFCXML
+in BLAKE3 CAS and seal TXT indexes in PostgreSQL schema 10. Bounded
+checkpoints preserve observations and TXT indexes across failures. The
+coordinator joins by exact selection and RFC and confirms the ending
+catalog. TXT awaits audit. The active generation and outbox stay on
+their existing publication path.
+[Processing and restart](ingestion.md#restart-durable-processing) ·
+[Shadow runbook](deployment.md#https-first-phase-3-shadow-runbook)
+
+### Offline verification on 2026-11-25
+
+- The frozen Rust gate passed, including the MCP wire probe, and frozen
+  all-feature Clippy and tests passed. The keyed-join regression checked
+  stale selections, duplicates, incomplete joins, and digest equality
+  across result orders.
+- Phase 0 and the production config-mount probes passed on Docker Engine
+  29.10.0 (rootless) and 29.10.1 (rootful). The rebuilt stock Sync image
+  was `sha256:8bdd218ff0f3704ab906ad5c8e6550f38d0cfc842b7a70a1fa57b1938fbaabee`.
+  Phase 0 exercised rsync, TLS, PostgreSQL authorization, and Landlock and
+  seccomp confinement.
+- The populated schema 9 copy migrated twice on rootless Docker. Historical
+  source identities, methods, timestamps, and manifest bytes matched
+  exactly. The incumbent served exact RFC 2119 bytes, the audit gate
+  rejected capture-only membership, and retained rollback served those
+  bytes at the next sequence. Warm minimum request-start spacing was
+  1,000,904 µs.
+- Minikube 1.39.0 with Kubernetes 1.37.0, Docker rootless, and containerd
+  passed stock Sync and Feed preflight and a fixture Sync pod replacement.
+  The replacement reused six TXT and three RFCXML checkpoints. The requests
+  fell from 14 to five and the processing digest and checkpoint identities
+  and expiries matched. Publication sequence stayed zero.
+- The processing fixtures on both Docker engines verified 28,097 staged
+  bytes across six RFCs, with at most three active artifact jobs. They
+  checked exact CAS bytes, NUL and invalid UTF-8 bytes mode, crash recovery
+  on both sides of CAS installation, checkpoint commit and catalog
+  validation, corruption rejection, expiry, and garbage collection.
+  Unchanged repeat runs made five HTTPS starts against 14 on cold runs.
+- Both engines passed the held-lane and acquisition fault cases. Focused
+  scheduler runs verified an unrelated HTTPS request during a delayed
+  checkpoint write, one-slot and filesystem bounds, both `Retry-After`
+  forms across restart, daemon operator routing, Feed convergence, and
+  retained rollback. The cold and warm minimum start spacing was
+  1,000,334 µs and 1,000,645 µs on rootless Docker and 1,000,516 µs and
+  1,000,935 µs on rootful Docker. The scheduler runs used separate
+  disposable projects from the crash and acquisition faults.
+- Production-profile confinement passed on both engines, including
+  concurrent worker limits, disconnect and deadline reaping, and
+  corpus-fence release. The publication suites on both engines passed
+  accepted reader fencing, retirement and unlink interruption, matched
+  backup restore, and checkpoint recovery.
+
+Early qualification found a missing checkpoint function in Sync's
+privilege allowlist and a rootful PostgreSQL startup timeout. The final
+images include the privilege correction, and the rootful Phase 0 rerun
+passed. A rootless CAS byte-check attempt timed out starting an extra
+container. The fixture now reads the test mirror directly. The rootless
+crash fixture uses one active slot so it reaches a TXT checkpoint before
+a bodyless XML result. The first timing probes missed the delayed write.
+The focused reruns use timestamps from PostgreSQL and the HTTPS fixture.
+The rootless publication suite passed after the harness targeted the
+accepted reader by its held advisory lock and terminated the session
+before starting GC. The Minikube setup needed a local tag for the pinned
+PostgreSQL image and a writable socket directory. It also retried
+transient API write timeouts.
+
+Use matching local stock and fixture images with a common prefix to repeat
+the Compose probes. Add `--scheduler-only` for the focused timing and
+routing run. The upgrade case also takes the matching schema 9 publication
+fixture prefix.
+
+~~~sh
+export TMPDIR=/tmp RFC_E2E_PRELOADED=1
+python3 -B scripts/phase0/integration.py --context "$context" --project "$prefix" --skip-build
+python3 -B scripts/phase7/integration.py --context "$context" --image-prefix "$prefix" --config-only
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix"
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" \
+  --upgrade-from-schema9 "$schema9_prefix"
+python3 -B scripts/phase3/integration.py --context "$context" --image-prefix "$prefix"
+python3 -B scripts/phase7/integration.py --context "$context" --image-prefix "$prefix"
+~~~
+
+For the pod replacement check, use a dedicated rootless Docker Minikube
+profile and preloaded pinned PostgreSQL and matching fixture images.
+
+~~~sh
+probe_root=$(mktemp -d /tmp/rfc-processing-kube.XXXXXXXX)
+export MINIKUBE_HOME="$probe_root" KUBECONFIG="$probe_root/kubeconfig" TMPDIR="$probe_root"
+export DOCKER_CONTEXT=rootless
+minikube config set rootless true
+minikube start -p rfc-processing --driver=docker --container-runtime=containerd \
+  --kubernetes-version=v1.37.0 --cpus=2 --memory=4096 --disable-driver-mounts
+python3 -B scripts/https-discovery/minikube.py --profile rfc-processing --image-prefix "$prefix"
+minikube delete -p rfc-processing
+rm -r -- "$probe_root"
+~~~
+
+All acquisition requests were to private fixture services. The full
+official corpus startup target remains unmeasured.

@@ -1,10 +1,10 @@
 # RFC discovery and candidate ingestion
 
-HTTPS-first Phase 2 runs the same discovery and acquisition engine for
-manual requests and daemon jobs. Successful acquisition seals HTTPS
-originals and classifies RFCXML for later processing. Required TXT audit
-and candidate publication are later phases. The qualified schema 9 release
-continues to supply production ingestion.
+HTTPS-first Phase 3 runs the same discovery and durable processing for
+manual requests and daemon jobs. It installs original HTTPS TXT and RFCXML
+in BLAKE3 CAS, seals TXT indexes in PostgreSQL schema 10, and joins both
+outcomes in the Sync coordinator. Required TXT audit and candidate publication are
+later phases. The qualified schema 9 release supplies production ingestion.
 [HTTPS-first design](decisions/0010-https-first-rfc-synchronization.md)
 
 ## Sync configuration
@@ -39,14 +39,16 @@ informational.
 The pipeline table controls descriptor queue depths, the active artifact
 window, parser workers, and raw and parse budgets. The active window
 requires a reservation of 16 MiB of raw capacity and 128 MiB of parse
-capacity per slot. The revalidation and database settings are validated
-for later phases.
+capacity per slot. `ingestion.database.batch_size` caps each checkpoint
+transaction at 32 available results by default (range 1–32). The active
+window can make a batch smaller. Revalidation settings apply in the audit
+phase.
 
 Run `rfc-mcp-docker-sync --check-config` with the HTTPS acquisition overlay
 to report effective configuration, the publication gate, scratch and
 cgroup capacity, and the spool's free bytes and inodes. It performs local
 checks before connecting to PostgreSQL or upstream. Sync uses its startup
-snapshot until restart. [Spool and shadow setup](deployment.md#https-first-phase-2-shadow-runbook)
+snapshot until restart. [Spool and shadow setup](deployment.md#https-first-phase-3-shadow-runbook)
 
 ### Translate v1 settings
 
@@ -85,19 +87,43 @@ invalid inventory, local canonical corruption, and unequal opening and
 ending catalog bytes fail the run.
 
 On a cold run, the two queues request required TXT and RFCXML from HTTPS.
-Warm TXT reuse requires a verified HTTPS observation, a matching canonical
-digest, and compatible size. TXT remains pending audit even when inventory
-metadata matches. A positive RFCXML capture can be reused for up to 24
-hours from its original capture when its catalog and processing versions
-match and its original rehashes and parses successfully. HTTP 404, HTTP
-410, malformed captures, and failed fetches remain separate XML outcomes.
+An existing TXT observation can be reused if it proves capture from the
+official HTTPS URL, the canonical file rehashes correctly, and the mirror
+inventory reports compatible size. The observation keeps its original
+verification method. Newly captured TXT records `https_capture`. Both
+cases produce audit-pending inputs. A successful TXT checkpoint pins
+both the original and its sealed index, even while RFCXML is pending.
+RFCXML is independently classified as captured, reused, 404, 410,
+malformed, retries exhausted, or fetch failed.
 
-The terminal report includes selection and catalog observations, final
-state, staged bytes, queue peaks, and TXT download, seal and reuse counts.
-It separately reports classified RFCXML, TXT audit, and membership counts.
-`acquisition_complete` leaves candidates, source observations, and the
-active pointer untouched. The private run spool is cleaned after the run.
-The deferred and failed states return nonzero from the manual command.
+### Restart durable processing
+
+Run the same reconciliation again after an interruption. Sync matches
+checkpoints by scope, exact catalog selection, source, processing
+versions, and publication sequence. It verifies canonical length and
+BLAKE3 before reusing the original observation and indexes. A missing
+checkpoint object is reacquired. A corrupt object stops the run for repair.
+Restore verified bytes from a matched backup before retrying a canonical
+corruption incident. A changed ending catalog invalidates that selection's
+checkpoints.
+
+The checkpoint cap is 40,000 records and 4 GiB of original bytes counted
+per record. TXT checkpoints expire seven days after first recording.
+Positive RFCXML checkpoints and malformed capture evidence expire
+24 hours after capture. Reuse keeps the original observation and expiry.
+New runs request XML again after 404, 410, malformed content, or fetch
+failure. Expired and evicted artifacts become reclaimable through
+`--phase3-recover` when the incumbent and retained generations have no
+references to them.
+
+The terminal report distinguishes downloaded, reused, sealed and
+audit-pending TXT, classified RFCXML, and joined documents. It includes
+the processing digest, queue and disk peaks, parser CPU time, CAS time,
+and DB transaction counts. `acquisition_complete` means both artifacts
+have terminal results for every selected RFC under the ending catalog
+fence. `txt_audited` and `membership_committed` remain zero. The per-run
+spool is cleaned after success and cooperative shutdown, or swept on the
+next run after a crash. Deferred and failed manual runs return nonzero.
 [Control behavior](control.md#reconciliation-and-publication)
 
 ## Schema 9 release pipeline

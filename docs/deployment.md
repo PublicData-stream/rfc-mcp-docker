@@ -2,13 +2,13 @@
 
 The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It requires a qualified Linux Docker host, an existing HTTPS reverse proxy, and a dedicated Docker ingress network shared with that proxy. Follow the [deployment prerequisites](deployment-prerequisites.md).
 
-## HTTPS-first Phase 2 shadow runbook
+## HTTPS-first Phase 3 shadow runbook
 
 Keep incumbent Serve online with its qualified schema 9 images and mirror.
-Phase 2 acquisition is available for private qualification and a separately
-authorized shadow run. Build or preload the matching Phase 2 Sync and Feed
-images. Use a separate Compose project, private networks and credentials,
-and a matched copy of the schema 9 database and mirror. Follow the
+Phase 3 processing is available for private qualification and a separately
+authorized shadow run. Build or preload matching Phase 3 Serve, Sync, and
+Feed images. Use a separate Compose project, private networks and
+credentials, and a matched copy of the schema 9 database and mirror. Follow the
 [backup and restore procedure](publication.md#backup-and-restore) to make the
 copy. Point the shadow notification channel to a private receiver with its
 own keys, and keep the shadow project off production ingress.
@@ -25,11 +25,17 @@ own keys, and keep the shadow project off production ingress.
    and verify that Sync alone mounts the spool and that Feed has only its
    internal control network. Run the preflight with the actual runtime UID
    and resource limits.
-3. Qualify first against private upstream fixtures. Check
-   `acquisition_complete`, matching catalog observations, pacing, TXT and
-   XML counts, and spool cleanup. Confirm the incumbent sequence and an
-   exact-byte pinned MCP read.
-4. Before any authorized official-source run, agree on sample or full scope,
+3. On the shadow copy, start only PostgreSQL and apply `migrations/migrate.sql`
+   with the owner migration procedure. Confirm schema 10, the incumbent
+   sequence, retained snapshots, readiness, and an exact-byte pinned MCP
+   read using matching schema 10 images. Keep the matched schema 9 backup
+   and images for rollback into fresh volumes.
+4. Qualify first against private sources. Check `acquisition_complete`,
+   matching catalogs, pacing, joined-document counts, and spool cleanup.
+   Repeat the run and verify checkpoint hits with original timestamps.
+   Run `--phase3-recover` when the shadow collector is stopped to reclaim
+   expired and abandoned data.
+5. Before any authorized official-source run, agree on sample or full scope,
    a time limit, and an upstream request cap. Drain incumbent Sync and
    Feed egress and wait out known cooldown before enabling shadow egress.
    Use a one-shot for bounded sample scope. A daemon startup queues a full
