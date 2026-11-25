@@ -21,29 +21,52 @@ phase1, phase2, phase3 = phase6.phase1, phase6.phase2, phase6.phase3
 CONFIG_PATH = "/etc/rfc-mcp/ingestion.toml"
 
 
+class Project(phase6.Project):
+    def prepare_phase6(self, work):
+        super().prepare_phase6(work)
+        self.manual_network = work / "manual-network.yml"
+        self.manual_network.write_text("""services:
+  sync:
+    networks: !override
+      db_write: {}
+      fixture_source: {}
+  serve:
+    networks: !override
+      db_read: {}
+""")
+
+    def app(self, service, *options, **kwargs):
+        command = super().app(service, *options, **kwargs)
+        if service in ("sync", "serve"):
+            index = command.index("-p")
+            return [*command[:index], "-f", str(self.manual_network), *command[index:]]
+        return command
+
+
 def publication_snapshot(project):
     return project.sql("""
         SELECT coalesce(generation_id, -1), publication_sequence,
-            (SELECT count(*) FROM rfc.generations),
+            (SELECT count(*) FROM rfc.generations WHERE state IN ('published','retained')),
             (SELECT count(*) FROM rfc.notification_outbox)
         FROM rfc.active_generation
     """)
 
 
-def manual(project, scope="full", state="acquisition_complete", *, error=None, options=()):
+def manual(project, scope="full", state="ready", *, error=None, options=()):
     command = project.app("sync", "-T", *options, args=("--phase2-reconcile", f"--{scope}"))
     result = subprocess.run(command, env=project.env, text=True, capture_output=True, timeout=115)
-    assert bool(result.returncode) == (state != "acquisition_complete"), result
+    assert bool(result.returncode) == (state != "ready"), result
     report = json.loads(result.stdout)
-    assert report["state"] == state and report["publication_gate"] == "https_txt_audit_pending", report
+    assert report["state"] == state and report["publication_gate"] == "https_txt_audit_required", report
     if error:
         assert error in report["error"], report
-    if state == "acquisition_complete":
+    if state == "ready":
+        assert report["generation_id"] and report["manifest_digest"] and report["promotion_deadline_us"]
         assert report["selection_id"]
         assert report["catalog_before"]["digest"] == report["catalog_after"]["digest"], report
         counts = report["acquisition"]
         assert counts["txt_sealed"] == counts["xml_classified"] == report["expected_txt"], report
-        assert counts["membership_committed"] == counts["txt_audit_pending"] == 0, report
+        assert counts["membership_committed"] == report["expected_txt"] and counts["txt_audit_pending"] == 0, report
         assert counts["documents_joined"] == counts["txt_audited"] == report["expected_txt"], report
         assert report["audit"]["matched"] + report["audit"]["repaired"] == report["expected_txt"], report
         assert counts["processing_digest"], report
@@ -101,13 +124,13 @@ def feed_convergence(project, catalog, initial, config):
         for transport in ("https", "rsync"):
             (project.source / transport / f"rfc{rfc}.txt").write_text("New fixture original\n")
     advance_retry(project, job, 2)
-    after = wait_report(project, state="acquisition_complete", job_id=job, hints_present=2)
-    wait_job(project, job, "acquisition_complete")
+    after = wait_report(project, state="published", job_id=job, hints_present=2)
+    wait_job(project, job, "published")
     traffic = sorted(starts(project, offset), key=lambda event: event[1])
     assert any(path == "/rfcatom.xml" for path, _ in traffic), traffic
     assert all(right[1] - left[1] >= 990_000_000 for left, right in zip(traffic, traffic[1:])), traffic
     mode.write_text("normal")
-    assert after["new_txt"] == before["expected_txt"] + 2
+    assert after["new_txt"] == 2 and after["expected_txt"] == before["expected_txt"] + 2
     epoch = phase6.identity(project)
     payloads = json.loads(project.sql("""
         SELECT json_agg(json_build_object(
@@ -153,7 +176,7 @@ def cancel_inventory(project):
             if proc.poll() is None:
                 subprocess.run([*project.docker, "rm", "--force", name], capture_output=True, timeout=10)
             mode.write_text("normal")
-    assert manual(project)["state"] == "acquisition_complete"
+    assert manual(project)["state"] == "ready"
     print("SIGTERM cancelled the live rsync child and released the corpus fence", flush=True)
 
 
@@ -163,70 +186,6 @@ def canonical_edit(project, digest, data):
         "-ec", 'chmod u+w "$1"; cat > "$1"; chmod a-w "$1"', "sh", path,
     ))
     subprocess.run(command, env=project.env, input=data, check=True, timeout=20)
-
-
-def verify_populated(project, published, sequence, sources, work):
-    before = publication_snapshot(project)
-    count = len(sources)
-    result = manual(project)
-    assert result["local_https_txt_audit_pending"] == count and result["new_txt"] == 0, result
-    assert project.sql(f"""
-        SELECT count(*) FROM rfc.ingestion_checkpoints c
-        JOIN rfc.generation_documents d ON d.generation_id={int(published)} AND d.rfc_id=c.rfc_id
-        WHERE c.scope='full' AND c.kind='txt' AND c.document_version=d.document_version
-    """) == str(count)
-    candidate = project.sql("SELECT id FROM rfc.generations WHERE state='ready'")
-    assert candidate
-    assert_capture_only_gate(project, published)
-    for daemon_fixture in (False, True):
-        options = ("--entrypoint", "/usr/local/bin/rfc-mcp-docker-sync") if not daemon_fixture else ()
-        phase1.failed(project.app("sync", "-T", *options, args=(
-            "--phase3-publish", candidate, "--expect-sequence", str(sequence),
-        )), project.env, "publication is gated")
-    missing = project.source / "rsync" / "rfc101.txt"
-    missing.unlink()
-    manual(project, state="acquisition_failed", error="inventory lost previously accepted RFC 101")
-    missing.write_bytes(sources[101])
-    catalog = project.source / "catalog.xml"
-    original_catalog = catalog.read_text()
-    original_entry = phase2.catalog_entry(101, "Legacy bytes", day="<day>23</day>")
-    assert original_entry in original_catalog
-    catalog.write_text(original_catalog.replace(original_entry, ""))
-    manual(project, state="acquisition_failed", error="catalog lost previously accepted RFC 101")
-    catalog.write_text(original_catalog)
-
-    digest = project.txt_digest(published)
-    assert digest
-    changed = bytes([sources[101][0] ^ 1]) + sources[101][1:]
-    canonical_edit(project, digest, changed)
-    try:
-        manual(project, state="acquisition_failed", error="canonical TXT")
-    finally:
-        canonical_edit(project, digest, sources[101])
-
-    audit = work / "audit"
-    audit.mkdir()
-    (audit / missing.name).write_bytes(sources[101])
-    stamp = missing.stat()
-    os.utime(audit / missing.name, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-    inventory_before = manual(project)["inventory_digest"]
-    missing.write_bytes(changed)
-    os.utime(missing, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-    unchanged_metadata = manual(project, state="acquisition_failed", error="TXT repair exhausted",
-                                options=fast_audit_config(work))
-    assert unchanged_metadata["audit"]["repair_attempts"] == 2, unchanged_metadata
-    assert unchanged_metadata["inventory_digest"] == inventory_before
-    assert unchanged_metadata["inventory_size_changes"] == 0
-    assert unchanged_metadata["local_https_txt_audit_pending"] == count
-    dry_run = project.app("sync", "-T", "-v", f"{audit}:/audit:ro", "--entrypoint", "/usr/bin/rsync",
-                          args=("--dry-run", "--checksum", "--checksum-choice=auto", "--itemize-changes",
-                                "rsync://fixtures:8873/rfc/rfc101.txt", "/audit/"))
-    output = phase1.capture(dry_run, env=project.env)
-    assert output.startswith(">fc") and "rfc101.txt" in output, output
-    assert (audit / missing.name).read_bytes() == sources[101]
-    missing.write_bytes(sources[101])
-    assert publication_snapshot(project) == before
-    print("Incumbent loss, corrupt CAS, promotion gate, and same-size checksum control passed", flush=True)
 
 
 def assert_capture_only_gate(project, generation):
@@ -281,9 +240,11 @@ def checkpoint_rows(project):
 def verify_cas(project, sources):
     entries = project.sql("""
         SELECT c.rfc_id, encode(o.raw_digest,'hex'), o.verification_method, d.encoding, d.sealed
-        FROM rfc.ingestion_checkpoints c JOIN rfc.source_observations o ON o.identity=c.observation
+        FROM rfc.generation_documents c JOIN rfc.source_observations o ON o.identity=c.txt_observation
         JOIN rfc.document_versions d ON d.identity=c.document_version
-        WHERE c.scope='full' AND c.kind='txt' ORDER BY c.rfc_id
+        WHERE c.generation_id=(SELECT max(g.id) FROM rfc.generations g
+            JOIN rfc.generation_ingestion i ON i.generation_id=g.id
+            WHERE i.scope='full' AND g.state IN ('ready','published','retained')) ORDER BY c.rfc_id
     """).splitlines()
     assert len(entries) == len(sources), entries
     for row in entries:
@@ -295,14 +256,16 @@ def verify_cas(project, sources):
 
 
 def checkpoint_restarts(project, sources, fresh):
+    crash_at(project, "before_readiness")
     historical = checkpoint_rows(project)
     warm = manual(project)
     counts = warm["acquisition"]
     assert counts["checkpoint_txt"] == len(sources) and counts["checkpoint_xml"] == 3, warm
     assert warm["metrics"]["https_requests"] == 5, warm
     assert counts["processing_digest"] == fresh["acquisition"]["processing_digest"]
-    assert checkpoint_rows(project) == historical
+    assert historical and not checkpoint_rows(project)
     verify_cas(project, sources)
+    discard_ready(project)
 
     # Run crash injections with one active artifact so the first commit is
     # a TXT checkpoint even when a bodyless XML result could otherwise win.
@@ -332,9 +295,18 @@ parser_workers = 1
                                                 "after_https_catalog_validation")), (boundary, committed)
         resumed = manual(project)
         assert resumed["acquisition"]["processing_digest"] == counts["processing_digest"], resumed
-        for row in committed.splitlines():
-            assert row in checkpoint_rows(project).splitlines(), row
+        assert not checkpoint_rows(project)
+        proofs = project.sql(f"""
+            SELECT rfc_id,'txt',encode(txt_observation,'hex') FROM rfc.generation_documents
+            WHERE generation_id={int(resumed['generation_id'])}
+            UNION ALL SELECT rfc_id,'rfcxml',encode(rfcxml_observation,'hex') FROM rfc.generation_documents
+            WHERE generation_id={int(resumed['generation_id'])} AND rfcxml_observation IS NOT NULL
+        """).splitlines()
+        assert all("|".join(row.split("|")[:3]) in proofs for row in committed.splitlines())
+        if boundary != "after_https_catalog_validation":
+            discard_ready(project)
 
+    crash_at(project, "before_readiness")
     digest = project.sql("""
         SELECT encode(o.raw_digest,'hex') FROM rfc.ingestion_checkpoints c
         JOIN rfc.source_observations o ON o.identity=c.observation
@@ -353,6 +325,7 @@ parser_workers = 1
         canonical_edit(project, digest, sources[100])
 
     project.sql("UPDATE rfc.ingestion_checkpoints SET expires_at=now()-interval '1 second'")
+    discard_ready(project)
     recover(project)
     assert not checkpoint_rows(project)
     assert project.sql("SELECT count(*) FROM rfc.document_versions") == "0"
@@ -368,11 +341,16 @@ def recover(project):
                           timeout=45)
 
 
+def discard_ready(project):
+    for generation in project.sql("SELECT id FROM rfc.generations WHERE state='ready'").splitlines():
+        phase1.capture(project.app("sync", "-T", args=("--phase3-discard", generation)), env=project.env)
+
+
 def acquisition_faults(project, sources, spool):
     mode = project.source / "mode"
     for scenario, state, error in (
-        ("bad-rfcxml", "acquisition_complete", None),
-        ("acquisition-xml-status", "acquisition_complete", None),
+        ("bad-rfcxml", "ready", None),
+        ("acquisition-xml-status", "ready", None),
         ("txt-html", "acquisition_failed", "unexpected HTTPS media type"),
         ("acquisition-oversized", "acquisition_failed", "HTTPS transfer exceeds byte limit"),
         ("acquisition-truncated", "acquisition_failed", "HTTPS transport"),
@@ -383,9 +361,9 @@ def acquisition_faults(project, sources, spool):
         if scenario == "bad-rfcxml":
             assert report["acquisition"]["xml_malformed"] == 1, report
             assert project.sql("""
-                SELECT count(*) FROM rfc.ingestion_checkpoints c
-                JOIN rfc.source_observations o ON o.identity=c.observation
-                WHERE c.evidence_state='malformed' AND o.verification_method='https_capture'
+                SELECT count(*) FROM rfc.generation_source_evidence e
+                JOIN rfc.source_observations o ON o.identity=e.rfcxml_observation
+                WHERE e.rfcxml_outcome='malformed' AND o.verification_method='https_capture'
             """) == "1"
         if scenario == "acquisition-xml-status":
             assert report["acquisition"]["xml_gone"] == 1, report
@@ -533,7 +511,7 @@ def restart_cooldown(project, spool):
                 mode.write_text("acquisition-restart")
                 if proc.poll() is None:
                     subprocess.run([*project.docker, "rm", "--force", name], capture_output=True, timeout=10)
-        assert manual(project)["state"] == "acquisition_complete"
+        assert manual(project)["state"] == "ready"
         current = starts(project, offset)
         retry_start = next(stamp for path, stamp in current if path == "/rfc/rfc100.txt")
         resumed = next(stamp for path, stamp in current if path == "/rfc-index.xml" and stamp > retry_start)
@@ -612,6 +590,7 @@ def exercise_audit(project, work, sources, fresh, audit):
     assert fresh["metrics"]["rsync_transferred_files"] == 0
     assert fresh["metrics"]["rsync_transferred_payload_bytes"] == 0
     verify_cas(project, sources)
+    publication_command(project, fresh)
     fast = fast_audit_config(work)
     one = fast_audit_config(work, batch_size=1)
     mode = project.source / "mode"
@@ -773,7 +752,187 @@ def exercise_audit(project, work, sources, fresh, audit):
           "and quarantine bounds passed", flush=True)
 
 
-def exercise(project, work, spool, audit, incumbent_only, old_driver=None, scheduler_only=False, audit_only=False):
+def publication_command(project, report, *, sequence=None, rollback=False, error=None, crash=None):
+    expected = report["expected_publication_sequence"] if sequence is None else sequence
+    operation = "rollback" if rollback else "publish"
+    options = ("-e", f"RFC_PHASE3_CRASH={crash}") if crash else ()
+    args = (f"--phase3-{operation}", report["generation_id"], "--expect-sequence", str(expected))
+    result = subprocess.run(project.app("sync", "-T", *options, args=args), env=project.env,
+                            text=True, capture_output=True, timeout=60)
+    if crash:
+        assert result.returncode == 86 and f"crash at {crash}" in result.stderr, result
+    elif error:
+        assert result.returncode and error in result.stderr, result
+    else:
+        assert result.returncode == 0, result
+        value = json.loads(result.stdout)
+        assert value["publication_sequence"] == str(expected + 1), value
+        return value
+
+
+def database_publication_guards(project, generation):
+    cases = (
+        (f"DELETE FROM rfc.generation_source_evidence WHERE generation_id={generation} AND rfc_id=100",
+         "candidate membership and audit must equal the sealed selection"),
+        (f"UPDATE rfc.generation_source_evidence SET txt_observation=(SELECT txt_observation "
+         f"FROM rfc.generation_documents WHERE generation_id={generation} AND rfc_id=101) "
+         f"WHERE generation_id={generation} AND rfc_id=100", "candidate contains ineligible source evidence"),
+        (f"UPDATE rfc.generation_audit SET started_us=1, expires_us=2 WHERE generation_id={generation}",
+         "candidate audit cycle expired"),
+        (f"UPDATE rfc.generation_audit SET expected_sequence=1 WHERE generation_id={generation}",
+         "candidate publication sequence changed"),
+    )
+    for mutation, message in cases:
+        query = (f"BEGIN; SELECT pg_advisory_xact_lock(-1); {mutation}; SET LOCAL ROLE rfc_sync; "
+                 f"SELECT rfc.promote_generation({generation}, 0, false); ROLLBACK")
+        phase1.failed([*project.psql(), "-c", query], project.env, message)
+        assert project.publication() == 0
+    phase1.failed([*project.psql(), "-c", f"UPDATE rfc.generation_source_evidence "
+                   f"SET selection=decode(repeat('a1',32),'hex') WHERE generation_id={generation}"],
+                  project.env, "23503")
+
+
+def load_mcp_schemas(client):
+    tools = client.rpc("tools/list")[0]["tools"]
+    client.schemas = {tool["name"]: phase6.phase5.Draft202012Validator(tool["outputSchema"]) for tool in tools}
+
+
+def publication_contract(project, client, sources, first):
+    initial = publication_snapshot(project)
+    assert initial == "-1|0|0|0", initial
+    generation = int(first["generation_id"])
+    assert project.sql(f"SELECT state,manifest_format FROM rfc.generations WHERE id={generation}") == "ready|3"
+    assert project.sql(f"""
+        SELECT count(*), count(DISTINCT receipt), count(DISTINCT algorithm),
+               bool_and(method='rsync_checksum_match' AND rfcxml_audit='audit_not_applicable')
+        FROM rfc.generation_source_evidence WHERE generation_id={generation}
+    """) == f"{len(sources)}|1|1|t"
+    assert not checkpoint_rows(project)
+    assert_capture_only_gate(project, generation)
+    database_publication_guards(project, generation)
+    project.denied_sql(f"UPDATE rfc.generation_source_evidence SET receipt=txt_digest WHERE generation_id={generation}",
+                       phase1.SYNC)
+    project.denied_sql(f"DELETE FROM rfc.generation_audit WHERE generation_id={generation}", phase1.SYNC)
+    sample = manual(project, scope="sample")
+    publication_command(project, sample, error="not eligible")
+    project.maintain("discard", sample["generation_id"])
+    assert project.sql("SELECT count(*) FROM rfc.generation_source_evidence "
+                       f"WHERE generation_id={int(sample['generation_id'])}") == "0"
+    verify_cas(project, sources)
+    publication_command(project, first, crash="before_publication_commit")
+    assert publication_snapshot(project) == initial
+    with phase3.paused(project, "sync", "before_promotion", "publish", first["generation_id"], 0,
+                       timeout=35) as publisher:
+        publication_command(project, first, error="corpus lock")
+        output, error = phase3.release(publisher)
+        assert publisher.returncode == 0 and output.strip() == "1", (output, error)
+    phase6.wait(lambda: project.admin("/ready").returncode == 0)
+    load_mcp_schemas(client)
+    document = client.call("get", id=2119)[0]
+    assert phase6.phase5.bytes_from(document["original"]) == sources[2119]
+    assert document["original"]["source_verification"]["method"] == "rsync_checksum_match", document
+    assert client.call("table", id=2119)[0]["source_verification"] == document["original"]["source_verification"]
+    assert client.call("list", limit=1)[0]["items"][0]["source_verification"]["method"] == "rsync_checksum_match"
+    hits = client.call("search", query='in::title:"RFC 2119"')[0]["hits"]
+    assert hits[0]["source_verification"]["method"] == "rsync_checksum_match", hits
+    publication_command(project, first, sequence=1, error="not eligible")
+    assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "1"
+
+    changed = bytes([sources[100][0] ^ 1]) + sources[100][1:]
+    for transport in ("https", "rsync"):
+        (project.source / transport / "rfc100.txt").write_bytes(changed)
+    crash_at(project, "after_rsync_repair_pair")
+    repair = manual(project)
+    assert repair["audit"]["repaired"] == 1 and repair["audit"]["repair_attempts"] == 0, repair
+    repaired_id = int(repair["generation_id"])
+    assert project.sql(f"""
+        SELECT e.method, o.raw_digest=e.txt_digest, o.https_verification
+        FROM rfc.generation_source_evidence e JOIN rfc.source_observations o ON o.identity=e.rsync_observation
+        WHERE e.generation_id={repaired_id} AND e.rfc_id=100
+    """) == "dual_source_byte_match|t|unverified"
+    assert project.sql(f"SELECT count(*) FROM rfc.generation_source_evidence WHERE generation_id={repaired_id}") == str(len(sources))
+    assert project.publication() == 1
+    publication_command(project, repair, crash="after_publication_commit")
+    assert project.publication() == 2
+    assert project.sql("SELECT count(*) FROM rfc.notification_outbox") == "2"
+    publication_command(project, first, sequence=2, rollback=True)
+    assert project.publication() == 3
+    assert project.admin("/ready").returncode == 0
+    recover(project)
+    assert project.sql(f"""
+        SELECT count(*) FROM rfc.generation_source_evidence e JOIN rfc.source_observations o ON o.identity=e.rsync_observation
+        WHERE e.generation_id={repaired_id} AND e.rfc_id=100
+    """) == "1"
+
+    project.restart_sync(crash="after_readiness", PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782")
+    project.wait_crash("after_readiness")
+    assert project.publication() == 3
+    ready = project.sql("SELECT generation_id FROM rfc.sync_jobs WHERE state='running'")
+    assert ready and project.state(ready) == "ready"
+    project.restart_sync(PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782")
+    report = wait_report(project, state="published", generation_id=ready)
+    wait_job(project, report["job_id"], "published")
+    assert project.publication() == 4
+    phase6.wait(lambda: project.sql("SELECT delivery_state FROM rfc.notification_outbox WHERE publication_sequence=4") == "delivered")
+    assert project.sql("SELECT count(*) FROM rfc.notification_outbox WHERE publication_sequence=4") == "1"
+    print("Manual publication, repaired proof, MCP verification, rollback and daemon restart passed", flush=True)
+
+
+def upgrade_publication(project, old_driver, sources):
+    current = project.env["PHASE2_DRIVER"]
+    overlay = project.ingestion_overlay
+    del project.ingestion_overlay
+    project.env["PHASE2_DRIVER"] = str(old_driver)
+    with phase2.capped_stage(project, label="schema10-bootstrap") as stage:
+        old_options = phase2.bulk_options(project, stage, bootstrap=True)
+        command = project.app("sync", "-T", *old_options, "-e", "RFC_SYNC_CONFIG_FILE=/phase2/bulk.toml",
+                              "--entrypoint", "/phase2/fixture-driver", args=("full",))
+        def legacy_full():
+            return int(json.loads(phase1.capture(command, env=project.env, timeout=100))["generation_id"])
+        first = legacy_full()
+        project.activate(first, 0)
+        mode = project.source / "mode"
+        mode.write_text("bad-rfcxml")
+        incumbent = legacy_full()
+        project.activate(incumbent, 1)
+        legacy_ready = legacy_full()
+        mode.write_text("normal")
+    assert project.sql(f"""
+        SELECT count(*) FROM rfc.generation_documents d JOIN rfc.source_observations o ON o.identity=d.txt_observation
+        WHERE d.generation_id={incumbent} AND o.verification_method='rsync_integrity'
+    """) == str(len(sources))
+    before = history(project)
+    project.env["PHASE2_DRIVER"] = current
+    project.ingestion_overlay = overlay
+    project.migrate()
+    project.migrate()
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "11"
+    assert history(project) == before
+    client = project.start_mcp()
+    phase6.wait(lambda: project.admin("/ready").returncode == 0)
+    load_mcp_schemas(client)
+    document = client.call("get", id=2119)[0]
+    assert phase6.phase5.bytes_from(document["original"]) == sources[2119]
+    assert document["original"]["source_verification"] == {"method": "rsync_integrity"}
+    assert project.read(first)["generation"] == first
+    publication_command(project, {"generation_id": str(legacy_ready), "expected_publication_sequence": 2},
+                        error="lacks HTTPS-first audit evidence")
+    replacement = manual(project)
+    counts = replacement["acquisition"]
+    assert counts["txt_downloaded"] == counts["txt_audited"] == len(sources), replacement
+    assert project.sql(f"SELECT rfcxml_outcome FROM rfc.generation_source_evidence "
+                       f"WHERE generation_id={int(replacement['generation_id'])} AND rfc_id=8174") == "captured"
+    publication_command(project, replacement)
+    document = client.call("get", id=2119)[0]
+    assert phase6.phase5.bytes_from(document["original"]) == sources[2119]
+    assert document["original"]["source_verification"]["method"] == "rsync_checksum_match"
+    publication_command(project, {"generation_id": str(first), "expected_publication_sequence": 3}, rollback=True)
+    assert client.call("get", id=2119)[0]["original"]["source_verification"] == {"method": "rsync_integrity"}
+    print("Populated schema 10 upgraded twice and retained byte-exact rollback with original proof", flush=True)
+
+
+def exercise(project, work, spool, audit, incumbent_only, old_driver=None, scheduler_only=False, audit_only=False,
+             publication_only=False, upgrade=False):
     sources = phase2.prepare(project, include_nul=True)
     original = project.source / "catalog.xml"
     initial = original.read_text()
@@ -781,7 +940,7 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
     (project.source / "feed-mode").write_text("normal")
     project.start()
     if old_driver:
-        phase2.migrate_to_historical_schema(project, 9)
+        phase2.migrate_to_historical_schema(project, 10 if upgrade else 9)
     else:
         project.migrate()
     project.run("up", "-d", "--wait", "fixtures", "control-probe", timeout=35)
@@ -801,8 +960,11 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
         "feed": {"environment": {"RFC_DISCOVERY_FIXTURES": "1"}},
     }}))
     project.ingestion_overlay = overlay
+    if old_driver:
+        upgrade_publication(project, old_driver, sources)
+        return
     if incumbent_only:
-        exercise_incumbent(project, work, overlay, sources, client, old_driver)
+        exercise_incumbent(project, sources, client)
         return
     empty = publication_snapshot(project)
     assert empty == "-1|0|0|0"
@@ -819,6 +981,9 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
           f"with a {fresh['audit']['snapshot_peak_bytes']}-byte snapshot.", flush=True)
     if audit_only:
         exercise_audit(project, work, sources, fresh, audit)
+        return
+    if publication_only:
+        publication_contract(project, client, sources, fresh)
         return
     if not scheduler_only:
         checkpoint_restarts(project, sources, fresh)
@@ -882,80 +1047,62 @@ parse_budget_bytes = 134217728
         (project.source / "mode").write_text("normal")
 
     daemon = operator_runs(project)
-    wait_job(project, daemon["job_id"], "acquisition_complete")
+    wait_job(project, daemon["job_id"], "published")
     assert daemon["selection_id"] == fresh["selection_id"], (daemon, fresh)
     assert daemon["metrics"]["minimum_start_spacing_us"] >= 1_000_000
-    assert publication_snapshot(project) == empty
+    assert daemon["state"] == "published" and project.publication() == 1
     feed_convergence(project, original, initial, config)
-    assert publication_snapshot(project) == empty
+    assert project.publication() == 2
 
-    exercise_incumbent(project, work, overlay, sources, client)
     print(f"Cold minimum start spacing {fresh['metrics']['minimum_start_spacing_us']} us", flush=True)
 
 
-def exercise_incumbent(project, work, overlay, sources, client, old_driver=None):
-    # Seed historical evidence via the private legacy fixture binary.
-    del project.ingestion_overlay
-    driver = project.env["PHASE2_DRIVER"]
-    if old_driver:
-        project.env["PHASE2_DRIVER"] = str(old_driver)
-    def legacy_candidate():
-        return int(json.loads(project.invoke("sync", "full").splitlines()[-1])["generation_id"])
-
-    previous = legacy_candidate()
-    project.activate(previous, 0)
-    published = legacy_candidate()
-    project.activate(published, 1)
-    legacy_candidate()
-    project.sql("UPDATE rfc.notification_outbox SET delivery_state = 'delivered', delivered_at = now()")
-    if old_driver:
-        before = history(project)
-        project.env["PHASE2_DRIVER"] = driver
-        project.migrate()
-        project.migrate()
-        assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "10"
-        assert history(project) == before
-        client = project.start_mcp()
-        print("Populated schema 9 upgraded twice with exact historical evidence and manifests", flush=True)
+def exercise_incumbent(project, sources, client):
+    first = manual(project)
+    publication_command(project, first)
+    second = manual(project)
+    publication_command(project, second)
     phase6.wait(lambda: project.admin("/ready").returncode == 0)
-    client.schemas = {"get": phase6.phase5.Draft202012Validator(next(
-        tool["outputSchema"] for tool in client.rpc("tools/list")[0]["tools"] if tool["name"] == "get"
-    ))}
-    document = client.call("get", id=2119)[0]
-    assert document["publication_sequence"] == "2"
-    assert phase6.phase5.bytes_from(document["original"]) == sources[2119]
-    project.ingestion_overlay = overlay
-    populated = publication_snapshot(project)
-    verify_populated(project, published, 2, sources, work)
+    load_mcp_schemas(client)
+    prior = publication_snapshot(project)
+
+    missing = project.source / "rsync/rfc101.txt"
+    missing.unlink()
+    manual(project, state="acquisition_failed", error="inventory lost previously accepted RFC 101")
+    missing.write_bytes(sources[101])
+    catalog = project.source / "catalog.xml"
+    original = catalog.read_text()
+    catalog.write_text(original.replace(phase2.catalog_entry(101, "Legacy bytes", day="<day>23</day>"), ""))
+    manual(project, state="acquisition_failed", error="catalog lost previously accepted RFC 101")
+    catalog.write_text(original)
+    digest = project.txt_digest(second["generation_id"])
+    original_txt = sources[101]
+    canonical_edit(project, digest, bytes([original_txt[0] ^ 1]) + original_txt[1:])
+    try:
+        manual(project, state="acquisition_failed", error="canonical TXT")
+    finally:
+        canonical_edit(project, digest, original_txt)
+    assert publication_snapshot(project) == prior
+    assert phase6.phase5.bytes_from(client.call("get", id=2119)[0]["original"]) == sources[2119]
+
     mode = project.source / "mode"
     mode.write_text("acquisition-hourly")
     offset = len(project.capture("logs", "--no-log-prefix", "fixtures").splitlines())
     project.restart_sync(PHASE6_NOTIFY_TARGET=f"{project.net}.34:8782", PHASE6_HOURLY="12")
-    warm = wait_report(project, state="acquisition_complete", publication_sequence=2)
-    wait_job(project, warm["job_id"], "acquisition_complete")
-    assert warm["local_https_txt_audit_pending"] == len(sources)
+    warm = wait_report(project, state="published", publication_sequence=2)
+    wait_job(project, warm["job_id"], "published")
     assert warm["acquisition"]["txt_downloaded"] == 0
     assert warm["acquisition"]["txt_reused"] == len(sources)
     assert warm["acquisition"]["xml_reused"] > 0, warm
     assert project.admin("/ready").returncode == 0
-    final = client.call("get", id=2119)[0]
-    assert final["publication_sequence"] == "2"
-    assert phase6.phase5.bytes_from(final["original"]) == sources[2119]
-    assert publication_snapshot(project) == populated
     phase6.wait(lambda: sum(path == "/rfc-index.xml" for path, _ in starts(project, offset)) >= 3)
     assert project.sql("SELECT count(*) FROM rfc.sync_jobs WHERE state IN ('pending','running')") == "0"
-    mode.write_text("normal")
     project.run("stop", "sync")
-    rollback = phase1.capture(project.app(
-        "sync", "-T", "--entrypoint", "/usr/local/bin/rfc-mcp-docker-sync",
-        args=("--phase3-rollback", str(previous), "--expect-sequence", "2"),
-    ), env=project.env)
-    assert json.loads(rollback)["publication_sequence"] == "3"
+    publication_command(project, first, sequence=3, rollback=True)
     final = client.call("get", id=2119)[0]
-    assert final["publication_sequence"] == "3" and final["generation_id"] == str(previous)
+    assert final["publication_sequence"] == "4" and final["generation_id"] == first["generation_id"]
     assert phase6.phase5.bytes_from(final["original"]) == sources[2119]
-    print(f"Warm acquisition, idle catalog check, and retained rollback passed. "
-          f"Warm minimum start spacing {warm['metrics']['minimum_start_spacing_us']} us", flush=True)
+    print("Warm acquisition, idle catalog check, incumbent failure handling and retained rollback passed", flush=True)
 
 
 def main():
@@ -966,12 +1113,15 @@ def main():
     parser.add_argument("--image-prefix", required=True)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--audit-only", action="store_true", help="exercise audit and exact-byte repair")
+    modes.add_argument("--publication-only", action="store_true", help="exercise audited publication and recovery")
     modes.add_argument("--incumbent-only", action="store_true",
                        help="repeat warm reuse, the idle catalog check and retained rollback")
     modes.add_argument("--scheduler-only", action="store_true",
                        help="repeat checkpoint backpressure, pacing and daemon routing")
     modes.add_argument("--upgrade-from-schema9", metavar="SCHEMA9_IMAGE_PREFIX",
                        help="seed a populated schema 9 store before running incumbent checks")
+    modes.add_argument("--upgrade-from-schema10", metavar="SCHEMA10_IMAGE_PREFIX",
+                       help="qualify a populated schema 10 to 11 upgrade")
     args = parser.parse_args()
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-https-discovery-", dir="/tmp") as directory:
@@ -979,17 +1129,20 @@ def main():
         driver = work / "publication-driver"
         phase3.fixture_driver(docker, args.image_prefix, driver)
         old_driver = None
-        if args.upgrade_from_schema9:
-            old_driver = work / "publication-driver-schema9"
-            phase3.fixture_driver(docker, args.upgrade_from_schema9, old_driver)
+        old_prefix = args.upgrade_from_schema10 or args.upgrade_from_schema9
+        if old_prefix:
+            old_driver = work / "publication-driver-historical"
+            phase3.fixture_driver(docker, old_prefix, old_driver)
         phase6.fixture_binaries(docker, args.image_prefix, work)
-        project = phase6.Project(work / work.name.lower(), driver, args.image_prefix, docker)
+        project = Project(work / work.name.lower(), driver, args.image_prefix, docker)
+        project.external_ingestion = True
         project.prepare_phase6(work)
         with (phase2.capped_stage(project, mebibytes=5120, inodes=65536) as spool,
               phase2.capped_stage(project, mebibytes=1024, inodes=4096, label="audit") as audit):
             try:
                 exercise(project, work, spool, audit, args.incumbent_only or bool(old_driver), old_driver,
-                         scheduler_only=args.scheduler_only, audit_only=args.audit_only)
+                         scheduler_only=args.scheduler_only, audit_only=args.audit_only,
+                         publication_only=args.publication_only, upgrade=bool(args.upgrade_from_schema10))
             except Exception:
                 project.run("logs", "--no-color", "--tail", "15", "sync", "fixtures", "feed")
                 raise

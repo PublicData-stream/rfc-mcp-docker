@@ -29,6 +29,7 @@ enum Event {
         input: Input,
         repair: Box<Repair>,
     },
+    Prepared(i64),
     Complete,
 }
 
@@ -37,6 +38,7 @@ pub(super) struct Journal {
     path: PathBuf,
     pub started_us: i64,
     pub states: BTreeMap<u32, State>,
+    pub prepared: Option<i64>,
     complete: bool,
 }
 
@@ -61,6 +63,7 @@ impl Journal {
             path,
             started_us: now,
             states: BTreeMap::new(),
+            prepared: None,
             complete: false,
         };
         journal.append(&Event::Begin {
@@ -101,6 +104,7 @@ impl Journal {
             path: path.to_owned(),
             started_us,
             states: BTreeMap::new(),
+            prepared: None,
             complete: false,
         };
         loop {
@@ -145,10 +149,10 @@ impl Journal {
         }
         match event {
             Event::Begin { .. } => return Err("duplicate audit cycle header".into()),
-            Event::Batch { results, .. } => {
+            Event::Batch { results, session } => {
                 for (input, matched) in results {
                     let state = if matched {
-                        State::Matched(input)
+                        State::Matched(input, session.clone())
                     } else {
                         State::Repair(input, Box::default())
                     };
@@ -158,6 +162,7 @@ impl Journal {
             Event::Repair { input, repair } => {
                 self.states.insert(input.rfc, State::Repair(input, repair));
             }
+            Event::Prepared(generation) => self.prepared = Some(generation),
             Event::Complete => self.complete = true,
         }
         Ok(())
@@ -181,6 +186,12 @@ impl Journal {
     pub fn complete(&mut self) -> Result<()> {
         self.append(&Event::Complete)?;
         self.apply(Event::Complete)
+    }
+
+    pub fn prepare(&mut self, generation: i64) -> Result<()> {
+        let event = Event::Prepared(generation);
+        self.append(&event)?;
+        self.apply(event)
     }
 
     pub fn invalidate(self) -> Result<()> {

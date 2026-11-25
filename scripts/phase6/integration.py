@@ -13,7 +13,6 @@ import secrets
 import select
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 
@@ -618,26 +617,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", default="rfc-phase6-final")
-    parser.add_argument("--bulk-bootstrap", action="store_true")
+    parser.add_argument("--bulk-bootstrap", action="store_true", help="run the pinned schema 10 bootstrap fixture")
     args = parser.parse_args()
-    docker = ["docker", "--context", args.context]
-    with tempfile.TemporaryDirectory(prefix="rfc-phase6-", dir="/tmp") as directory:
-        work = Path(directory)
-        driver = work / "publication-driver"
-        phase3.fixture_driver(docker, args.image_prefix, driver)
-        fixture_binaries(docker, args.image_prefix, work)
-        project = Project(work / work.name, driver, args.image_prefix, docker)
-        try:
-            project.prepare_phase6(work)
-            if args.bulk_bootstrap:
-                exercise_bulk_bootstrap(project)
-            else:
-                exercise(project)
-        except Exception:
-            project.run("logs", "--no-color", "--tail", "25")
-            raise
-        finally:
-            project.close()
+    options = ["--context", args.context, "--image-prefix", args.image_prefix]
+    if args.bulk_bootstrap:
+        spec = importlib.util.spec_from_file_location("e2e", HERE.parent / "ci/docker-e2e.py")
+        e2e = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(e2e)
+        with e2e.historical_checkout() as checkout:
+            historical = checkout / "scripts/phase6/integration.py"
+            subprocess.run([sys.executable, "-B", str(historical), *options, "--bulk-bootstrap"], check=True)
+    else:
+        scheduler = HERE.parent / "https-discovery/integration.py"
+        subprocess.run([sys.executable, "-B", str(scheduler), *options, "--scheduler-only"], check=True)
 
 
 if __name__ == "__main__":

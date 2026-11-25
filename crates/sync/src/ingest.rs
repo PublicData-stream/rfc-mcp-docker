@@ -172,17 +172,6 @@ pub async fn reconcile_fixture(scope: Scope) -> Result<()> {
     .await
 }
 
-/// Only the disposable fixture driver passes synthetic review receipts.
-#[cfg(feature = "phase3-fixtures")]
-pub async fn reconcile_fixture_with_reviews(scope: Scope, reviews: &str) -> Result<()> {
-    execute(
-        Upstream::fixture(SyncConfig::load()?),
-        serde_json::from_str(reviews).map_err(Into::into),
-        scope,
-    )
-    .await
-}
-
 async fn execute(
     upstream: Result<Upstream>,
     registry: Result<Registry>,

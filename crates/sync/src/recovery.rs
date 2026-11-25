@@ -66,7 +66,6 @@ pub async fn maintain(operation: Maintenance) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "phase2-fixtures")]
 pub(crate) async fn recover_before_ingestion(
     writer: &mut Writer,
     mirror: &BlobWriter,

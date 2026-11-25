@@ -100,6 +100,16 @@ source pairs. Receipt validation and successful repair feed the existing
 coordinator and its ending catalog fence. The database publication proof
 contract follows in Phase 5.
 
+## Phase 5 rollout
+
+Apply schema 11 on a matched shadow copy. Audit receipts and terminal RFCXML
+outcomes become part of the immutable manifest. Readiness and promotion
+enforce the sealed selection, expected sequence, and deadline. The daemon
+promotes its own full candidates and completes the associated job and hints
+with the pointer and outbox event. Manual reconciliation prepares a candidate
+for explicit promotion. Historical manifests and retained rollback preserve
+the original evidence. [Phase 5 shadow runbook](../deployment.md#https-first-phase-5-shadow-runbook)
+
 ## Cold-start timing
 
 Keep the [cold-start timing contract](0009-cold-rfc-bootstrap.md#timing-contract)

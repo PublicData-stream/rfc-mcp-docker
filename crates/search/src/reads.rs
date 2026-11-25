@@ -10,7 +10,7 @@ use crate::{
     Search, SearchError,
     cursor::{CursorKey, MAX_AGE_SECONDS, validate_context},
     engine::{repository_error, unix_time},
-    snippets::{self, MAX_SOURCE_BYTES, Source},
+    snippets::{self, MAX_SOURCE_BYTES, Source, SourceVerification},
 };
 
 const DEFAULT_LIMIT: i32 = 20;
@@ -20,9 +20,11 @@ const MAX_SECTION_ID: usize = 256;
 const MAX_HEADING: usize = 4096;
 const DOCUMENT: &str = "SELECT m.rfc_id::integer,m.title,m.stream,d.txt_digest::bytea,
     d.byte_length::bigint,d.encoding,d.notice_policy,d.notice_state::text,
-    o.source_url,d.identity::bytea,coalesce(d.section_state::text,'unavailable')
+    o.source_url,d.identity::bytea,coalesce(d.section_state::text,'unavailable'),
+    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm
     FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity=m.document_version
     JOIN rfc.source_observations o ON o.identity=m.txt_observation
+    LEFT JOIN rfc.generation_source_evidence p ON (p.generation_id,p.rfc_id) = (m.generation_id,m.rfc_id)
     WHERE m.generation_id=$1 AND m.rfc_id=$2::integer";
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
@@ -302,20 +304,28 @@ impl Search {
                 "SELECT jsonb_array_length(catalog_only) FROM rfc.generation_ingestion WHERE generation_id=$1",
                 &[&generation],
             ).await?.map(|row| row.get(0));
-            let sql = format!("SELECT m.rfc_id::integer,m.title,m.stream,m.current_status,o.source_url,d.txt_digest::bytea
+            let sql = format!("SELECT m.rfc_id::integer,m.title,m.stream,m.current_status,o.source_url,d.txt_digest::bytea,
+                coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm
                 FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity=m.document_version
                 JOIN rfc.source_observations o ON o.identity=m.txt_observation
+                LEFT JOIN LATERAL (
+                    SELECT method, algorithm FROM rfc.generation_source_evidence p
+                    WHERE (p.generation_id,p.rfc_id) = (m.generation_id,m.rfc_id) LIMIT 1
+                ) p ON true
                 WHERE m.generation_id=$1 AND m.rfc_id {operator} $2::bigint
                 ORDER BY m.rfc_id {ordering} LIMIT $3");
             let rows = tx.query(&sql, &[&generation, &after, &(limit + 1)]).await?;
             let entries = rows.iter().map(|row| {
                 let id: i32 = row.get(0);
                 let digest = BlobDigest::from_bytes(row.get::<_, &[u8]>(5).try_into().map_err(|_| SearchError::Unavailable)?);
-                Ok((i64::from(id), json!({
+                let mut item = json!({
                     "id": id, "title": row.get::<_, &str>(1), "stream": row.get::<_, Option<&str>>(2),
                     "status": row.get::<_, Option<&str>>(3), "source_url": row.get::<_, &str>(4),
                     "digest": digest.to_string(),
-                })))
+                });
+                let verification = SourceVerification::read(row, "verification_method", "verification_algorithm")?;
+                SourceVerification::add(&mut item, verification.as_ref());
+                Ok((i64::from(id), item))
             }).collect::<Result<Vec<_>, SearchError>>()?;
             Ok(build_items(guard, &context, ItemPage {
                 args: &args, limit, entries, field: "items", coverage: json!({"catalog_only":count}),
@@ -357,13 +367,16 @@ impl Search {
                 original = Some(bytes);
             }
             let entries = rows.iter().map(|row| table_entry(row, original.as_deref(), group.as_ref().map(|g| g.id.as_str()))).collect();
+            let headings_included = group.is_some();
+            let mut extra = json!({
+                "id":request.id, "source_url":source.url, "digest":source.digest.to_string(),
+                "notice_groups":group.into_iter().collect::<Vec<_>>(),
+            });
+            SourceVerification::add(&mut extra, source.verification.as_ref());
             Ok(build_items(guard, &context, ItemPage {
                 args: &args, limit, entries, field: "sections",
-                coverage: json!({"section_state":state, "headings_included":group.is_some()}),
-                extra: json!({
-                    "id":request.id, "source_url":source.url, "digest":source.digest.to_string(),
-                    "notice_groups":group.into_iter().collect::<Vec<_>>(),
-                }),
+                coverage: json!({"section_state":state, "headings_included":headings_included}),
+                extra,
             }, &fits)?)
         }).await
     }
@@ -517,6 +530,7 @@ impl Search {
                     ))?;
                     original["rfc_id"] = json!(request.id);
                     original["source_url"] = json!(source.url);
+                    SourceVerification::add(&mut original, source.verification.as_ref());
                     original["digest"] = json!(source.digest.to_string());
                     original["encoding"] = json!(if scope.format == Format::Base64 {
                         "base64"

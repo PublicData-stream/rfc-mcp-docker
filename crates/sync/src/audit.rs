@@ -191,23 +191,23 @@ impl Input {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct BatchReceipt {
-    id: String,
-    started_us: i64,
-    observed_us: i64,
-    checksum_choice: String,
-    algorithm: Option<String>,
+pub(crate) struct BatchReceipt {
+    pub id: String,
+    pub started_us: i64,
+    pub observed_us: i64,
+    pub checksum_choice: String,
+    pub algorithm: Option<String>,
     module: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct Equal {
-    original: Original,
+pub(crate) struct Equal {
+    pub original: Original,
     https_url: String,
-    rsync_observed_us: i64,
+    pub rsync_observed_us: i64,
     rsync_url: String,
-    rsync_digest: String,
-    rsync_length: u64,
+    pub rsync_digest: String,
+    pub rsync_length: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -228,14 +228,14 @@ struct Repair {
 }
 
 enum State {
-    Matched(Input),
+    Matched(Input, BatchReceipt),
     Repair(Input, Box<Repair>),
 }
 
 impl State {
     fn rfc(&self) -> u32 {
         match self {
-            Self::Matched(input) | Self::Repair(input, _) => input.rfc,
+            Self::Matched(input, _) | Self::Repair(input, _) => input.rfc,
         }
     }
 }
@@ -269,13 +269,41 @@ impl Report {
     }
 }
 
-pub(crate) struct Completion(Journal, Instant);
+pub(crate) enum Proof<'a> {
+    Checksum(&'a BatchReceipt),
+    Repair(&'a Equal),
+}
+
+pub(crate) struct Completion(Journal, Instant, i64);
 
 impl Completion {
-    pub fn commit(mut self) -> Result<()> {
-        if Instant::now() >= self.1 {
-            return Err("audit receipts expired before the catalog fence".into());
+    pub fn window(&self) -> (i64, i64) {
+        (self.0.started_us, self.2)
+    }
+
+    pub fn proof(&self, input: &Input) -> Result<Proof<'_>> {
+        match self.0.states.get(&input.rfc) {
+            Some(State::Matched(saved, receipt)) if saved == input => Ok(Proof::Checksum(receipt)),
+            Some(State::Repair(_, repair)) if repair.sealed.as_ref() == Some(input) => {
+                Ok(Proof::Repair(
+                    repair
+                        .equal
+                        .as_ref()
+                        .ok_or("sealed audit repair has no proof")?,
+                ))
+            }
+            _ => Err("audit proof does not bind the selected HTTPS original".into()),
         }
+    }
+
+    pub fn prepare(&mut self, generation: i64) -> Result<()> {
+        if Instant::now() >= self.1 {
+            return Err("audit receipts expired before candidate readiness".into());
+        }
+        self.0.prepare(generation)
+    }
+
+    pub fn commit(mut self) -> Result<()> {
         self.0.complete()
     }
 
@@ -291,10 +319,16 @@ pub(crate) struct Audit {
     deadline: Instant,
     options: Revalidation,
     report: Report,
+    expires_us: i64,
 }
 
 impl Audit {
-    pub fn open(scope: &str, key: &str, config: &Revalidation) -> Result<Self> {
+    pub async fn open(
+        scope: &str,
+        key: &str,
+        config: &Revalidation,
+        writer: &crate::Writer,
+    ) -> Result<Self> {
         let volume = Path::new(ROOT);
         let root = volume.join(scope);
         let quarantine = volume.join("quarantine");
@@ -305,7 +339,16 @@ impl Audit {
         remove_directory(&root.join("snapshot"))?;
         let now = now_us()?;
         let lifetime_us = i64::try_from(config.interval_seconds * 1_000_000)?;
-        let journal = Journal::open(&root, key, now, lifetime_us)?;
+        let mut journal = Journal::open(&root, key, now, lifetime_us)?;
+        if let Some(generation) = journal.prepared
+            && writer.client.query_one(
+                "SELECT EXISTS (SELECT FROM rfc.generations WHERE id = $1 AND manifest_format = 3)",
+                &[&generation],
+            ).await?.try_get::<_, bool>(0)?
+        {
+            journal.invalidate()?;
+            journal = Journal::open(&root, key, now, lifetime_us)?;
+        }
         for entry in fs::read_dir(&root)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -320,8 +363,8 @@ impl Audit {
                 }
             }
         }
-        let deadline =
-            Instant::now() + Duration::from_micros((journal.started_us + lifetime_us - now) as u64);
+        let expires_us = journal.started_us + lifetime_us;
+        let deadline = Instant::now() + Duration::from_micros((expires_us - now) as u64);
         let mut audit = Self {
             root,
             quarantine,
@@ -329,6 +372,7 @@ impl Audit {
             deadline,
             options: config.clone(),
             report: Report::default(),
+            expires_us,
         };
         let used = audit.quarantine_usage(now)?.0;
         audit.report.record_quarantine(used);
@@ -350,7 +394,7 @@ impl Audit {
         }
         (
             self.report,
-            result.map(|()| Completion(self.journal, self.deadline)),
+            result.map(|()| Completion(self.journal, self.deadline, self.expires_us)),
         )
     }
 
@@ -368,7 +412,7 @@ impl Audit {
             .await?
         {
             match self.journal.states.get(&item.rfc) {
-                Some(State::Matched(saved)) if saved == &item => {
+                Some(State::Matched(saved, _)) if saved == &item => {
                     self.report.matched += 1;
                     self.report.reused += 1;
                 }
@@ -432,7 +476,7 @@ impl Audit {
         cleanup?;
         self.report.matched += inputs
             .iter()
-            .filter(|item| matches!(self.journal.states.get(&item.rfc), Some(State::Matched(_))))
+            .filter(|item| matches!(self.journal.states.get(&item.rfc), Some(State::Matched(..))))
             .count();
         for item in inputs {
             if matches!(

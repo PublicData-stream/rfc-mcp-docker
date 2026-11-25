@@ -2,6 +2,8 @@ use std::ops::Range;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rfc_core::{BlobDigest, RfcNumber};
+use serde::Serialize;
+use serde_json::{Value, json};
 use tokio_postgres::{Row, Transaction};
 
 use crate::{
@@ -33,6 +35,43 @@ pub(crate) struct Source {
     pub encoding: String,
     pub policy: String,
     pub notice_state: String,
+    pub verification: Option<SourceVerification>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SourceVerification {
+    method: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    algorithm: Option<String>,
+}
+
+impl SourceVerification {
+    pub(crate) fn read(
+        row: &Row,
+        method: &str,
+        algorithm: &str,
+    ) -> Result<Option<Self>, SearchError> {
+        let method = match row.try_get::<_, Option<&str>>(method)? {
+            Some("rsync_checksum_match") => "rsync_checksum_match",
+            Some("dual_source_byte_match") => "dual_source_byte_match",
+            Some("dual_source") => "dual_source",
+            Some("legacy_https_verified") => "legacy_https_verified",
+            Some("rsync_integrity") => "rsync_integrity",
+            Some("https_capture") => "https_capture",
+            Some("unclassified") | None => return Ok(None),
+            _ => return Err(SearchError::Unavailable),
+        };
+        Ok(Some(Self {
+            method,
+            algorithm: row.try_get(algorithm)?,
+        }))
+    }
+
+    pub(crate) fn add(value: &mut Value, verification: Option<&Self>) {
+        if let Some(verification) = verification {
+            value["source_verification"] = json!(verification);
+        }
+    }
 }
 
 impl Source {
@@ -52,6 +91,11 @@ impl Source {
             notice_state: row.get(7),
             url: row.get(8),
             version: row.get(9),
+            verification: SourceVerification::read(
+                row,
+                "verification_method",
+                "verification_algorithm",
+            )?,
         })
     }
 
@@ -68,6 +112,7 @@ impl Source {
             id: format!("rfc-{}-notices", self.rfc.get()),
             rfc_id: self.rfc.get(),
             source_url: self.url.clone(),
+            source_verification: self.verification.clone(),
             source_name: "RFC Editor",
             stream: self.stream.clone(),
             attribution: if self.stream.as_deref() == Some("IETF") {

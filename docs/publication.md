@@ -6,15 +6,15 @@ The PostgreSQL `rfc.active_generation` row identifies the active generation and 
 
 Run these commands with the sync binary, sync database credentials, and its writable mirror in the private Compose environment.
 
-The command table describes the published schema 9 collector. With the
-HTTPS-first Phase 3 build, `--phase2-reconcile` reports durable processing and
-`--phase3-publish` fails at the publication gate. The retained-generation
-rollback and maintenance commands still use the rules below.
+The HTTPS-first Phase 5 image uses schema 11. Its full candidates carry a
+sealed selection, audited HTTPS TXT, and a classified RFCXML outcome for
+every RFC. Reconciliation and promotion share the existing corpus lock.
 [Acquisition and rollout](ingestion.md#run-acquisition)
 
 | Command | Effect |
 |---|---|
-| `--phase2-reconcile --full` | Prepare a full candidate and return its generation ID and manifest digest. |
+| `--phase2-reconcile --full` | Prepare a full candidate and report its generation ID, manifest digest, expected sequence, and promotion deadline. |
+| `--phase2-reconcile --sample` | Prepare a sample for inspection. Promotion requires full scope. |
 | `--phase3-publish GENERATION --expect-sequence SEQUENCE` | Verify and publish a ready full candidate. The first publication expects sequence `0`. |
 | `--phase3-rollback GENERATION --expect-sequence SEQUENCE` | Verify and reactivate a retained generation with a new publication sequence. |
 | `--phase3-recover` | Reconcile abandoned candidates, stages, interrupted retirement, and registered or orphaned files awaiting deletion. |
@@ -22,6 +22,14 @@ rollback and maintenance commands still use the rules below.
 | `--phase3-discard GENERATION` | Retire an explicitly selected ready candidate and reclaim newly unreachable files. |
 
 An expected-sequence conflict leaves the publication untouched. After a lost connection around commit, inspect `rfc.active_generation` and `rfc.notification_outbox` for the intended sequence and generation before retrying. A missing or corrupted file stops promotion. Restore the verified bytes to the original digest path before retrying. Retain the recorded incident for investigation.
+
+An expired audit cycle or a changed incumbent sequence requires a new
+reconciliation. The deadline starts when the audit cycle begins and uses
+`ingestion.revalidation.interval_seconds`, one day by default. Use the
+existing discard command to reclaim a superseded ready candidate. Retained
+generations remain available for explicit rollback with their original proof.
+Automatic publication completes its job and associated hints in the same
+transaction as the pointer and outbox event.
 
 The schema 9 collector runs recovery before each reconciliation. Phase 3 sweeps its spool and interrupted CAS staging on the next run. Use `--phase3-recover` for an explicit reclamation pass. It reports blocked and remaining deletion counts. An eligible restart checkpoint can pin a canonical file after the interrupted generation is retired. Expiry and eviction release that pin while generation references still protect published or retained bytes. A queued item with unexpected contents, type, or links remains in place for inspection. Preserve private quarantine. If retiring an eligible generation is busy, repeat GC after the reader has finished. [Interrupted reconciliation](ingestion.md#interrupted-reconciliation)
 

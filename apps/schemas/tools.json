@@ -27,6 +27,17 @@
       "type": "object",
       "oneOf": [{"$ref": "#/$defs/page"}, {"$ref": "#/$defs/error"}],
       "$defs": {
+        "source_verification": {
+          "type": "object",
+          "properties": {
+            "method": {"enum": ["https_capture", "legacy_https_verified", "dual_source", "rsync_integrity", "rsync_checksum_match", "dual_source_byte_match"]},
+            "algorithm": {"enum": ["xxh128", "xxh3", "xxh64", "md5", "md4", "sha1"]}
+          },
+          "required": ["method"],
+          "if": {"properties": {"method": {"const": "rsync_checksum_match"}}},
+          "else": {"properties": {"algorithm": false}},
+          "additionalProperties": false
+        },
         "page": {
           "type": "object",
           "properties": {
@@ -53,6 +64,7 @@
           "properties": {
             "id": {"$ref": "#/$defs/rfc"},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "digest": {"$ref": "#/$defs/digest"},
             "start_byte": {"$ref": "#/$defs/offset"},
             "end_byte": {"$ref": "#/$defs/offset"},
@@ -87,6 +99,7 @@
             "id": {"type": "string"},
             "rfc_id": {"$ref": "#/$defs/rfc"},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "source_name": {"const": "RFC Editor"},
             "stream": {"type": "string"},
             "attribution": {"type": "string"},
@@ -201,6 +214,17 @@
         {"$ref": "#/$defs/error"}
       ],
       "$defs": {
+        "source_verification": {
+          "type": "object",
+          "properties": {
+            "method": {"enum": ["https_capture", "legacy_https_verified", "dual_source", "rsync_integrity", "rsync_checksum_match", "dual_source_byte_match"]},
+            "algorithm": {"enum": ["xxh128", "xxh3", "xxh64", "md5", "md4", "sha1"]}
+          },
+          "required": ["method"],
+          "if": {"properties": {"method": {"const": "rsync_checksum_match"}}},
+          "else": {"properties": {"algorithm": false}},
+          "additionalProperties": false
+        },
         "error": {
           "type": "object",
           "properties": {
@@ -252,6 +276,7 @@
             "title": {"type": "string"},
             "stream": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "status": {"anyOf": [{"type": "string"}, {"type": "null"}]}
           },
@@ -330,6 +355,17 @@
         {"$ref": "#/$defs/error"}
       ],
       "$defs": {
+        "source_verification": {
+          "type": "object",
+          "properties": {
+            "method": {"enum": ["https_capture", "legacy_https_verified", "dual_source", "rsync_integrity", "rsync_checksum_match", "dual_source_byte_match"]},
+            "algorithm": {"enum": ["xxh128", "xxh3", "xxh64", "md5", "md4", "sha1"]}
+          },
+          "required": ["method"],
+          "if": {"properties": {"method": {"const": "rsync_checksum_match"}}},
+          "else": {"properties": {"algorithm": false}},
+          "additionalProperties": false
+        },
         "error": {
           "type": "object",
           "properties": {
@@ -381,6 +417,7 @@
             "title": {"type": "string"},
             "stream": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "excerpts": {"type": "array", "items": {"$ref": "#/$defs/excerpt"}, "maxItems": 8}
           },
@@ -423,6 +460,7 @@
             "id": {"type": "string"},
             "rfc_id": {"type": "integer", "minimum": 1, "maximum": 2147483647},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "source_name": {"const": "RFC Editor"},
             "stream": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "attribution": {"type": "string"},
@@ -505,6 +543,17 @@
         {"$ref": "#/$defs/error"}
       ],
       "$defs": {
+        "source_verification": {
+          "type": "object",
+          "properties": {
+            "method": {"enum": ["https_capture", "legacy_https_verified", "dual_source", "rsync_integrity", "rsync_checksum_match", "dual_source_byte_match"]},
+            "algorithm": {"enum": ["xxh128", "xxh3", "xxh64", "md5", "md4", "sha1"]}
+          },
+          "required": ["method"],
+          "if": {"properties": {"method": {"const": "rsync_checksum_match"}}},
+          "else": {"properties": {"algorithm": false}},
+          "additionalProperties": false
+        },
         "error": {
           "type": "object",
           "properties": {
@@ -556,6 +605,7 @@
             "end_byte": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
             "rfc_id": {"type": "integer", "minimum": 1, "maximum": 2147483647},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "encoding": {"type": "string", "enum": ["utf8", "base64"]},
             "notice_group_id": {"type": "string"},
@@ -593,6 +643,7 @@
             "id": {"type": "string"},
             "rfc_id": {"type": "integer", "minimum": 1, "maximum": 2147483647},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "source_name": {"const": "RFC Editor"},
             "stream": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "attribution": {"type": "string"},
@@ -644,6 +695,7 @@
             },
             "id": {"type": "integer", "minimum": 1, "maximum": 2147483647},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "sections": {"type": "array", "items": {"$ref": "#/$defs/section"}, "maxItems": 100},
             "notice_groups": {"type": "array", "items": {"$ref": "#/$defs/notice"}, "maxItems": 10}
@@ -666,6 +718,17 @@
         {"$ref": "#/$defs/error"}
       ],
       "$defs": {
+        "source_verification": {
+          "type": "object",
+          "properties": {
+            "method": {"enum": ["https_capture", "legacy_https_verified", "dual_source", "rsync_integrity", "rsync_checksum_match", "dual_source_byte_match"]},
+            "algorithm": {"enum": ["xxh128", "xxh3", "xxh64", "md5", "md4", "sha1"]}
+          },
+          "required": ["method"],
+          "if": {"properties": {"method": {"const": "rsync_checksum_match"}}},
+          "else": {"properties": {"algorithm": false}},
+          "additionalProperties": false
+        },
         "error": {
           "type": "object",
           "properties": {
@@ -759,6 +822,7 @@
             "id": {"type": "string"},
             "rfc_id": {"type": "integer", "minimum": 1, "maximum": 2147483647},
             "source_url": {"type": "string"},
+            "source_verification": {"$ref": "#/$defs/source_verification"},
             "source_name": {"const": "RFC Editor"},
             "stream": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "attribution": {"type": "string"},

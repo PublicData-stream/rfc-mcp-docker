@@ -191,9 +191,11 @@ impl Upstream {
         Self::new(https, OFFICIAL_HTTPS, OFFICIAL_RSYNC, None)
     }
 
-    #[cfg(feature = "phase6-fixtures")]
+    #[cfg(feature = "phase3-fixtures")]
     pub(crate) fn discovery_fixture(https: Https) -> Result<Self> {
-        Self::fixture_client(https)
+        let mut upstream = Self::fixture_client(https)?;
+        upstream.paced = std::env::var("RFC_HTTPS_FIXTURE_UNPACED").as_deref() != Ok("1");
+        Ok(upstream)
     }
 
     #[cfg(feature = "phase2-fixtures")]

@@ -30,7 +30,6 @@ pub(crate) struct Entry {
     pub has_txt: bool,
 }
 
-#[cfg_attr(not(feature = "phase2-fixtures"), allow(dead_code))]
 pub(crate) struct CatalogEdge {
     pub source: RfcNumber,
     pub kind: RelationKind,

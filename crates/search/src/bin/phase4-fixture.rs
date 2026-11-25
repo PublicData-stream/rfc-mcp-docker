@@ -2,7 +2,10 @@
 
 use rfc_core::GenerationId;
 use rfc_search::{Search, SearchError, SearchRequest};
-use rfc_storage::postgres::{Result as RepositoryResult, RuntimeRole, connect, load_manifest};
+use rfc_storage::{
+    blob::BlobWriter,
+    postgres::{Result as RepositoryResult, RuntimeRole, connect, load_manifest, mirror_root},
+};
 use serde_json::{Value, json};
 use std::{
     io::{self, BufRead, Write},
@@ -61,6 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn ready(id: i64) -> RepositoryResult<()> {
     let generation = GenerationId::new(id).ok_or("invalid fixture generation ID")?;
     let mut client = connect(RuntimeRole::Sync).await?;
+    let _coordinator = BlobWriter::coordinate(&mirror_root())?;
+    let held: bool = client
+        .query_one("SELECT pg_try_advisory_lock(-1::bigint)", &[])
+        .await?
+        .try_get(0)?;
+    if !held {
+        return Err("another synchronization holds the corpus lock".into());
+    }
     let tx = client.transaction().await?;
     tx.query_one(
         "SELECT id FROM rfc.generations WHERE id=$1 AND state='building' FOR NO KEY UPDATE",

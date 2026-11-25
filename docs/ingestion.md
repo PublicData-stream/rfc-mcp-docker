@@ -1,11 +1,12 @@
 # RFC discovery and candidate ingestion
 
-HTTPS-first Phase 4 runs the same discovery and durable processing for
+HTTPS-first Phase 5 runs the same discovery and durable processing for
 manual requests and daemon jobs. It installs original HTTPS TXT and RFCXML
-in BLAKE3 CAS, seals TXT indexes in PostgreSQL schema 10, and joins both
+in BLAKE3 CAS, seals TXT indexes in PostgreSQL schema 11, and joins both
 outcomes in the Sync coordinator. Each required TXT receives a current rsync
-audit or a fresh dual-source byte comparison. Phase 5 owns candidate
-publication. The qualified schema 9 release supplies production ingestion.
+audit or a fresh dual-source byte comparison. Manual reconciliation prepares
+a ready candidate. The daemon promotes its own full candidates. The qualified
+schema 9 release supplies production ingestion.
 [HTTPS-first design](decisions/0010-https-first-rfc-synchronization.md)
 
 ## Sync configuration
@@ -53,7 +54,7 @@ to report effective configuration, the publication gate, scratch and
 cgroup capacity, and free bytes and inodes on the spool and audit mounts.
 It performs local
 checks before connecting to PostgreSQL or upstream. Sync uses its startup
-snapshot until restart. [Spool and shadow setup](deployment.md#https-first-phase-4-shadow-runbook)
+snapshot until restart. [Spool and shadow setup](deployment.md#https-first-phase-5-shadow-runbook)
 
 ### Translate v1 settings
 
@@ -76,7 +77,10 @@ selects RFCs 2119, 8174, and 9110. In the Compose project, an invocation
 while the daemon runs uses its private Sync-UID socket. A matching request
 joins the active run. One different-scope request may wait for the next
 run. With the daemon stopped, the CLI acquires the deployment lease and
-runs directly.
+runs directly. A ready report includes `generation_id`, `manifest_digest`,
+`expected_publication_sequence`, and `promotion_deadline_us` in Unix epoch
+microseconds. If a manual invocation attaches to a daemon-owned automatic run,
+it receives that run's publication outcome. [Publication commands](publication.md#operator-commands)
 
 ~~~sh
 docker compose -f compose.yml -f deploy/compose.https-acquisition.yml \
@@ -116,6 +120,9 @@ The checkpoint cap is 40,000 records and 4 GiB of original bytes counted
 per record. TXT checkpoints expire seven days after first recording.
 Positive RFCXML checkpoints and malformed capture evidence expire
 24 hours after capture. Reuse keeps the original observation and expiry.
+Readiness clears checkpoints in the transaction that seals generation
+membership. An interrupted run can reuse its unexpired audit receipts when
+the catalog selection, inventory, and source identity still match.
 New runs request XML again after 404, 410, malformed content, or fetch
 failure. Expired and evicted artifacts become reclaimable through
 `--phase3-recover` when the incumbent and retained generations have no

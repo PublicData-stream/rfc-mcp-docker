@@ -22,7 +22,7 @@ use crate::{
     Search, SearchError,
     cursor::{MAX_AGE_SECONDS, validate_context},
     engine::{repository_error, unix_time},
-    snippets::{self, MAX_SOURCE_BYTES, Source},
+    snippets::{self, MAX_SOURCE_BYTES, Source, SourceVerification},
     worker::{self, Match, Output, Pattern, WorkerError},
 };
 
@@ -33,9 +33,14 @@ const RESPONSE_TAIL: usize = 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
 const SOURCES: &str = "SELECT m.rfc_id::integer,m.title,m.stream,d.txt_digest::bytea,
     d.byte_length::bigint,d.encoding,d.notice_policy,d.notice_state::text,
-    o.source_url,d.identity::bytea
+    o.source_url,d.identity::bytea,
+    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm
     FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity=m.document_version
     JOIN rfc.source_observations o ON o.identity=m.txt_observation
+    LEFT JOIN LATERAL (
+        SELECT method, algorithm FROM rfc.generation_source_evidence p
+        WHERE (p.generation_id,p.rfc_id) = (m.generation_id,m.rfc_id) LIMIT 1
+    ) p ON true
     WHERE m.generation_id=$1 AND m.rfc_id >= $2::integer
       AND ($3::integer[] IS NULL OR m.rfc_id=ANY($3))
     ORDER BY m.rfc_id LIMIT 129";
@@ -532,6 +537,7 @@ fn hit_value(source: &Source, bytes: &[u8], hit: &Match, range: Range<usize>) ->
     let mut value = json!(original);
     value["id"] = json!(source.rfc.get());
     value["source_url"] = json!(source.url);
+    SourceVerification::add(&mut value, source.verification.as_ref());
     value["digest"] = json!(source.digest.to_string());
     value["encoding"] = json!(if force_base64 { "base64" } else { "utf8" });
     value["notice_group_id"] = json!(format!("rfc-{}-notices", source.rfc.get()));

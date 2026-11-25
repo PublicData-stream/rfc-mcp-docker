@@ -2,7 +2,7 @@
 
 use crate::{
     blob::BlobReader,
-    manifest::{Coverage, Edge, Ingestion, Manifest, Member},
+    manifest::{Audit, Coverage, Edge, Ingestion, Manifest, Member},
 };
 use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
@@ -17,7 +17,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSIONS: [i32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const SCHEMA_VERSIONS: [i32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 const READ_DEADLINE: Duration = Duration::from_secs(15);
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",
@@ -37,6 +37,8 @@ const PUBLIC_READS: &[&str] = &[
     "relation_coverage",
     "document_lexemes",
     "generation_ingestion",
+    "generation_audit",
+    "generation_source_evidence",
 ];
 
 /// Expected role for the executable opening a storage repository.
@@ -84,6 +86,8 @@ impl RuntimeRole {
                     "control_events",
                     "document_lexemes",
                     "generation_ingestion",
+                    "generation_audit",
+                    "generation_source_evidence",
                 ] {
                     grants.push(format!("{name}:INSERT"));
                 }
@@ -691,6 +695,32 @@ pub async fn load_manifest(db: &impl GenericClient, generation: GenerationId) ->
         Ok(Ingestion(row.try_get(0)?, row.try_get(1)?, row.try_get(2)?, row.try_get(3)?,
             serde_json::from_str(row.try_get::<_, &str>(4)?)?))
     }).transpose()?;
+    let audit = if let Some(header) = db
+        .query_opt(
+            "SELECT jsonb_build_array(encode(selection, 'hex'), encode(inventory, 'hex'), policy,
+            expected_rfc_ids, expected_sequence, started_us, expires_us)::text
+         FROM rfc.generation_audit WHERE generation_id = $1",
+            &[&id],
+        )
+        .await?
+    {
+        let mut proofs = Vec::new();
+        for row in db.query(
+            "SELECT jsonb_build_array(rfc_id, encode(txt_observation, 'hex'), encode(document_version, 'hex'),
+                encode(txt_digest, 'hex'), byte_length, method, encode(receipt, 'hex'), rsync_url,
+                started_us, observed_us, checksum_choice, algorithm, encode(rsync_observation, 'hex'),
+                rfcxml_outcome, encode(rfcxml_observation, 'hex'), rfcxml_audit)::text
+             FROM rfc.generation_source_evidence WHERE generation_id = $1 ORDER BY rfc_id", &[&id],
+        ).await? {
+            proofs.push(serde_json::from_str(row.try_get::<_, &str>(0)?)?);
+        }
+        Some(Audit(
+            serde_json::from_str(header.try_get::<_, &str>(0)?)?,
+            proofs,
+        ))
+    } else {
+        None
+    };
     Ok(Manifest {
         parser_version: versions.try_get(0)?,
         index_version: versions.try_get(1)?,
@@ -698,6 +728,7 @@ pub async fn load_manifest(db: &impl GenericClient, generation: GenerationId) ->
         edges,
         coverage,
         ingestion,
+        audit,
     })
 }
 

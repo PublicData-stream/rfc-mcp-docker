@@ -2,6 +2,7 @@
 """Build, transfer, and exercise the images used by the Compose CI matrix."""
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import os
@@ -14,6 +15,8 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
+SCHEMA10 = "29896b51f048e319ddadebc36ff0fe24ab85c7bf"
+LEGACY_CASES = {"phase2", "bootstrap-quick", "phase6-legacy"}
 APP_TARGETS = {"serve": "serve", "sync": "sync", "feed": "feed", "fixtures": "phase0-fixtures"}
 FIXTURE_TARGETS = {
     "storage-fixture": "phase1-fixture",
@@ -30,9 +33,11 @@ CASE_FIXTURES = {
     "phase4": ("publication-fixture", "search-fixture"),
     "phase5": ("publication-fixture",),
     "phase6": ("publication-fixture", "control-fixture"),
+    "phase6-legacy": ("publication-fixture", "control-fixture"),
     "phase7": ("publication-fixture",),
     "phase8": ("publication-fixture",),
     "bootstrap-quick": ("publication-fixture", "control-fixture"),
+    "https-publication": ("publication-fixture", "control-fixture"),
 }
 ARCH_NAMES = {"x86_64": "amd64", "aarch64": "arm64", "amd64": "amd64", "arm64": "arm64"}
 
@@ -54,6 +59,8 @@ def case_list(value):
 
 
 def image_targets(prefix, cases):
+    if not cases:
+        return {}
     targets = dict(APP_TARGETS)
     for case in cases:
         for fixture in CASE_FIXTURES[case]:
@@ -67,6 +74,15 @@ def capture(command):
 
 def run(command, **kwargs):
     return subprocess.run(command, cwd=ROOT, check=True, **kwargs)
+
+
+@contextmanager
+def historical_checkout():
+    with tempfile.TemporaryDirectory(prefix="rfc-schema10-", dir="/tmp") as work:
+        checkout = Path(work) / "source"
+        run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(checkout)])
+        run(["git", "-C", str(checkout), "checkout", "--quiet", "--detach", SCHEMA10])
+        yield checkout
 
 
 def require_native(docker, arch):
@@ -92,15 +108,21 @@ def sha256(path):
 
 def image_bundle(args, docker):
     require_native(docker, args.arch)
-    targets = image_targets(args.image_prefix, args.cases)
+    current = image_targets(args.image_prefix, [case for case in args.cases if case not in LEGACY_CASES])
+    legacy = image_targets(f"{args.image_prefix}-schema10", [case for case in args.cases if case in LEGACY_CASES])
+    targets = current | legacy
     archive = args.bundle / "images.tar"
     manifest = args.bundle / "manifest.json"
     identity = {"revision": capture(["git", "rev-parse", "HEAD"]), "platform": f"linux/{args.arch}"}
+    if legacy:
+        identity["schema10_revision"] = SCHEMA10
     if args.command == "build":
         args.bundle.mkdir(parents=True)
-        for ref, target in targets.items():
-            run([*docker, "buildx", "build", "--load", "--platform", identity["platform"],
-                 "--provenance=false", "--target", target, "--tag", ref, "."])
+        with (historical_checkout() if legacy else nullcontext(ROOT)) as historical:
+            for ref, target in targets.items():
+                source = historical if ref in legacy else ROOT
+                run([*docker, "buildx", "build", "--load", "--platform", identity["platform"],
+                     "--provenance=false", "--target", target, "--tag", ref, str(source)])
         ids = image_ids(docker, targets, args.arch)
         run([*docker, "image", "save", "--output", str(archive), *targets])
         receipt = {**identity, "images": ids, "archive_sha256": sha256(archive)}
@@ -117,34 +139,43 @@ def image_bundle(args, docker):
     print(manifest.read_text(), end="", flush=True)
 
 
-def pinned_images(case):
+def pinned_images(case, checkout):
     postgres = re.search(r"(?m)^    image: (docker\.io/library/postgres:\S+@sha256:[0-9a-f]{64})$",
-                         (ROOT / "compose.yml").read_text())
+                         (checkout / "compose.yml").read_text())
     yield postgres.group(1)
     if case == "phase7":
         compiler = re.search(r"(?m)^FROM (docker\.io/library/rust:\S+@sha256:[0-9a-f]{64}) AS build$",
-                             (ROOT / "Dockerfile").read_text())
+                             (checkout / "Dockerfile").read_text())
         yield compiler.group(1)
 
 
 def run_case(args, docker):
     args.evidence.mkdir(parents=True)
-    scripts = ROOT / "scripts"
+    legacy = args.case in LEGACY_CASES
+    with (historical_checkout() if legacy else nullcontext(ROOT)) as checkout:
+        run_probe(args, docker, checkout, f"{args.image_prefix}-schema10" if legacy else args.image_prefix)
+
+
+def run_probe(args, docker, checkout, image_prefix):
+    scripts = checkout / "scripts"
+    case = "phase6" if args.case == "phase6-legacy" else args.case
     script = (scripts / "bootstrap" / "baseline.py" if args.case == "bootstrap-quick"
-              else scripts / args.case / "integration.py")
+              else scripts / ("https-discovery" if args.case == "https-publication" else case) / "integration.py")
     prefix_option = "--project" if args.case == "phase0" else "--image-prefix"
-    command = [sys.executable, "-B", str(script), "--context", args.context, prefix_option, args.image_prefix]
+    command = [sys.executable, "-B", str(script), "--context", args.context, prefix_option, image_prefix]
     if args.case == "phase8":
         command.extend(("--evidence", str(args.evidence)))
     elif args.case == "bootstrap-quick":
         command.extend(("--phase8", "quick", "--evidence", str(args.evidence / "bootstrap-quick")))
+    elif args.case == "https-publication":
+        command.append("--publication-only")
     env = dict(os.environ, RFC_E2E_PRELOADED="1", TMPDIR="/tmp", PYTHONUNBUFFERED="1")
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace", dir=args.evidence) as stream:
         try:
             output = {"stdout": stream, "stderr": subprocess.STDOUT}
-            run([*docker, "image", "inspect", *image_targets(args.image_prefix, [args.case])],
+            run([*docker, "image", "inspect", *image_targets(image_prefix, [args.case])],
                 stdout=subprocess.DEVNULL, stderr=stream)
-            for image in pinned_images(args.case):
+            for image in pinned_images(args.case, checkout):
                 run([*docker, "pull", image], **output)
             run(["timeout", "--signal=INT", "--kill-after=120s", "20m", *command], env=env, **output)
         finally:

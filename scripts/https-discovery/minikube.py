@@ -231,9 +231,9 @@ class Probe:
         self.database(input=f"ALTER ROLE rfc_sync PASSWORD '{writer}';\n")
         self.database("-f", "/migrations/bootstrap.sql", "-f", "/migrations/migrate.sql")
 
-        def sync(name, crash=None):
+        def sync(name, crash=None, args=("--phase2-reconcile", "--full")):
             self.pod(name, f"{self.prefix}-sync", 10002, [
-                "/phase6/sync", "--phase2-reconcile", "--full",
+                "/phase6/sync", *args,
             ], env={
                 **cfg, "RFC_PHASE6_FIXTURES": "1", "RFC_DISCOVERY_FIXTURES": "1",
                 "RFC_DB_HOST": "postgres", "RFC_DB_CA_FILE": "/phase2/ca.crt",
@@ -245,19 +245,15 @@ class Probe:
                        self.host("writer", "/phase1/db-password", "writer")),
                 scratch="512Mi")
 
-        reports = []
-        runs = []
-        for name in ("sync-cold", "sync-warm"):
-            sync(name)
-            reports.append(json.loads(self.done(name)))
-            runs.append(self.database("-c", """
-                SELECT rfc_id,kind,observation,expires_at FROM rfc.ingestion_checkpoints
-                ORDER BY rfc_id,kind
-            """))
-        cold, warm = reports
-        assert warm["state"] == cold["state"] == "acquisition_complete", reports
-        assert warm["acquisition"]["checkpoint_txt"] == cold["expected_txt"] == expected, reports
-        assert warm["acquisition"]["checkpoint_xml"] > 0 and runs[0] == runs[1], reports
+        sync("sync-cold")
+        cold = json.loads(self.done("sync-cold"))
+        sync("publish-cold", args=("--phase3-publish", cold["generation_id"], "--expect-sequence", "0"))
+        assert json.loads(self.done("publish-cold"))["publication_sequence"] == "1"
+        sync("sync-warm")
+        warm = json.loads(self.done("sync-warm"))
+        assert warm["state"] == cold["state"] == "ready", (cold, warm)
+        assert warm["acquisition"]["txt_reused"] == cold["expected_txt"] == expected, warm
+        assert warm["acquisition"]["xml_reused"] > 0, warm
         assert cold["acquisition"]["processing_digest"] == warm["acquisition"]["processing_digest"]
         assert warm["metrics"]["https_requests"] < cold["metrics"]["https_requests"]
         # Update both sources while holding rsync metadata constant. A warm
@@ -279,10 +275,17 @@ class Probe:
         assert repair["audit"]["repaired"] == 1 and repair["audit"]["repair_attempts"] == 0, repair
         assert repair["audit"]["reused"] == expected - 1, repair
         assert repair["acquisition"]["processing_digest"] != cold["acquisition"]["processing_digest"], repair
-        assert self.database("-c", "SELECT publication_sequence FROM rfc.active_generation") == "0"
+        assert self.database("-c", "SELECT publication_sequence FROM rfc.active_generation") == "1"
+        sync("publish-repaired", args=("--phase3-publish", repair["generation_id"], "--expect-sequence", "1"))
+        assert json.loads(self.done("publish-repaired"))["publication_sequence"] == "2"
+        assert self.database("-c", """
+            SELECT e.method, e.rsync_observation IS NOT NULL
+            FROM rfc.active_generation a JOIN rfc.generation_source_evidence e USING (generation_id)
+            WHERE a.singleton AND e.rfc_id=100
+        """) == "dual_source_byte_match|t"
         print("Minikube replacement sealed the durable repair pair without another source attempt", flush=True)
         print(f"Minikube pod replacement reused {expected} TXT and "
-              f"{warm['acquisition']['checkpoint_xml']} XML checkpoints. HTTPS starts "
+              f"{warm['acquisition']['xml_reused']} RFCXML originals. HTTPS starts "
               f"{cold['metrics']['https_requests']} cold and {warm['metrics']['https_requests']} warm.",
               flush=True)
 

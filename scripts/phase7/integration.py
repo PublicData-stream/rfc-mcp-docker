@@ -168,7 +168,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
             timeout=60,
         ))
         assert report["source"] == "file" and report["schema_version"] == 2
-        assert report["publication_gate"] == "https_txt_audit_pending"
+        assert report["publication_gate"] == "https_txt_audit_required"
         assert report["resources"]["cgroup_memory_limit_bytes"] == 2 * 1024**3
         assert report["resources"]["scratch_available_bytes"] == 512 * 1024**2
         assert report["resources"]["spool_available_inodes"] >= 40016
@@ -188,7 +188,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
                      "-d", "rfc", input=password_sql)
         self.sql("-f", "/migrations/bootstrap.sql")
         self.sql("-f", "/migrations/migrate.sql")
-        assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "10"
+        assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "11"
         assert self.sql("-c", "SELECT current_setting('server_encoding') || ':' || datlocale || ':' "
                         "|| datlocprovider::text FROM pg_database WHERE datname = current_database()") == "UTF8:und:i"
         assert self.sql("-c", "SELECT has_table_privilege('rfc_serve','rfc.generation_documents','INSERT')") == "f"
@@ -230,7 +230,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         assert defaults["source"] == "defaults"
         assert defaults["ingestion"] == probe(*file_options)["ingestion"]
         assert defaults["schema_version"] == 2 and defaults["phase"] == "audit"
-        assert defaults["publication_gate"] == "https_txt_audit_pending"
+        assert defaults["publication_gate"] == "https_txt_audit_required"
         assert defaults["pending_consumers"] == []
         probe(audit=False, expected="private rsync audit directory")
         probe("--tmpfs", "/rfc-rsync-audit:size=1g,uid=10002,gid=10002,mode=0700",

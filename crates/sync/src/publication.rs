@@ -1,5 +1,4 @@
 use crate::Writer;
-#[cfg(feature = "phase3-fixtures")]
 use crate::daemon::finish_published_job;
 use rfc_core::{BlobDigest, GenerationId};
 use rfc_storage::{
@@ -9,12 +8,7 @@ use rfc_storage::{
 
 /// Promote a verified full candidate or roll back to a retained generation.
 pub async fn promote(generation: GenerationId, expected: i64, rollback: bool) -> Result<i64> {
-    if !rollback {
-        return Err(
-            "publication is gated until HTTPS TXT and required audits are available".into(),
-        );
-    }
-    promote_explicit(generation, expected, true).await
+    promote_explicit(generation, expected, rollback).await
 }
 
 #[cfg(feature = "phase2-fixtures")]
@@ -40,7 +34,7 @@ pub(crate) async fn promote_locked(
     generation: GenerationId,
     expected: i64,
     rollback: bool,
-    _job: Option<i64>,
+    job: Option<i64>,
 ) -> Result<i64> {
     let mirror = BlobWriter::open(&mirror_root())?;
     let id = i64::try_from(generation.get())?;
@@ -69,6 +63,18 @@ pub(crate) async fn promote_locked(
          WHERE g.id = $1 AND g.state = $2 AND i.scope = 'full'
            AND EXISTS (SELECT FROM rfc.generation_documents WHERE generation_id = g.id)", &[&id, &target_state],
     ).await?.ok_or("generation is not eligible for promotion")?;
+    if !rollback {
+        let row = tx.query_opt(
+            "SELECT expected_sequence, expires_us > extract(epoch FROM clock_timestamp()) * 1000000
+             FROM rfc.generation_audit WHERE generation_id = $1", &[&id],
+        ).await?.ok_or("candidate lacks HTTPS-first audit evidence; reconcile again")?;
+        if row.try_get::<_, i64>(0)? != expected {
+            return Err("candidate publication sequence changed; reconcile again".into());
+        }
+        if !row.try_get::<_, bool>(1)? {
+            return Err("candidate audit cycle expired; reconcile again".into());
+        }
+    }
     verify_stored_manifest(&tx, generation).await?;
     let blobs = tx
         .query(
@@ -112,8 +118,7 @@ pub(crate) async fn promote_locked(
         )
         .await?
         .try_get(0)?;
-    #[cfg(feature = "phase3-fixtures")]
-    if let Some(job) = _job {
+    if let Some(job) = job {
         finish_published_job(&tx, job).await?;
     }
     rfc_storage::fixture_boundary("before_publication_commit");

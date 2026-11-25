@@ -1304,3 +1304,100 @@ Both profiles completed at concurrency 1, 4, 16, and 32, exercised
 admission limits, and returned to zero active readers, requests, and
 ripgrep workers. The disposable Compose resources, mounts, and loop
 devices were released after the probes.
+
+## HTTPS-first RFC synchronization Phase 5
+
+Schema 11 seals the selected RFCs, ending catalog fence, RFCXML outcomes,
+and TXT audit receipts in manifest format 3. Sync checks the audit window,
+published sequence, canonical blobs, and manifest before promotion.
+Manual reconciliation creates a candidate. Automatic promotion completes
+the job and associated control hints in the pointer and outbox transaction.
+Schema 9 remains the qualified production deployment.
+[Shadow runbook](deployment.md#https-first-phase-5-shadow-runbook) ·
+[Publication](publication.md#operator-commands)
+
+### Private verification on 2026-11-25
+
+- The frozen Rust gate, all-feature Clippy and tests, GitHub workflow
+  lint, exported output schema validation, and local MCP wire checks
+  passed. The HTTP mutation probe replayed 258 fixed-seed cases.
+- Phase 0 Compose passed on rootful Docker 29.10.1 and rootless Docker
+  29.10.0. The six-RFC rootless publication fixture made 14 HTTPS starts
+  and recorded six checksum matches without rsync payload transfers. It
+  passed manual publication, MCP source verification, repair replay,
+  retained rollback, and automatic promotion after restart at readiness.
+- The rootless scheduler probe passed at the normal HTTPS pace. It covered
+  checkpoint backpressure, cooldown across SIGKILL, daemon attachment,
+  manual scope queuing, and publication after Feed hints converged with the
+  catalog and mirror. The rootful configuration probe verified the Sync-only
+  spool and audit mounts and resource preflight.
+- The rootless audit probe passed receipt replay, snapshot mutation,
+  missing and truncated sessions, timeout recovery, exact-byte repair,
+  divergence, cooldown, and quarantine bounds. The rootful storage probe
+  restored two identical format 3 manifests into fresh volumes and verified
+  the original ranges, role isolation, and readiness immutability.
+- The final rootful publication probe rejected sample promotion, blocked a
+  competing writer under the corpus lock, and promoted exactly once.
+  PostgreSQL rejected missing, cross-selection, wrong-original, expired,
+  and stale-sequence evidence. The daemon resumed a ready generation and
+  delivered one outbox event for its sequence.
+- The populated schema 10 migration ran twice with identical historical
+  observations and manifests. The first schema 11 candidate downloaded
+  all six HTTPS TXT originals and audited them. It refetched malformed
+  historical RFCXML and preserved byte-exact retained rollback with the
+  original rsync-only provenance. The pinned schema 10 acquisition and
+  quick bootstrap cases passed on rootful Docker.
+- The rootful search probe checked 124 queries against its independent
+  graph evaluator. Its 10,000-RFC plans resolved proof metadata with
+  one indexed row per evaluated RFC. The rootless isolation probe passed
+  the production confinement, worker saturation, cancellation, and reaping
+  checks.
+- The final rootless MCP probe verified all five tools, original-byte
+  ranges, and authenticated continuations across publication, rollback,
+  and retirement. The rootful and rootless restore probes each verified
+  16 canonical blobs, 794 byte ranges and line starts, three manifests,
+  and the published pointer at sequence 2. They replayed all five tools
+  through a restored HTTPS proxy and rejected missing and corrupted originals
+  before startup. Discarding a sample removed its evidence, while recovery
+  preserved the separate rsync observation for a retained repair.
+- The isolated rootless checkpoint retry passed interrupted commits, quota
+  eviction, expiry, corrupt-original rejection, and garbage collection.
+  The first rootless publication lifecycle run timed out waiting for its
+  fixture reader to queue on an advisory lock. The full rootful rerun
+  passed publication, accepted-reader and post-lock tombstone checks,
+  retirement and unlink recovery, backup and restore, and checkpoint
+  recovery.
+- Minikube 1.39.0 with Kubernetes 1.37.0 and containerd published the cold
+  candidate and a repaired replacement. The replacement pod reused the
+  durable pair without a new repair request. The warm run reused six TXT
+  and three RFCXML observations, with five HTTPS starts versus 14 cold.
+  A later namespace deletion timed out after the assertions had passed.
+  The disposable profile and external mount were removed afterward.
+
+### Repeat the checks
+
+Use a private image prefix and run timing-sensitive Compose probes
+serially. Use the schema 10 fixture driver from the pinned pre-upgrade
+revision `29896b51f048e319ddadebc36ff0fe24ab85c7bf` for the populated
+upgrade. The older acquisition and bootstrap policy cases in the Compose
+matrix use matching images and scripts from that revision. Storage and
+graph probes use synthetic records to exercise schema 11 constraints and
+byte ranges independently of transport. The publication probe uses actual
+private HTTPS and rsync observations.
+
+~~~sh
+export TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target RFC_E2E_PRELOADED=1
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+python3 -B scripts/phase0/integration.py --context "$context" --project "$prefix" --skip-build
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" --publication-only
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" --upgrade-from-schema10 "$schema10_prefix"
+~~~
+
+Use a disposable Minikube profile with `MINIKUBE_HOME`, `KUBECONFIG`, and
+`TMPDIR` under `/tmp`. Attach a private disk-backed audit directory under
+`/tmp` on the node and run `scripts/https-discovery/minikube.py` with that
+directory and the same image prefix. All upstream traffic in these checks
+used fixture services. Official-corpus timing and production cutover remain
+separate gates.

@@ -163,7 +163,7 @@ impl Original {
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Classification {
+pub(crate) enum Classification {
     Captured,
     Reused,
     NotFound,
@@ -171,6 +171,19 @@ enum Classification {
     Malformed,
     RetriesExhausted,
     FetchFailed,
+}
+
+impl Classification {
+    pub fn sealed_name(self) -> &'static str {
+        match self {
+            Self::Captured | Self::Reused => "captured",
+            Self::NotFound => "not_found",
+            Self::Gone => "gone",
+            Self::Malformed => "malformed",
+            Self::RetriesExhausted => "retries_exhausted",
+            Self::FetchFailed => "fetch_failed",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -216,7 +229,7 @@ pub(crate) struct Counts {
     xml_malformed: usize,
     xml_retries_exhausted: usize,
     xml_fetch_failed: usize,
-    membership_committed: usize,
+    pub membership_committed: usize,
     pub accepted_bytes: u64,
     staged_body_bytes: u64,
     stage_peak_jobs: usize,
@@ -372,7 +385,7 @@ impl Spool {
         upstream: &Upstream,
         shutdown: &Shutdown,
         (counts, audit_report, audit): (&mut Counts, &mut audit::Report, audit::Audit),
-    ) -> Result<audit::Completion> {
+    ) -> Result<(audit::Completion, Join)> {
         let options = &config.ingestion.pipeline;
         let store = tokio::task::spawn_blocking(|| {
             let store = BlobWriter::open(&mirror_root())?;
@@ -629,7 +642,7 @@ impl Spool {
         ledger.sync_all().await?;
         let root = self.0.clone();
         tokio::task::spawn_blocking(move || File::open(root)?.sync_all()).await??;
-        Ok(completion)
+        Ok((completion, join))
     }
 }
 
@@ -775,6 +788,8 @@ impl Worker {
                         attempt.retain();
                         return Ok(receipt);
                     }
+                    Err(error)
+                        if prior.checkpoint_expiry.is_none() && error.is::<UnparseableXml>() => {}
                     Err(error) if prior.checkpoint_expiry.is_some() => {
                         if !error
                             .downcast_ref::<io::Error>()
@@ -953,7 +968,7 @@ impl Worker {
                     .blob()
             } else {
                 if parsed.is_none() {
-                    return Err("cached RFCXML no longer parses".into());
+                    return Err(UnparseableXml.into());
                 }
                 store.verify_durable(original.digest, i64::try_from(original.length)?)?
             };
@@ -1019,6 +1034,17 @@ struct InvalidCheckpoint {
     kind: Kind,
     cause: Box<dyn std::error::Error + Send + Sync>,
 }
+
+#[derive(Debug)]
+struct UnparseableXml;
+
+impl std::fmt::Display for UnparseableXml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cached RFCXML no longer parses")
+    }
+}
+
+impl std::error::Error for UnparseableXml {}
 
 impl std::fmt::Display for InvalidCheckpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1148,24 +1174,28 @@ impl Receipt {
 }
 
 #[derive(Default)]
-struct Pair {
-    txt: Option<Part>,
-    xml: Option<Part>,
+pub(crate) struct Pair {
+    pub txt: Option<Part>,
+    pub xml: Option<Part>,
 }
 
 #[derive(Serialize)]
-struct Part {
-    original: Option<String>,
-    version: Option<String>,
+pub(crate) struct Part {
+    pub original: Option<String>,
+    pub version: Option<String>,
+    #[serde(skip)]
+    pub observation: Option<String>,
+    #[serde(skip)]
+    pub length: Option<u64>,
     coverage: Option<(&'static str, &'static str)>,
     references: Option<String>,
-    outcome: Classification,
+    pub outcome: Classification,
     contains_nul: bool,
     invalid_utf8: bool,
 }
 
-struct Join {
-    pairs: BTreeMap<u32, Pair>,
+pub(crate) struct Join {
+    pub pairs: BTreeMap<u32, Pair>,
     unmatched: usize,
 }
 
@@ -1237,10 +1267,10 @@ impl Join {
         Ok(())
     }
 
-    fn finish(self) -> Result<String> {
+    fn finish(&self) -> Result<String> {
         let mut hash = blake3::Hasher::new_derive_key("rfc https processing selection v1");
-        for (rfc, pair) in self.pairs {
-            let (Some(txt), Some(xml)) = (pair.txt, pair.xml) else {
+        for (rfc, pair) in &self.pairs {
+            let (Some(txt), Some(xml)) = (&pair.txt, &pair.xml) else {
                 return Err("incomplete HTTPS document join".into());
             };
             let (all, classified) = txt.coverage.ok_or("missing TXT reference coverage")?;
@@ -1283,6 +1313,11 @@ impl From<&Receipt> for Part {
                 .as_ref()
                 .map(|value| value.digest.to_string()),
             version: receipt.document_version.clone(),
+            observation: receipt
+                .original
+                .as_ref()
+                .and_then(|value| value.observation.clone()),
+            length: receipt.original.as_ref().map(|value| value.length),
             coverage: receipt.coverage,
             references: receipt.reference_digest.clone(),
             outcome: if receipt.classification == Classification::Reused {

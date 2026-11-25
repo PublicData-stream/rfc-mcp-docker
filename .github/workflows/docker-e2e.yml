@@ -33,6 +33,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
@@ -65,6 +66,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -75,7 +77,7 @@ jobs:
           python3 -B scripts/ci/docker-e2e.py --image-prefix "$RFC_E2E_IMAGE_PREFIX" \
             load "$RFC_E2E_BUNDLE_DIR" --arch "$RFC_E2E_ARCH" --cases "$RFC_E2E_CASES"
       - name: Provide the MCP schema validator
-        if: ${{ contains(fromJSON('["phase5","phase6","phase7","phase8","bootstrap-quick"]'), matrix.phase) }}
+        if: ${{ contains(fromJSON('["phase5","phase6","phase6-legacy","phase7","phase8","bootstrap-quick","https-publication"]'), matrix.phase) }}
         run: |
           if ! /usr/bin/python3 -B -c 'from jsonschema import Draft202012Validator'; then
             sudo apt-get update

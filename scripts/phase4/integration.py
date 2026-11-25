@@ -122,7 +122,7 @@ def upgrade(project):
     project.check("serve", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8\n9\n10"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "\n".join(map(str, range(1, 12)))
     assert project.sql(row) == before
     project.denied_sql("DELETE FROM rfc.generation_documents", phase1.SERVE)
 
@@ -289,7 +289,7 @@ INVERSES = ("referenced_by", "normative_referenced_by", "informative_referenced_
 
 def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
     generation = int(project.sql("INSERT INTO rfc.generations (parser_version,index_version) "
-                                 "VALUES ('phase4-fixture','rfc-original-bytes-pg19-1') RETURNING id"))
+                                 f"SELECT parser_version,index_version FROM rfc.generations WHERE id={base} RETURNING id"))
     copy_fields = ("rfc_id,document_version,metadata_identity,catalog_observation,txt_observation,"
                    "title,stream,publication_date,current_status,publication_month,rfcxml_observation")
     template = 105 if bulk else 102
@@ -297,17 +297,17 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
         f"SELECT {generation}, n, 'obsoletes', 10000+mod(n,12) FROM generate_series({start},{end}) n"
         if bulk else "VALUES " + ",".join(f"({generation},{a},'{kind}',{b})" for a, kind, b in edges)
     )
-    seed_coverage = (
-        f"SELECT {generation}, 'document', n, 'obsoletes', 'complete' FROM generate_series({start},{end}) n"
-        if bulk else "VALUES " + ",".join(f"({generation},'document',{rfc},'{kind}','{state}')"
-                                         for (rfc, kind), state in coverage.items())
-    )
+    assignments = ("" if bulk else "VALUES " + ",".join(
+        f"({rfc},'{kind}','{state}')" for (rfc, kind), state in coverage.items()))
+    covered = ("CASE WHEN family='obsoletes' THEN 'complete' ELSE 'unavailable' END" if bulk
+               else "coalesce(s.state, 'unavailable')")
+    coverage_join = ("" if bulk else f"LEFT JOIN ({assignments}) s(rfc_id, kind, state) ON (s.rfc_id,s.kind)=(n,family)")
     project.sql(f"""
         BEGIN;
         INSERT INTO rfc.rfc_identities SELECT n FROM generate_series({start},{end}) n;
-        INSERT INTO rfc.source_observations (identity,kind,source_url,observed_at,fetched_at,raw_digest,https_verification)
+        INSERT INTO rfc.source_observations (identity,kind,source_url,observed_at,fetched_at,raw_digest,https_verification,capture_only)
           SELECT sha256(convert_to('phase4-txt-'||n,'UTF8')), 'txt',
-                 'https://www.rfc-editor.org/rfc/rfc'||n||'.txt', now(), now(), d.txt_digest, 'verified'
+                 'https://www.rfc-editor.org/rfc/rfc'||n||'.txt', now(), now(), d.txt_digest, 'verified', true
           FROM generate_series({start},{end}) n CROSS JOIN rfc.generation_documents m
           JOIN rfc.document_versions d ON d.identity=m.document_version
           WHERE m.generation_id={base} AND m.rfc_id={template};
@@ -328,6 +328,29 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
         INSERT INTO rfc.generation_ingestion
           SELECT {generation},scope,catalog_before,catalog_after,policy_registry,catalog_only
           FROM rfc.generation_ingestion WHERE generation_id={base};
+        INSERT INTO rfc.generation_audit
+          SELECT {generation},sha256(convert_to('phase4-selection-{generation}','UTF8')),inventory,policy,
+                 array(SELECT rfc FROM (SELECT rfc_id::integer rfc FROM rfc.generation_documents
+                     WHERE generation_id={base} UNION ALL SELECT generate_series({start},{end})) ids ORDER BY rfc),
+                 {sequence}, (extract(epoch FROM now())*1000000)::bigint,
+                 (extract(epoch FROM now())*1000000)::bigint+3600000000
+          FROM rfc.generation_audit WHERE generation_id={base};
+        -- This search-only fixture clones canonical bytes and synthesizes graph/proof rows.
+        INSERT INTO rfc.generation_source_evidence (generation_id,selection,rfc_id,txt_observation,
+            document_version,txt_digest,byte_length,method,receipt,rsync_url,started_us,observed_us,
+            checksum_choice,rfcxml_outcome,rfcxml_observation)
+          SELECT a.generation_id,a.selection,e.rfc_id,e.txt_observation,e.document_version,e.txt_digest,
+                 e.byte_length,'rsync_checksum_match',a.selection,e.rsync_url,a.started_us,a.started_us,
+                 'auto',e.rfcxml_outcome,e.rfcxml_observation
+          FROM rfc.generation_source_evidence e CROSS JOIN rfc.generation_audit a
+          WHERE e.generation_id={base} AND a.generation_id={generation}
+          UNION ALL
+          SELECT a.generation_id,a.selection,d.rfc_id,sha256(convert_to('phase4-txt-'||d.rfc_id,'UTF8')),
+                 d.identity,d.txt_digest,d.byte_length,'rsync_checksum_match',a.selection,
+                 'rsync://rsync.rfc-editor.org/rfcs-text-only/rfc'||d.rfc_id||'.txt',a.started_us,a.started_us,
+                 'auto','not_found',NULL
+          FROM rfc.document_versions d CROSS JOIN rfc.generation_audit a
+          WHERE d.rfc_id BETWEEN {start} AND {end} AND a.generation_id={generation};
         INSERT INTO rfc.generation_documents (generation_id,{copy_fields})
           SELECT {generation},{copy_fields} FROM rfc.generation_documents WHERE generation_id={base};
         INSERT INTO rfc.generation_documents (generation_id,{copy_fields})
@@ -351,7 +374,10 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
           SELECT {generation}, scope, rfc_id, family,
                  CASE WHEN scope='catalog' AND family='obsoletes' THEN 'partial' ELSE state END
           FROM rfc.relation_coverage WHERE generation_id={base};
-        INSERT INTO rfc.relation_coverage {seed_coverage};
+        INSERT INTO rfc.relation_coverage
+          SELECT {generation}, 'document', n, family, ({covered})::rfc.coverage_state
+          FROM generate_series({start},{end}) n CROSS JOIN unnest(ARRAY{list(FAMILIES)}) family
+          {coverage_join};
         COMMIT;
     """)
     run(project.search_command("sync", str(generation)), env=project.env, timeout=35)
@@ -479,6 +505,9 @@ def seeded_graph_and_benchmark(project, request, base):
             sample = "\n".join(plan["result"])
             assert "generation_documents_pkey" in sample and "source_observations_pkey" in sample, sample
             assert "Seq Scan on relation_coverage" not in sample, sample
+            assert "generation_source_evidence_pkey" in sample, sample
+            assert "Seq Scan on generation_source_evidence" not in sample, sample
+            assert "Bitmap Heap Scan on generation_source_evidence" not in sample, sample
             if label == "inbound_obsolescence":
                 assert "relations_inbound_obsolescence" in sample, sample
             print(label + " EXPLAIN (ANALYZE, BUFFERS)\n" + sample, flush=True)

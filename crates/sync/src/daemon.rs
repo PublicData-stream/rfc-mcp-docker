@@ -404,7 +404,6 @@ async fn claim(writer: &mut Writer) -> Result<NextJob> {
     Ok(job)
 }
 
-#[cfg(feature = "phase3-fixtures")]
 pub(crate) async fn finish_published_job(tx: &Transaction<'_>, job: i64) -> Result<()> {
     lock_queue(tx).await?;
     complete(tx, job, JobStatus::Published).await
@@ -412,19 +411,15 @@ pub(crate) async fn finish_published_job(tx: &Transaction<'_>, job: i64) -> Resu
 
 #[derive(Clone, Copy)]
 enum JobStatus {
-    Acquired,
     Deferred,
     Failed,
-    #[cfg(feature = "phase3-fixtures")]
     Published,
 }
 
 async fn complete(tx: &Transaction<'_>, job: i64, status: JobStatus) -> Result<()> {
     let (state, outcome, event_status) = match status {
-        JobStatus::Acquired => ("succeeded", "acquisition_complete", "completed"),
         JobStatus::Deferred => ("failed", "acquisition_deferred", "failed"),
         JobStatus::Failed => ("failed", "reconciliation_failed", "failed"),
-        #[cfg(feature = "phase3-fixtures")]
         JobStatus::Published => ("succeeded", "published", "completed"),
     };
     if tx
@@ -604,7 +599,7 @@ async fn worker(
         }
         match claim(&mut writer).await {
             Ok(NextJob::Ready(job)) => {
-                let result = process_job(&engine, &mut writer, job, shutdown, manual).await;
+                let result = process_job(&engine, job, shutdown, manual).await;
                 if let Some(status) = result
                     && shutdown.check().is_ok()
                     && schedule_retry(&mut writer, job, status).await.is_err()
@@ -642,7 +637,6 @@ async fn worker(
 
 async fn process_job(
     engine: &Engine,
-    writer: &mut Writer,
     job: i64,
     shutdown: &Shutdown,
     manual: &Manual,
@@ -654,23 +648,7 @@ async fn process_job(
                 discovery::execute(Scope::Full, Some(job), config, upstream, shutdown).await;
             let outcome = report_execution(result, manual);
             match outcome {
-                Ok(discovery::Outcome::Complete) => {
-                    let finished: Result<()> = async {
-                        let tx = writer.client.transaction().await?;
-                        tx.batch_execute("SET LOCAL synchronous_commit = on")
-                            .await?;
-                        lock_queue(&tx).await?;
-                        complete(&tx, job, JobStatus::Acquired).await?;
-                        tx.commit().await?;
-                        Ok(())
-                    }
-                    .await;
-                    if finished.is_err() {
-                        eprintln!("could not acknowledge discovery job {job}");
-                        return Some(JobStatus::Failed);
-                    }
-                    None
-                }
+                Ok(discovery::Outcome::Complete) => None,
                 Ok(discovery::Outcome::Deferred) => Some(JobStatus::Deferred),
                 Err(_) => Some(JobStatus::Failed),
             }

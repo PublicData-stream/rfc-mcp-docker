@@ -5,6 +5,7 @@ use serde::Serialize;
 
 pub const FORMAT_VERSION: i32 = 1;
 pub const INGESTION_FORMAT_VERSION: i32 = 2;
+pub const AUDIT_FORMAT_VERSION: i32 = 3;
 
 /// RFC number, TXT digest, document-version identity, catalog metadata identity.
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -28,6 +29,10 @@ pub struct Ingestion(
     pub serde_json::Value,
 );
 
+/// Sealed selection and one normalized proof row per RFC, in numeric order.
+#[derive(Serialize)]
+pub struct Audit(pub serde_json::Value, pub Vec<serde_json::Value>);
+
 /// Inputs loaded from the locked generation in one database transaction.
 pub struct Manifest {
     pub parser_version: String,
@@ -36,11 +41,14 @@ pub struct Manifest {
     pub edges: Vec<Edge>,
     pub coverage: Vec<Coverage>,
     pub ingestion: Option<Ingestion>,
+    pub audit: Option<Audit>,
 }
 
 impl Manifest {
     pub fn version(&self) -> i32 {
-        if self.ingestion.is_some() {
+        if self.audit.is_some() {
+            AUDIT_FORMAT_VERSION
+        } else if self.ingestion.is_some() {
             INGESTION_FORMAT_VERSION
         } else {
             FORMAT_VERSION
@@ -62,8 +70,18 @@ impl Manifest {
             self.edges,
             self.coverage,
         );
-        let bytes = match self.ingestion {
-            Some(ingestion) => serde_json::to_vec(&(
+        let bytes = match (self.ingestion, self.audit) {
+            (Some(ingestion), Some(audit)) => serde_json::to_vec(&(
+                AUDIT_FORMAT_VERSION,
+                inputs.0,
+                inputs.1,
+                inputs.2,
+                inputs.3,
+                inputs.4,
+                ingestion,
+                audit,
+            )),
+            (Some(ingestion), None) => serde_json::to_vec(&(
                 INGESTION_FORMAT_VERSION,
                 inputs.0,
                 inputs.1,
@@ -72,7 +90,7 @@ impl Manifest {
                 inputs.4,
                 ingestion,
             )),
-            None => serde_json::to_vec(&(
+            (None, None) => serde_json::to_vec(&(
                 FORMAT_VERSION,
                 inputs.0,
                 inputs.1,
@@ -80,6 +98,7 @@ impl Manifest {
                 inputs.3,
                 inputs.4,
             )),
+            (None, Some(_)) => unreachable!("audit evidence requires ingestion metadata"),
         }
         .expect("manifest contains only JSON primitives and arrays");
         let digest = BlobDigest::hash(&bytes);
@@ -120,6 +139,7 @@ mod tests {
                 "partial".into(),
             )],
             ingestion: None,
+            audit: None,
         }
     }
 

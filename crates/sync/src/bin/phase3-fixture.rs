@@ -1,10 +1,7 @@
 //! Drives the production repositories in a disposable Compose project.
 
 use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
-use rfc_mcp_docker_sync::{
-    Maintenance, Scope, maintain, promote_fixture as promote, reconcile_fixture,
-    reconcile_fixture_with_reviews,
-};
+use rfc_mcp_docker_sync::{Maintenance, Scope, maintain, promote, reconcile_audited_fixture};
 use rfc_storage::{
     blob::{BlobReader, BlobWriter},
     fixture_boundary,
@@ -19,11 +16,11 @@ use std::{collections::BTreeMap, io::Read, process::Stdio, time::Duration};
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [scope] if scope == "full" => reconcile_fixture(Scope::Full).await?,
-        [scope] if scope == "sample" => reconcile_fixture(Scope::Sample).await?,
+        [scope] if scope == "full" => reconcile_audited_fixture(Scope::Full, None).await?,
+        [scope] if scope == "sample" => reconcile_audited_fixture(Scope::Sample, None).await?,
         [scope, review] if scope == "full" && review == "--review-fixture" => {
             let reviews = std::fs::read_to_string("/phase5/fixture-policy.json")?;
-            reconcile_fixture_with_reviews(Scope::Full, &reviews).await?;
+            reconcile_audited_fixture(Scope::Full, Some(&reviews)).await?;
         }
         [action] if action == "digest" => {
             let mut bytes = Vec::new();

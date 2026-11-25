@@ -34,6 +34,13 @@ Arguments are JSON objects. The [exported schemas](../apps/schemas/tools.json) d
 
 ## Original bytes and notices
 
+Source records can include `source_verification` with the proof `method`
+recorded for that generation. `rsync_checksum_match` can also include its
+negotiated `algorithm`. `dual_source_byte_match` records an exact comparison
+of two independently captured originals. Historic records report their
+recorded `dual_source`, `legacy_https_verified`, or `rsync_integrity`
+method. Each record retains its original `source_url`.
+
 `range` uses zero-based `start_byte` and exclusive `end_byte`. When text is returned, JSON decoding followed by UTF-8 encoding reproduces the original range, including CRLFs and form feeds. Use `format: "base64"` for exact byte slices that split a UTF-8 character. Originals with other encodings default to base64. An explicit text request for those originals returns `unsupported_source_encoding`.
 
 Each `get` page contains up to 64 KiB of original bytes. The complete serialized JSON-RPC response has a 256 KiB limit, including both representations and all notices. A page can contain fewer bytes to fit. Continue until `next_cursor` is null. Compare the reassembled bytes with the returned full BLAKE3 digest.

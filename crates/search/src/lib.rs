@@ -19,3 +19,4 @@ pub use reads::{GetRequest, ListRequest, TableRequest};
 pub use rg::{Rg, RgRequest};
 #[cfg(target_os = "linux")]
 pub use sandbox::{sandbox_probe, sandbox_worker};
+pub use snippets::SourceVerification;

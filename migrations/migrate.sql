@@ -70,4 +70,10 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 10) AS appl
 \ir 0010-https-processing.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (10);
 \endif
+SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 11) AS apply_v11
+\gset
+\if :apply_v11
+\ir 0011-https-publication.sql
+INSERT INTO rfc.schema_migrations (version) VALUES (11);
+\endif
 COMMIT;

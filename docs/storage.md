@@ -59,6 +59,17 @@ Sort each collection lexicographically by the shown fields and sort the evidence
 
 The [serializer golden test](../crates/storage/src/manifest.rs) fixes the exact bytes, including a non-ASCII string. Its BLAKE3 digest is `6b5a42ee1e42b0746f35e4278e36ac04816a7e27c9f283ece2b2fc58c686119c`.
 
+## Manifest formats 2 and 3
+
+Format 2 appends the ingestion scope, catalog observation identities, policy
+registry version, and entries without TXT. Format 3 appends the HTTPS-first
+selection, inventory, publication sequence, and audit window, followed by
+the normalized TXT and RFCXML evidence in ascending RFC order. A checksum
+receipt records an algorithm when negotiation identifies it. An exact-byte
+repair records a separate rsync observation. The manifest retains the
+original HTTPS observation in both cases. The serializer preserves formats
+1 and 2 for historical generations.
+
 ## Repeat verification
 
 From the repository on Linux, run the locked offline checks and build and test both Compose profiles.

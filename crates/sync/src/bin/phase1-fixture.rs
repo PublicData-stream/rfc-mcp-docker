@@ -8,7 +8,10 @@ use rfc_mcp_docker_sync::{
 };
 use rfc_storage::blob::{BlobReader, BlobWriter, Install};
 use rfc_storage::postgres::{Reader, Result, RuntimeRole, connect, mirror_root};
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const TXT: &[(i32, &[u8])] = &[
     (2119, include_bytes!("../../../../fixtures/rfc/rfc2119.txt")),
@@ -17,6 +20,12 @@ const TXT: &[(i32, &[u8])] = &[
 const CATALOG: &[u8] = b"synthetic catalog: 8174 updates 2119\n";
 const CAP: usize = 64 * 1024;
 const TIME: i64 = 1_795_320_000_000_000;
+const FAMILIES: [&str; 4] = [
+    "all_references",
+    "classified_references",
+    "updates",
+    "obsoletes",
+];
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -44,6 +53,7 @@ async fn main() -> Result<()> {
 async fn populate() -> Result<()> {
     let store = BlobWriter::open(&mirror_root())?;
     let mut writer = Writer::connect().await?;
+    let _coordinator = writer.fixture_coordinator().await?;
     let catalog = store.install(CATALOG, CAP as u64)?.blob();
     writer.register_blob(catalog).await?;
     let mut texts = Vec::new();
@@ -53,6 +63,7 @@ async fn populate() -> Result<()> {
         texts.push((number, bytes, blob));
     }
     let mut previous = None;
+    let started = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?;
     for _ in 0..2 {
         let candidate = writer
             .begin("fixture-parser-v1", "fixture-index-v1")
@@ -69,35 +80,23 @@ async fn populate() -> Result<()> {
                 https_verification: "verified",
             })
             .await?;
+        candidate
+            .fixture_catalog(observation, &[2119, 8174], started)
+            .await?;
         for &(number, bytes, blob) in &texts {
             let rfc = RfcNumber::new(number).unwrap();
             let url = format!("https://www.rfc-editor.org/rfc/rfc{number}.txt");
-            let peer = candidate
-                .observe(&Observation {
+            let txt = candidate
+                .fixture_capture(&Observation {
                     kind: "txt",
-                    url: &format!("rsync://rsync.rfc-editor.org/rfcs-text-only/rfc{number}.txt"),
+                    url: &url,
                     observed_us: TIME,
                     fetched_us: Some(TIME),
                     etag: None,
                     last_modified: None,
                     raw_digest: blob.digest(),
-                    https_verification: "unverified",
+                    https_verification: "verified",
                 })
-                .await?;
-            let txt = candidate
-                .observe_comparison(
-                    &Observation {
-                        kind: "txt",
-                        url: &url,
-                        observed_us: TIME,
-                        fetched_us: Some(TIME),
-                        etag: None,
-                        last_modified: None,
-                        raw_digest: blob.digest(),
-                        https_verification: "verified",
-                    },
-                    peer,
-                )
                 .await?;
             let doc_range = ByteRange::new(0, blob.byte_length()).unwrap();
             let first_line = bytes
@@ -106,38 +105,42 @@ async fn populate() -> Result<()> {
                 .ok_or("fixture has no lines")?;
             let line_range = ByteRange::new(0, (first_line + 1) as i64).unwrap();
             let version = candidate
-                .document(Document {
-                    rfc,
-                    txt: blob,
-                    parser_version: "fixture-parser-v1",
-                    index_version: "fixture-index-v1",
-                    encoding: "utf8",
-                    index_state: Coverage::Partial,
-                    notice_state: Coverage::Partial,
-                    notice_policy: "metadata_only",
-                    sections: vec![Section {
-                        id: SectionId::new("fixture".into()).unwrap(),
-                        parent: None,
-                        ordinal: 0,
-                        depth: 0,
-                        number: None,
-                        heading: "Fixture range",
-                        body: doc_range,
-                        raw_heading: line_range,
-                        parse_state: Coverage::Partial,
-                    }],
-                    chunks: vec![Chunk {
-                        range: doc_range,
-                        text: std::str::from_utf8(bytes)?,
-                    }],
-                    notices: vec![Notice {
-                        ordinal: 0,
-                        category: "other",
-                        range: line_range,
-                        extraction: Coverage::Partial,
-                        review: "unreviewed",
-                    }],
-                })
+                .fixture_document(
+                    Document {
+                        rfc,
+                        txt: blob,
+                        parser_version: "fixture-parser-v1",
+                        index_version: "fixture-index-v1",
+                        encoding: "utf8",
+                        index_state: Coverage::Partial,
+                        notice_state: Coverage::Partial,
+                        notice_policy: "metadata_only",
+                        sections: vec![Section {
+                            id: SectionId::new("fixture".into()).unwrap(),
+                            parent: None,
+                            ordinal: 0,
+                            depth: 0,
+                            number: None,
+                            heading: "Fixture range",
+                            body: doc_range,
+                            raw_heading: line_range,
+                            parse_state: Coverage::Partial,
+                        }],
+                        chunks: vec![Chunk {
+                            range: doc_range,
+                            text: std::str::from_utf8(bytes)?,
+                        }],
+                        notices: vec![Notice {
+                            ordinal: 0,
+                            category: "other",
+                            range: line_range,
+                            extraction: Coverage::Partial,
+                            review: "unreviewed",
+                        }],
+                    },
+                    std::str::from_utf8(bytes)?,
+                    txt,
+                )
                 .await?;
             candidate
                 .member(&Membership {
@@ -151,9 +154,11 @@ async fn populate() -> Result<()> {
                     status: None,
                 })
                 .await?;
-            candidate
-                .coverage(Some(rfc), "classified_references", Coverage::Partial)
-                .await?;
+            for family in FAMILIES {
+                candidate
+                    .coverage(Some(rfc), family, Coverage::Partial)
+                    .await?;
+            }
         }
         let evidence = candidate
             .evidence(&Evidence {
@@ -179,9 +184,9 @@ async fn populate() -> Result<()> {
                 &[evidence],
             )
             .await?;
-        candidate
-            .coverage(None, "updates", Coverage::Partial)
-            .await?;
+        for family in FAMILIES {
+            candidate.coverage(None, family, Coverage::Partial).await?;
+        }
         let (id, digest) = candidate.ready().await?;
         if let Some(previous) = previous {
             assert_eq!(

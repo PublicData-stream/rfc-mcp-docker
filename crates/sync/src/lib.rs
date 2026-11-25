@@ -13,12 +13,15 @@ mod acquisition;
 mod audit;
 #[cfg(feature = "phase2-fixtures")]
 mod bulk;
+mod candidate;
 mod checkpoint;
 mod config;
 mod daemon;
 mod discovery;
 mod egress;
 mod feed_broker;
+#[cfg(feature = "phase1-fixtures")]
+mod fixture_storage;
 #[cfg(feature = "phase2-fixtures")]
 mod ingest;
 mod inventory;
@@ -44,11 +47,11 @@ pub use config::check_config;
 #[doc(hidden)]
 pub use daemon::legacy_fixtures;
 pub use daemon::run_daemon;
+#[cfg(feature = "phase3-fixtures")]
+pub use discovery::reconcile_audited_fixture;
 pub use discovery::{Scope, reconcile};
 #[cfg(feature = "phase2-fixtures")]
 pub use ingest::reconcile_fixture;
-#[cfg(feature = "phase3-fixtures")]
-pub use ingest::reconcile_fixture_with_reviews;
 #[cfg(feature = "phase2-fixtures")]
 #[doc(hidden)]
 pub use legacy_config::check_config as check_legacy_fixture_config;
@@ -116,7 +119,6 @@ impl Writer {
         Ok(fence)
     }
 
-    #[cfg(feature = "phase2-fixtures")]
     async fn start_ingestion(
         &mut self,
         parser: &str,
@@ -146,7 +148,6 @@ impl Writer {
         GenerationId::new(id).ok_or_else(|| "invalid candidate ID".into())
     }
 
-    #[cfg(feature = "phase2-fixtures")]
     async fn batch(&mut self, id: GenerationId) -> Result<Candidate<'_>> {
         Ok(Candidate {
             id,
@@ -154,7 +155,6 @@ impl Writer {
         })
     }
 
-    #[cfg(feature = "phase2-fixtures")]
     async fn fail(&self, id: GenerationId) -> Result<()> {
         self.client
             .execute(
@@ -455,7 +455,6 @@ impl Candidate<'_> {
         Ok((self.id, digest))
     }
 
-    #[cfg(feature = "phase2-fixtures")]
     async fn commit(self) -> Result<()> {
         Ok(self.tx.commit().await?)
     }

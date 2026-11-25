@@ -2,7 +2,7 @@
 """Exercise publication and recovery on pinned PostgreSQL in private Compose projects."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import importlib.util
 import json
 from pathlib import Path
@@ -39,6 +39,43 @@ def fixture_driver(docker, prefix, target):
 class Project(phase2.Project):
     def __init__(self, directory, driver, prefix, docker):
         super().__init__(directory, driver, prefix, docker, False)
+        self.ingestion_mounts = ExitStack()
+
+    def start(self):
+        super().start()
+        if getattr(self, "external_ingestion", False):
+            return
+        try:
+            spool = self.ingestion_mounts.enter_context(phase2.capped_stage(self, mebibytes=5120, inodes=65536,
+                                                                           label="publication-spool"))
+            audit = self.ingestion_mounts.enter_context(phase2.capped_stage(self, mebibytes=1024, inodes=4096,
+                                                                          label="publication-audit"))
+            self.audited_overlay = self.directory / "audited-compose.json"
+            config = self.directory / "audited-ingestion.toml"
+            config.write_bytes((phase2.REPO / "deploy/ingestion.toml.example").read_bytes())
+            self.audited_config = config
+            self.audited_overlay.write_text(json.dumps({"services": {"sync": {
+                "environment": {"RFC_SYNC_CONFIG_FILE": "/etc/rfc-mcp/ingestion.toml",
+                                "RFC_HTTPS_FIXTURE_UNPACED": "1"},
+                "volumes": [f"{config}:/etc/rfc-mcp/ingestion.toml:ro", f"{spool}:/rfc-https-spool",
+                            f"{audit}:/rfc-rsync-audit"],
+            }}}))
+        except BaseException:
+            self.ingestion_mounts.close()
+            raise
+
+    def command(self, *args):
+        command = super().command(*args)
+        if hasattr(self, "audited_overlay"):
+            index = command.index("-p")
+            return [*command[:index], "-f", str(self.audited_overlay), *command[index:]]
+        return command
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self.ingestion_mounts.close()
 
     def operation(self, service, *args, crash=None, pause=None):
         options = ["-T", "--entrypoint", "/phase2/fixture-driver"]
@@ -46,6 +83,11 @@ class Project(phase2.Project):
             if value:
                 options.extend(("-e", f"RFC_PHASE3_{name}={value}"))
         return self.app(service, *options, args=tuple(map(str, args)))
+
+    def reconcile_command(self, live, scope, settings=(), *, options=(), prelude=None):
+        assert not live and not prelude
+        overrides = [part for setting in settings for part in ("-e", setting)]
+        return self.app("sync", "-T", *options, *overrides, "--entrypoint", "/phase2/fixture-driver", args=(scope,))
 
     def invoke(self, service, *args, crash=None, error=None):
         command = self.operation(service, *args, crash=crash)
@@ -84,11 +126,11 @@ class Project(phase2.Project):
 
 
 @contextmanager
-def paused(project, service, label, *args):
+def paused(project, service, label, *args, timeout=10):
     proc = subprocess.Popen(project.operation(service, *args, pause=label), env=project.env,
                             text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        assert select.select([proc.stdout], [], [], 10)[0], f"no checkpoint: {label}"
+        assert select.select([proc.stdout], [], [], timeout)[0], f"no checkpoint: {label}"
         assert proc.stdout.readline().strip() == f"paused {label}", f"wrong checkpoint: {label}"
         yield proc
     finally:
@@ -121,7 +163,7 @@ def upgrade(project):
     project.check("sync", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8\n9\n10"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "\n".join(map(str, range(1, 12)))
     assert project.sql(f"SELECT state,manifest_format,encode(manifest_bytes,'hex') FROM rfc.generations WHERE id={old}") == "ready|1|0123"
     project.activate(old, 0, error="not eligible")
 
@@ -179,12 +221,12 @@ def check_checkpoint_quota(project):
             FROM generate_series(50000,{49999 + entries}) n
             CROSS JOIN rfc.source_observations o
             WHERE o.source_url='https://www.rfc-editor.org/rfc/rfc100.txt'
-              AND o.verification_method='dual_source';
+              AND o.verification_method='https_capture';
             SET LOCAL synchronous_commit = off;
-            SELECT rfc.store_ingestion_checkpoint('full',sha256('quota'::bytea),100,'txt',o.identity)
-            FROM rfc.source_observations o
+            SELECT rfc.store_source_checkpoint('full',sha256('quota'::bytea),100,'txt',o.identity,'https',d.identity)
+            FROM rfc.source_observations o JOIN rfc.document_versions d ON d.txt_digest=o.raw_digest
             WHERE o.source_url='https://www.rfc-editor.org/rfc/rfc100.txt'
-              AND o.verification_method='dual_source';
+              AND o.verification_method='https_capture' AND d.rfc_id=100 AND d.sealed;
             SHOW synchronous_commit;
             SELECT u.entries,min(c.rfc_id) FILTER (WHERE c.scope='sample')
             FROM rfc.ingestion_checkpoints c CROSS JOIN rfc.ingestion_checkpoint_usage u
@@ -202,18 +244,21 @@ def exercise_checkpoints(project):
     project.denied_sql("SELECT * FROM rfc.ingestion_checkpoints", phase1.SERVE)
     project.denied_sql("DELETE FROM rfc.ingestion_checkpoints", phase1.SYNC)
     project.denied_sql("SELECT rfc.prune_ingestion_checkpoints(NULL, NULL)", phase1.SYNC, "55000")
-    project.invoke("sync", "full", crash="before_txt_checkpoint_commit")
+    project.audited_config.write_text("""schema_version = 2
+[ingestion.https]
+max_in_flight_requests = 1
+[ingestion.pipeline]
+max_active_documents = 1
+parser_workers = 1
+""")
+    project.invoke("sync", "full", crash="before_https_checkpoint_commit")
     assert not saved_sources(project)
-    project.invoke("sync", "full", crash="after_txt_checkpoint_commit")
+    project.invoke("sync", "full", crash="after_https_checkpoint_commit")
     first, = saved_sources(project)
     assert first["kind"] == "txt"
     project.maintain("recover")
     assert saved_sources(project) == [first]
     assert project.canonical(first["digest"]).is_file()
-    project.invoke("sync", "full", crash="before_xml_checkpoint_commit")
-    assert all(row["kind"] == "txt" for row in saved_sources(project))
-    project.invoke("sync", "full", crash="after_xml_checkpoint_commit")
-    assert sum(row["kind"] == "rfcxml" for row in saved_sources(project)) == 1
     project.invoke("sync", "full", crash="before_readiness")
     saved = {(row["rfc"], row["kind"]): row for row in saved_sources(project)}
     assert len(saved) == len(sources) + 3, saved
@@ -226,9 +271,10 @@ def exercise_checkpoints(project):
     for transport in ("rsync", "https"):
         (project.source / transport / "rfc101.txt").write_bytes(sources[101] + b"\nUpdated TXT.\n")
     ready = project.reconcile()
-    assert ready["checkpoint_txt"] == len(sources) - 1 and ready["metrics"]["txt"]["calls"] == 1, ready
-    assert ready["rfcxml"]["reused"] == ready["rfcxml"]["captured"] == 1, ready
-    assert ready["rfcxml"]["not_found"] == len(sources)-2, ready
+    counts = ready["acquisition"]
+    assert counts["checkpoint_txt"] == len(sources) - 1 and counts["txt_downloaded"] == 1, ready
+    assert counts["xml_reused"] == counts["xml_captured"] == 1, ready
+    assert counts["xml_not_found"] == len(sources)-2, ready
     assert not project.canonical(saved[(102, "rfcxml")]["digest"]).exists()
     generation = int(ready["generation_id"])
     retained = saved[(9110, "rfcxml")]
@@ -258,11 +304,11 @@ def exercise_checkpoints(project):
     source = project.source / "https/rfc9110.xml"
     source.write_bytes(source.read_bytes() + b"\n")
     project.invoke("sync", "full", crash="before_readiness")
-    suspect = next(row["digest"] for row in saved_sources(project) if row["rfc"] == 9110)
+    suspect = next(row["digest"] for row in saved_sources(project)
+                   if row["rfc"] == 9110 and row["kind"] == "rfcxml")
     change_cached_file(project, suspect,
                        'chmod u+w "$1"; printf x | dd of="$1" bs=1 conv=notrunc 2>/dev/null; chmod 0444 "$1"')
-    failure = project.reconcile(expected=f"rfcxml checkpoint {suspect} failed verification")
-    assert failure["rfcxml"]["reused"] <= 1
+    project.reconcile(expected=f"original {suspect} failed canonical verification")
     assert all(row["digest"] != suspect for row in saved_sources(project))
     gc = project.maintain("gc")
     assert gc["blocked_deletions"] == 1 and project.canonical(suspect).is_file(), gc

@@ -168,7 +168,7 @@ def prepare_backup(root, args, driver, backup):
         phase3.changed_catalog(seed, "Phase 8 metadata-only publication")
         report = seed.reconcile()
         second = report["generation_id"]
-        assert report["verified_txt"] > 0 and report["reused_txt"] == report["verified_txt"], report
+        assert report["expected_txt"] > 0 and report["acquisition"]["txt_reused"] == report["expected_txt"], report
         seed.activate(int(second), 1)
         phase3.changed_catalog(seed, "Phase 8 ready candidate")
         ready = seed.reconcile()["generation_id"]

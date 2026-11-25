@@ -3,12 +3,13 @@
 The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It requires a qualified Linux Docker host, an existing HTTPS reverse proxy, and a dedicated Docker ingress network shared with that proxy. Follow the [deployment prerequisites](deployment-prerequisites.md).
 
 <a id="https-first-phase-3-shadow-runbook"></a>
+<a id="https-first-phase-4-shadow-runbook"></a>
 
-## HTTPS-first Phase 4 shadow runbook
+## HTTPS-first Phase 5 shadow runbook
 
 Keep incumbent Serve online with its qualified schema 9 images and mirror.
-Phase 4 audit and repair are available for private qualification and a separately
-authorized shadow run. Build or preload matching Phase 4 Serve, Sync, and
+Phase 5 publication is available for private qualification and a separately
+authorized shadow run. Build or preload matching schema 11 Serve, Sync, and
 Feed images. Use a separate Compose project, private networks and
 credentials, and a matched copy of the schema 9 database and mirror. Follow the
 [backup and restore procedure](publication.md#backup-and-restore) to make the
@@ -31,15 +32,19 @@ own keys, and keep the shadow project off production ingress.
    and verify that Sync alone mounts both volumes and that Feed has only its
    internal control network. Run the preflight with the actual runtime UID
    and resource limits.
-3. On the shadow copy, start only PostgreSQL and apply `migrations/migrate.sql`
-   with the owner migration procedure. Confirm schema 10, the incumbent
+3. On the shadow copy, keep ingress closed and Feed, Sync, and Serve stopped.
+   Start only PostgreSQL and apply `migrations/migrate.sql` with the owner
+   migration procedure. Confirm schema 11, the incumbent
    sequence, retained snapshots, readiness, and an exact-byte pinned MCP
-   read using matching schema 10 images. Keep the matched schema 9 backup
-   and images for rollback into fresh volumes.
-4. Qualify first against private sources. Check `acquisition_complete`,
-   matching catalogs, pacing, joined-document counts, and `txt_audited`
-   equal to `expected_txt`. Repeat the run and verify HTTPS checkpoint hits
-   with original timestamps and a fresh checksum audit. After an interruption,
+   read using matching schema 11 images before opening any shadow ingress.
+   Keep the matched database and mirror backup and the corresponding schema 9
+   or 10 images and TOML for rollback into fresh volumes.
+4. Qualify first against private sources. Run `--phase2-reconcile --full`
+   and check `ready`, matching catalogs, pacing, joined-document counts,
+   and `txt_audited` equal to `expected_txt`. With the daemon stopped, run
+   `--phase3-publish` using the generation ID and expected sequence from the
+   report. Check the active pointer, `/ready`, a pinned MCP `get`, and the
+   outbox. Repeat separately with the daemon and a private receiver. After an interruption,
    rerun the same scope with the original volumes to resume eligible receipts.
    Use the private audit `quarantine` directory to inspect disagreements.
    Preserve its receipts and bytes for diagnosis. A full quarantine or
@@ -70,7 +75,7 @@ shadow run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --sample
 ~~~
 
 Use the [private acquisition fixture](../scripts/https-discovery/integration.py)
-for qualification. The sample command in the snippet uses the stock image
+with `--publication-only` for qualification. The sample command in the snippet uses the stock image
 and is for the authorized official-source window. The remaining production
 procedures apply to the qualified schema 9 release with its matching
 checkout, images, and v1 configuration.

@@ -231,7 +231,10 @@ impl Plan {
             CASE WHEN octet_length(m.stream)<=262144 THEN m.stream END,
             d.txt_digest::bytea,d.byte_length::bigint,d.encoding,d.notice_policy,d.notice_state::text,
             (SELECT o.source_url FROM rfc.source_observations o WHERE o.identity=m.txt_observation LIMIT 1),
-            m.document_version::bytea,ARRAY[");
+            m.document_version::bytea,
+            coalesce(p.method, (SELECT o.verification_method FROM rfc.source_observations o
+                WHERE o.identity=m.txt_observation LIMIT 1)) AS verification_method,
+            p.algorithm AS verification_algorithm,ARRAY[");
         let mut params = Vec::new();
         for (slot, leaf) in self.leaves.iter().enumerate() {
             if slot != 0 {
@@ -292,6 +295,10 @@ impl Plan {
         sql.push_str(
             "] AS predicates FROM rfc.generation_documents m
             JOIN rfc.document_versions d ON d.identity=m.document_version
+            LEFT JOIN LATERAL (
+                SELECT method, algorithm FROM rfc.generation_source_evidence p
+                WHERE (p.generation_id,p.rfc_id) = (m.generation_id,m.rfc_id) LIMIT 1
+            ) p ON true
             LEFT JOIN ROWS FROM (pg_catalog.unnest($4::integer[]), pg_catalog.unnest($5::bytea[]))
                 AS x(rfc_id,facts) ON x.rfc_id=m.rfc_id
             WHERE m.generation_id=$1 AND m.rfc_id>$2::integer AND m.rfc_id<=$3::integer)

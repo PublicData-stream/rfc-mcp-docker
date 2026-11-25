@@ -3,21 +3,22 @@
 use crate::{
     Writer,
     acquisition::{Accepted, Counts, Original, Selection, Spool},
-    audit,
+    audit, candidate,
     checkpoint::Context,
     config::SyncConfig,
     egress::Lease,
     inventory,
     metrics::{Record, Stage},
     policy::Registry,
+    publication, recovery,
     shutdown::Shutdown,
     upstream::{Capture, MAX_CATALOG_ENTRIES, Source, TXT_LIMIT, Upstream, XML_LIMIT},
     xml,
 };
-use rfc_core::{BlobDigest, RfcNumber};
+use rfc_core::{BlobDigest, GenerationId, RfcNumber};
 use rfc_mcp_docker::control::SyncRequested;
 use rfc_storage::{
-    blob::BlobReader,
+    blob::{BlobReader, BlobWriter},
     manifest::identity,
     postgres::{Result, mirror_root},
 };
@@ -32,8 +33,8 @@ use tokio::time::Instant;
 pub(crate) const PARSER: &str = "rfc-txt-catalog-1";
 pub(crate) const INDEX: &str = "rfc-original-bytes-pg19-1";
 pub(crate) const SAMPLE: [i32; 3] = [2119, 8174, 9110];
-pub(crate) const PUBLICATION_GATE: &str = "https_txt_audit_pending";
-const POLICY: &str = "https-first-rsync-audit-v1";
+pub(crate) const PUBLICATION_GATE: &str = "https_txt_audit_required";
+pub(crate) const POLICY: &str = "https-first-rsync-audit-v1";
 const DEADLINE: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,16 @@ struct Report {
     job_id: Option<i64>,
     active_generation_id: Option<i64>,
     publication_sequence: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_publication_sequence: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    promotion_deadline_us: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    published_sequence: Option<i64>,
     catalog_before: Option<Observation>,
     catalog_after: Option<Observation>,
     selection_id: Option<String>,
@@ -121,14 +132,33 @@ pub async fn reconcile(scope: Scope) -> Result<()> {
         return if reply.success {
             Ok(())
         } else {
-            Err("daemon acquisition did not complete".into())
+            Err("daemon reconciliation did not complete".into())
         };
     }
     let config = SyncConfig::load()?;
+    let upstream = upstream(&config)?;
+    reconcile_standalone(scope, config, upstream, None).await
+}
+
+#[cfg(feature = "phase3-fixtures")]
+pub async fn reconcile_audited_fixture(scope: Scope, reviews: Option<&str>) -> Result<()> {
+    let config = SyncConfig::load()?;
+    let upstream = Upstream::discovery_fixture(config.ingestion.https)?
+        .with_parsers(config.ingestion.pipeline.parser_workers);
+    let registry = reviews.map(serde_json::from_str).transpose()?;
+    reconcile_standalone(scope, config, upstream, registry).await
+}
+
+async fn reconcile_standalone(
+    scope: Scope,
+    config: SyncConfig,
+    upstream: Upstream,
+    registry: Option<Registry>,
+) -> Result<()> {
     let lease = Lease::acquire()?;
     let leader = Writer::connect().await?;
     leader.acquire_egress_leader().await?;
-    let upstream = upstream(&config)?.with_lease(&lease)?;
+    let upstream = upstream.with_lease(&lease)?;
     let shutdown = Shutdown::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -138,7 +168,7 @@ pub async fn reconcile(scope: Scope) -> Result<()> {
             _ = interrupt.recv() => (),
         }
     };
-    let work = execute(scope, None, &config, &upstream, &shutdown);
+    let work = execute_with_registry(scope, None, &config, &upstream, &shutdown, registry);
     tokio::pin!(work);
     let outcome = tokio::select! {
         result = &mut work => result?,
@@ -181,6 +211,17 @@ pub(crate) async fn execute(
     upstream: &Upstream,
     shutdown: &Shutdown,
 ) -> Result<Execution> {
+    execute_with_registry(scope, job, config, upstream, shutdown, None).await
+}
+
+async fn execute_with_registry(
+    scope: Scope,
+    job: Option<i64>,
+    config: &SyncConfig,
+    upstream: &Upstream,
+    shutdown: &Shutdown,
+    registry: Option<Registry>,
+) -> Result<Execution> {
     let started = Instant::now();
     let upstream = upstream.with_fresh_metrics();
     let mut report = Report {
@@ -199,20 +240,50 @@ pub(crate) async fn execute(
         Spool::sweep().await?;
         crate::egress::preflight(config.ingestion.max_accepted_bytes)?;
         audit::preflight()?;
-        discover(
-            &mut writer,
-            config,
-            &upstream,
-            shutdown,
-            deadline,
-            scope,
-            &mut report,
-        )
-        .await
+        let resumed = if let Some(job) = job {
+            resume_candidate(&writer, job, &mut report).await?
+        } else {
+            false
+        };
+        let outcome = if resumed {
+            Outcome::Complete
+        } else {
+            let store = BlobWriter::open(&mirror_root())?;
+            recovery::recover_before_ingestion(&mut writer, &store).await?;
+            discover(
+                &mut writer,
+                config,
+                &upstream,
+                shutdown,
+                deadline,
+                (scope, registry),
+                &mut report,
+            )
+            .await?
+        };
+        if outcome == Outcome::Complete && job.is_some() {
+            let generation = GenerationId::new(
+                report
+                    .generation_id
+                    .as_deref()
+                    .ok_or("automatic run has no ready generation")?
+                    .parse()?,
+            )
+            .ok_or("invalid ready generation")?;
+            let expected = report
+                .expected_publication_sequence
+                .ok_or("candidate has no publication sequence")?;
+            shutdown.check()?;
+            let sequence =
+                publication::promote_locked(&mut writer, generation, expected, false, job).await?;
+            report.published_sequence = Some(sequence);
+        }
+        Result::Ok(outcome)
     }
     .await;
     report.state = match &result {
-        Ok(Outcome::Complete) => "acquisition_complete",
+        Ok(Outcome::Complete) if report.published_sequence.is_some() => "published",
+        Ok(Outcome::Complete) => "ready",
         Ok(Outcome::Deferred) => "acquisition_deferred",
         Err(error) => {
             report.error = Some(error.to_string().chars().take(512).collect());
@@ -226,13 +297,40 @@ pub(crate) async fn execute(
     })
 }
 
+async fn resume_candidate(writer: &Writer, job: i64, report: &mut Report) -> Result<bool> {
+    let row = writer
+        .client
+        .query_opt(
+            "SELECT g.id, encode(g.manifest_digest, 'hex'), a.expected_sequence, a.expires_us,
+                encode(a.selection, 'hex'), cardinality(a.expected_rfc_ids), live.generation_id
+         FROM rfc.sync_jobs j JOIN rfc.generations g ON g.id = j.generation_id
+         JOIN rfc.generation_audit a ON a.generation_id = g.id CROSS JOIN rfc.active_generation live
+         WHERE j.id = $1 AND j.state = 'running' AND g.state = 'ready' AND live.singleton
+           AND a.expected_sequence = live.publication_sequence
+           AND a.expires_us > extract(epoch FROM clock_timestamp()) * 1000000",
+            &[&job],
+        )
+        .await?;
+    let Some(row) = row else { return Ok(false) };
+    report.generation_id = Some(row.try_get::<_, i64>(0)?.to_string());
+    report.manifest_digest = Some(row.try_get(1)?);
+    let expected = row.try_get(2)?;
+    report.expected_publication_sequence = Some(expected);
+    report.publication_sequence = expected;
+    report.promotion_deadline_us = Some(row.try_get(3)?);
+    report.selection_id = Some(row.try_get(4)?);
+    report.expected_txt = usize::try_from(row.try_get::<_, i32>(5)?)?;
+    report.active_generation_id = row.try_get(6)?;
+    Ok(true)
+}
+
 async fn discover(
     writer: &mut Writer,
     config: &SyncConfig,
     upstream: &Upstream,
     shutdown: &Shutdown,
     deadline: Instant,
-    scope: Scope,
+    (scope, registry): (Scope, Option<Registry>),
     report: &mut Report,
 ) -> Result<Outcome> {
     let (active, sequence, priors, hints) = {
@@ -370,7 +468,10 @@ async fn discover(
     }
     report.local_https_txt_audit_pending = local_with_https;
     report.local_txt_needs_https = local_without_https;
-    let registry = Registry::load()?;
+    let registry = match registry {
+        Some(registry) => registry,
+        None => Registry::load()?,
+    };
     let scope_name = scope.as_str();
     let checkpoint = Context {
         scope: scope_name,
@@ -392,13 +493,20 @@ async fn discover(
     let selection_id = checkpoint.key.to_string();
     let audit_key = identity(
         "rfc-rsync-audit-cycle-v1",
-        &(&selection_id, &report.inventory_digest),
+        &(
+            &selection_id,
+            &report.inventory_digest,
+            config.ingestion.revalidation.interval_seconds,
+            upstream.rsync_module(),
+        ),
     )?;
     let audit = audit::Audit::open(
         scope_name,
         &audit_key.to_string(),
         &config.ingestion.revalidation,
-    )?;
+        writer,
+    )
+    .await?;
     report.selection_id = Some(selection_id.clone());
 
     let mut reuse_xml = if let Some(active) = active {
@@ -452,7 +560,7 @@ async fn discover(
             xml: reuse_xml,
             accepted: accepted.clone(),
         };
-        let audited = {
+        let (mut audited, documents) = {
             let work = spool.acquire(
                 selection,
                 writer,
@@ -488,12 +596,48 @@ async fn discover(
         }
         spool.stage_catalog("catalog-after", &after).await?;
         rfc_storage::fixture_boundary("after_https_catalog_validation");
-        audited.commit()?;
+        let candidate_selection = candidate::Selection {
+            scope,
+            context: checkpoint,
+            inventory: report
+                .inventory_digest
+                .as_deref()
+                .ok_or("missing inventory digest")?,
+            sequence,
+            catalog: &catalog,
+            registry_version: &registry.version,
+            before: &before,
+            after: &after,
+            documents,
+            batch_size: config.ingestion.database.batch_size as usize,
+        };
+        let (_, expires) = audited.window();
+        let (generation, manifest) = candidate::seal(
+            writer,
+            candidate_selection,
+            &mut audited,
+            report.job_id,
+            shutdown,
+        )
+        .await?;
+        report.generation_id = Some(generation.get().to_string());
+        report.manifest_digest = Some(manifest.to_string());
+        report.expected_publication_sequence = Some(sequence);
+        report.promotion_deadline_us = Some(expires);
+        report.acquisition.membership_committed = report.expected_txt;
+        if let Err(error) = audited.commit() {
+            eprintln!(
+                "could not acknowledge committed audit for generation {}: {error}",
+                generation.get()
+            );
+        }
         Ok(Outcome::Complete)
     }
     .await;
     let cleanup = spool.remove().await;
-    cleanup?;
+    if let Err(error) = cleanup {
+        eprintln!("could not clean HTTPS acquisition spool: {error}");
+    }
     result
 }
 
@@ -603,9 +747,12 @@ async fn load_prior_xml(
          JOIN rfc.source_observations c ON c.identity = i.catalog_before
          JOIN rfc.source_observations o ON o.identity = d.rfcxml_observation
          JOIN rfc.blobs b ON b.digest = o.raw_digest
+         LEFT JOIN rfc.generation_source_evidence e
+           ON (e.generation_id, e.rfc_id) = (d.generation_id, d.rfc_id)
          WHERE d.generation_id = $1 AND c.raw_digest = $2::bytea
            AND g.parser_version = $3 AND g.index_version = $4 AND i.policy_registry = $5
            AND o.kind = 'rfcxml' AND o.https_verification = 'verified'
+           AND (e.generation_id IS NULL OR e.rfcxml_outcome = 'captured')
            AND o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || d.rfc_id || '.xml'
            AND o.fetched_at BETWEEN clock_timestamp() - interval '24 hours' AND clock_timestamp()
          ORDER BY d.rfc_id LIMIT $6",

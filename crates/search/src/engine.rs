@@ -207,6 +207,8 @@ pub struct Hit {
     pub title: String,
     pub stream: Option<String>,
     pub source_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_verification: Option<crate::snippets::SourceVerification>,
     pub digest: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excerpts: Vec<Excerpt>,
@@ -241,6 +243,8 @@ pub struct NoticeGroup {
     pub id: String,
     pub rfc_id: u32,
     pub source_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_verification: Option<crate::snippets::SourceVerification>,
     pub source_name: &'static str,
     pub stream: Option<String>,
     pub attribution: &'static str,
@@ -555,8 +559,8 @@ impl Scan<'_> {
                 return Err(SearchError::Unavailable);
             }
             for (index, row) in batch.iter().enumerate() {
-                let truth: Option<bool> = row.get(11);
-                let facts: Vec<Option<bool>> = row.get(10);
+                let truth: Option<bool> = row.get(13);
+                let facts: Vec<Option<bool>> = row.get(12);
                 if truth == Some(true) {
                     let source = Source::from_row(row)?;
                     if !push_hit(&mut page, &source, self.fits) {
@@ -669,6 +673,7 @@ fn push_hit(page: &mut SearchPage, source: &Source, fits: &dyn Fn(&SearchPage) -
         title: title.clone(),
         stream: source.stream.clone(),
         source_url: source.url.clone(),
+        source_verification: source.verification.clone(),
         digest: source.digest.to_string(),
         excerpts: Vec::new(),
     });

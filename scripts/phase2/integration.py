@@ -63,7 +63,8 @@ class Project(phase1.Project):
             assert result.returncode == 0 and report["state"] == "ready", (result.stderr, report)
         else:
             assert result.returncode != 0 and expected in report["error"], (result.stderr, report)
-            assert self.sql(f"SELECT state FROM rfc.generations WHERE id = {int(report['generation_id'])}") == "failed"
+            if report.get("generation_id"):
+                assert self.sql(f"SELECT state FROM rfc.generations WHERE id = {int(report['generation_id'])}") == "failed"
         return report
 
     def verify_manifest(self, report):
