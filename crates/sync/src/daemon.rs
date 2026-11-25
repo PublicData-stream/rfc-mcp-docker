@@ -5,6 +5,7 @@ use crate::{
     discovery,
     egress::Lease,
     feed_broker::Broker,
+    inventory,
     manual::{Manual, Reply},
     shutdown::Shutdown,
     upstream::Upstream,
@@ -326,13 +327,16 @@ pub(crate) async fn finish_published_job(tx: &Transaction<'_>, job: i64) -> Resu
 enum JobStatus {
     Deferred,
     Failed,
+    InvalidInventory,
     Published,
 }
 
 async fn complete(tx: &Transaction<'_>, job: i64, status: JobStatus) -> Result<()> {
     let (state, outcome, event_status) = match status {
         JobStatus::Deferred => ("failed", "acquisition_deferred", "failed"),
-        JobStatus::Failed => ("failed", "reconciliation_failed", "failed"),
+        JobStatus::Failed | JobStatus::InvalidInventory => {
+            ("failed", "reconciliation_failed", "failed")
+        }
         JobStatus::Published => ("succeeded", "published", "completed"),
     };
     if tx
@@ -368,7 +372,12 @@ async fn schedule_retry(writer: &mut Writer, job: i64, status: JobStatus) -> Res
     if retries >= 2 {
         complete(&tx, job, status).await?;
     } else {
-        let delay = if retries == 0 { 30_i32 } else { 120_i32 };
+        let delay: i32 = match (status, retries) {
+            (JobStatus::InvalidInventory, 0) => 300,
+            (JobStatus::InvalidInventory, _) => 900,
+            (_, 0) => 30,
+            _ => 120,
+        };
         tx.execute(
             "UPDATE rfc.sync_jobs SET retries = retries + 1, next_attempt_at = clock_timestamp() + make_interval(secs => $2::integer)
              WHERE id = $1",
@@ -489,6 +498,7 @@ async fn process_job(
     match report_execution(result, manual) {
         Ok(discovery::Outcome::Complete) => None,
         Ok(discovery::Outcome::Deferred) => Some(JobStatus::Deferred),
+        Err(error) if error.is::<inventory::ParseError>() => Some(JobStatus::InvalidInventory),
         Err(_) => Some(JobStatus::Failed),
     }
 }

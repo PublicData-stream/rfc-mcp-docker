@@ -1679,3 +1679,40 @@ Use the disposable rootless Minikube setup described in Phase 6 for its
 separate runtime smoke. Pass the two capped ext4 mount paths under the
 node's `/tmp` to `scripts/https-discovery/minikube.py`. Keep the host
 profile, kubeconfig, and evidence under `/tmp`.
+
+## RFC Editor inventory compatibility
+
+- The unchanged 2026-11-25 list-only capture contains 9,880 rows. The
+  offline regression selected 9,862 canonical RFC TXT entries and compared
+  each entry's size and timestamp with the capture. Negative tests covered
+  unsafe paths and file kinds, unexpected links, ambiguous and duplicate
+  names, malformed metadata, limits, and diagnostic escaping.
+  [Fixture and provenance](../fixtures/rfc/README.md#rfc-editor-inventory)
+- The frozen Rust gate and all-feature Clippy and tests passed. The
+  rootless Phase 0 Compose probe passed with packaged rsync 3.5.2.
+- The rootless `scripts/https-discovery/integration.py --cold-daemon-only`
+  probe verified five- and fifteen-minute persisted retry deadlines and
+  terminal failure after three rejected listings. Each failed attempt
+  requested only the opening catalog over HTTPS and stopped before
+  downloading TXT, auditing originals, or publishing. The probe advanced
+  only the test job's retry timestamp to exercise both delays. After removing
+  the unexpected link, the same initialized deployment published all six
+  fixture TXT originals with audit evidence and byte-exact MCP reads. The
+  database, schema, volumes, and deployment configuration were reused.
+- One stock `--phase2-reconcile --sample` against official sources in a
+  fresh rootless production Compose project exited 0 with a ready
+  candidate. Discovery found 9,862 canonical files. Sync downloaded and
+  audited all three sample TXT files, with three checksum matches and zero
+  rsync payload bytes. Eight HTTPS starts had a minimum spacing of
+  1,000,557 µs. The active generation remained empty at sequence 0. The
+  temporary result checker initially treated the omitted publication
+  field as required. Rechecking the captured report confirmed the sample
+  without making a second upstream run.
+- The rootless Minikube smoke passed manual publication, pod-replacement
+  recovery, automatic publication, and brokered Feed publication, with
+  byte-exact MCP reads and authenticated outbox delivery. The initial
+  invocation stopped while its fixture image was still building. The
+  rerun used the complete matching image set.
+
+The disposable Compose projects, Minikube profile, staging mounts, and
+test image tags were removed after verification.

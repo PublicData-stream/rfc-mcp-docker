@@ -98,10 +98,16 @@ def wait_job(project, job, outcome):
     ) == outcome)
 
 
-def advance_retry(project, job, retries):
+def advance_retry(project, job, retries, *, delay=None):
     phase6.wait(lambda: project.sql(
         f"SELECT retries FROM rfc.sync_jobs WHERE id = {int(job)} AND next_attempt_at > clock_timestamp()"
     ) == str(retries))
+    if delay is not None:
+        remaining = float(project.sql(
+            "SELECT extract(epoch FROM next_attempt_at - clock_timestamp()) "
+            f"FROM rfc.sync_jobs WHERE id = {int(job)}"
+        ))
+        assert delay - 10 <= remaining <= delay, (retries, delay, remaining)
     project.sql(f"UPDATE rfc.sync_jobs SET next_attempt_at = now() WHERE id = {int(job)}")
 
 
@@ -1108,6 +1114,36 @@ def exercise_faults(project, work, client, sources, first, audit):
     print("Stock fixture guard, required HTTPS timeout, audit ENOSPC and database disconnect passed", flush=True)
 
 
+def exercise_inventory_retry(project):
+    mirror = project.source / "rsync"
+    (mirror / "RFCs_for_errata.txt").write_text("Fixture errata index\n")
+    (mirror / "rfc17a.txt").write_text("Historical filename\n")
+    (mirror / "rfcxx00.txt").touch()
+    (mirror / "rfc-ref.txt").symlink_to("rfc-ref.txt.new")
+    bad_link = mirror / "rfc1.txt"
+    bad_link.symlink_to("rfc100.txt")
+    project.restart_sync()
+
+    first = wait_report(project, state="acquisition_failed")
+    job = first["job_id"]
+    for retries, delay in enumerate((300, 900), start=1):
+        advance_retry(project, job, retries, delay=delay)
+    wait_job(project, job, "reconciliation_failed")
+    failures = [report for report in daemon_reports(project) if report["job_id"] == job]
+    assert len(failures) == 3, failures
+    for report in failures:
+        rejection = report["inventory_rejection"]
+        assert rejection["reason"] == "unexpected_link" and rejection["line"] > 1, report
+        assert rejection["entry_preview"].endswith("rfc1.txt -> rfc100.txt"), report
+        assert report["metrics"]["https_requests"] == 1, report
+        assert report["acquisition"]["txt_downloaded"] == report["audit"]["matched"] == 0, report
+    assert publication_snapshot(project) == "-1|0|0|0"
+    bad_link.unlink()
+    # Startup enqueues a fresh job after the invalid listing exhausted its retries.
+    project.restart_sync()
+    print("Invalid inventory was retried twice, then corrected on the same initialized stack", flush=True)
+
+
 def exercise_cold_daemon(project, client, sources, config, spool):
     valid = config.read_bytes()
     config.write_text("schema_version = 1\n")
@@ -1131,8 +1167,10 @@ def exercise_cold_daemon(project, client, sources, config, spool):
                            args=("-ec", "mkdir -m 0700 /rfc-https-spool/acquisition")), env=project.env)
     phase6.run(["sudo", "-n", "fallocate", "-l", "1G", str(spool / "acquisition/interrupted")])
     phase1.failed(project.app("sync", args=("--check-config",)), project.env, "spool lacks free bytes")
-    project.restart_sync()
+    exercise_inventory_retry(project)
     observed = wait_report(project, state="published", published_sequence=1)
+    assert observed["inventory_txt"] == len(sources)
+    assert observed["metrics"]["rsync_transferred_payload_bytes"] == 0, observed
     assert observed["metrics"]["minimum_start_spacing_us"] >= 1_000_000, observed
     assert observed["acquisition"]["txt_downloaded"] == observed["acquisition"]["txt_audited"] == len(sources)
     wait_job(project, observed["job_id"], "published")

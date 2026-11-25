@@ -99,6 +99,12 @@ It ignores known ancillary entries, including the exact listed
 reads metadata, and later rsync operations request canonical filenames.
 A rejected listing adds `inventory_rejection` to the acquisition report
 with the reason, one-based line number, and a bounded, escaped entry preview.
+For a listing rejected after a successful rsync exit, the daemon waits five
+minutes before the first automatic retry and fifteen minutes before the
+second, then fails the job if the listing is still invalid. A waiting retry
+takes priority over later automatic jobs. Manual reconciliation remains
+available. Transport failures and source convergence use the existing
+30- and 120-second delays.
 
 On a cold run, the two queues request required TXT and RFCXML from HTTPS.
 An existing TXT observation can be reused if it proves capture from the
