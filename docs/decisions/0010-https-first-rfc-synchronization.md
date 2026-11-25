@@ -36,9 +36,9 @@ collector and its two TXT policies are the baseline for this change.
 The next config version removes `txt_provenance` and the rsync acquisition
 mode selector. Old configuration must fail with a migration hint. Keep
 resource and scheduling settings separate from the fixed source policy.
-Feed owns its current polling and backoff outside Sync's request-start
-gate. The new design needs a common HTTPS start budget across Feed and
-Sync, including catalog probes, ordinary acquisition, retries, and repair.
+Phase 2 brokers Feed polling through Sync. Catalog probes, TXT, RFCXML,
+Feed polls, and retries share one HTTPS scheduler. Future repair requests
+use the same scheduler.
 
 A forward schema migration must represent HTTPS captures, checksum audit
 receipts, and exact-byte matches for repair as distinct evidence. Extend
@@ -71,7 +71,16 @@ without creating a candidate or a durable catalog observation. It can
 read historical evidence on PostgreSQL schema 9. The existing release
 continues to supply production ingestion while HTTPS acquisition and the
 audit gate are developed. Phase 1 retains sequence-checked rollback to
-an already retained generation. [Phase 1 configuration and discovery](../ingestion.md)
+an already retained generation. [Phase 1 evidence](../implementation-status.md#https-first-rfc-synchronization-phase-1)
+
+## Phase 2 rollout
+
+Use a Sync-only, bounded run spool for originals and observations. Manual
+and automatic requests share a single HTTPS owner and preserve the corpus
+fence through cleanup. The spool supports acquisition only. Phase 3 adds
+CAS, durable checkpoints, and joins. The existing PostgreSQL schema and
+publication gate remain in force.
+[Shadow runbook](../deployment.md#https-first-phase-2-shadow-runbook)
 
 ## Cold-start timing
 

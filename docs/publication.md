@@ -7,10 +7,10 @@ The PostgreSQL `rfc.active_generation` row identifies the active generation and 
 Run these commands with the sync binary, sync database credentials, and its writable mirror in the private Compose environment.
 
 The command table describes the published schema 9 collector. With the
-HTTPS-first Phase 1 build, `--phase2-reconcile` reports discovery and
+HTTPS-first Phase 2 build, `--phase2-reconcile` reports acquisition and
 `--phase3-publish` fails at the publication gate. The retained-generation
 rollback and maintenance commands still use the rules below.
-[Discovery and rollout](ingestion.md#run-discovery)
+[Acquisition and rollout](ingestion.md#run-acquisition)
 
 | Command | Effect |
 |---|---|

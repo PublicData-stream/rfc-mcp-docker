@@ -2,7 +2,7 @@
 
 A read-only RFC research MCP service under development. Sync builds and publishes indexed snapshots of original RFC Editor TXT and metadata with recorded source evidence. Feed and publication hints use private authenticated HTTP. Operators can roll back retained generations, and readers hold a generation guard while accessing corpus data. The MCP endpoint exposes generation-scoped list, search, retrieval, section, and sandboxed ripgrep tools.
 
-The HTTPS-first Phase 1 build runs discovery and gates new publication. See [Phase 1 discovery](docs/ingestion.md#run-discovery).
+The HTTPS-first Phase 2 build acquires original TXT and RFCXML through one shared HTTPS budget. New publication awaits the required TXT audit. See [Phase 2 acquisition](docs/ingestion.md#run-acquisition) and the [shadow runbook](docs/deployment.md#https-first-phase-2-shadow-runbook).
 
 See [Docker Compose deployment](docs/deployment.md), the [MCP API](docs/mcp.md), [implementation status](docs/implementation-status.md), [candidate ingestion](docs/ingestion.md), [control plane and key rotation](docs/control.md), [publication and recovery](docs/publication.md), [storage and database provisioning](docs/storage.md), and [contributing](CONTRIBUTING.md).
 

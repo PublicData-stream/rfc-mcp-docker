@@ -24,14 +24,22 @@ Choose a new key ID and generate a fresh key. Install it as the active key on th
 
 Feed polls the official publication feed every 15 minutes plus jitter. Conditional validators advance only after its hints are acknowledged. The RFC publication identifier determines the observation fingerprint and event ID, so a replay, a switch between feed formats, or a restart can repeat the same hint safely. A feed hint acknowledges durable acceptance, which can refer to an existing job. Inspect `rfc.control_events.job_id`, the event status, and `rfc.sync_jobs.state` to see whether work has completed. A failed job is terminal after two retries. Later scheduled work can still reconcile independently.
 
-With HTTPS-first Phase 1, startup, scheduled work, and Feed hints run the
-same full discovery. A completed job records `outcome = 'discovery_complete'`.
-Hints whose digests have yet to match an eligible catalog ID or mirror
-entry defer the job within the existing retry budget. Feed bursts coalesce
-into one pending job and newly queued Feed work waits one second before
-being claimed. The incumbent remains readable and new publication is
+With HTTPS-first Phase 2, Feed requests a poll through the Sync control
+listener. Sync owns the upstream validators and schedules the fetch in the
+same HTTPS budget as catalog, TXT, and RFCXML. Feed retains cadence,
+deduplication, and durable hint delivery. The Phase 2 deployment overlay
+removes Feed's separate upstream network. The preceding direct-poll
+behavior applies to the qualified schema 9 release.
+
+Phase 2 startup, scheduled work, and Feed hints use the same full
+acquisition. Successful jobs record `acquisition_complete`. Hints whose
+digests have yet to match an eligible catalog ID or mirror entry defer the
+job within the existing retry budget. PostgreSQL advisory key `-3` and the
+shared spool lease serialize HTTPS ownership. The local Sync-UID socket
+lets an operator join the active matching acquisition or queue one
+different scope. The incumbent remains readable and new publication is
 gated. Previously queued publication notifications can still be delivered.
-[Phase 1 discovery](ingestion.md#run-discovery)
+[Phase 2 acquisition](ingestion.md#run-acquisition)
 
 The following publication behavior applies to the deployed schema 9 release.
 
@@ -45,7 +53,15 @@ For operator rollback, stop the sync daemon, obtain the current publication sequ
 
 Issue a POST to `/internal/v1/identify` with body `{}` and epoch `bootstrap`. The signed response carries `epoch`. Use that epoch on business routes. `sync-requested` takes `event_id` (UUID), `observation_digest` (64 lowercase hex characters), `observed_at` (Unix seconds), and `reason` (`feed_publication`). `generation-committed` takes `event_id`, `generation_id`, and `publication_sequence` as well as an optional `manifest_digest`. Business replies contain `event_id` and `outcome` (`accepted`, `observed`, or `superseded`).
 
-Both reply types bind the raw JSON and HTTP status to the caller and initiating nonce. The response headers are `X-RFC-Request-Nonce`, `X-RFC-Receiver`, and `X-RFC-Response-Signature`. The response MAC uses a separate domain prefix from the request MAC. Phase 6 processes one bounded request per connection.
+On the Phase 2 Feed-to-Sync link, `/internal/v1/feed-poll` takes
+`format` (`atom` or `rss`) and optional `known`, a lowercase hexadecimal
+digest of the last acknowledged sorted RFC list. A response is
+`"pending"`, `"unchanged"`, `{"retry":seconds}`, or
+`{"publications":[... RFC numbers ...]}`. The list has at most 256
+canonical RFC numbers. Sync queues upstream work and returns inside the
+existing control deadline.
+
+Successful replies bind the raw JSON and HTTP status to the caller and initiating nonce. The response headers are `X-RFC-Request-Nonce`, `X-RFC-Receiver`, and `X-RFC-Response-Signature`. The response MAC uses a separate domain prefix from the request MAC. Phase 6 processes one bounded request per connection.
 
 The request prefix starts with `RFMCP-HMAC-SHA384-V1`. In order, the remaining lines carry the key ID, caller, audience, epoch, Unix timestamp, nonce, `POST`, literal request path, `application/json`, and decimal body length. End the prefix with a blank line and append the original JSON bytes. Send the key ID, caller, audience, epoch, timestamp, nonce, and tag in their corresponding `X-RFC-*` headers.
 

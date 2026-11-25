@@ -2,18 +2,59 @@
 
 The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It requires a qualified Linux Docker host, an existing HTTPS reverse proxy, and a dedicated Docker ingress network shared with that proxy. Follow the [deployment prerequisites](deployment-prerequisites.md).
 
-## HTTPS-first Phase 1
+## HTTPS-first Phase 2 shadow runbook
 
-Keep production on the existing schema 9 release. Phase 1 is a discovery
-milestone for disposable qualification. It creates no candidate and gates
-`--phase3-publish`. Use the [v2 TOML example](../deploy/ingestion.toml.example)
-with the Phase 1 Sync image and its required read-only file mount. The
-production Compose layout and Sync resource limits apply to the fixture.
-Run the local preflight and discovery checks with the disposable database
-and mirror. [Discovery and v1 migration](ingestion.md#sync-configuration)
+Keep incumbent Serve online with its qualified schema 9 images and mirror.
+Phase 2 acquisition is available for private qualification and a separately
+authorized shadow run. Build or preload the matching Phase 2 Sync and Feed
+images. Use a separate Compose project, private networks and credentials,
+and a matched copy of the schema 9 database and mirror. Follow the
+[backup and restore procedure](publication.md#backup-and-restore) to make the
+copy. Point the shadow notification channel to a private receiver with its
+own keys, and keep the shadow project off production ingress.
 
-The remaining procedures cover the qualified schema 9 release. Run them
-from its checkout with the matching images and v1 configuration.
+1. Provision a separate ext4 spool with 5 GiB and 65,536 inodes. Mount it
+   `nosuid,nodev,noexec`, set mode `0700`, and map ownership to container
+   UID/GID `10002:10002` using the deployment engine's namespace mapping.
+   The spool holds run files and HTTPS cooldown state outside the canonical
+   mirror and PostgreSQL. Allow at least 4 GiB plus 640 MiB free for the
+   default accepted-byte budget and at least 40,016 free inodes.
+2. Set `RFC_SYNC_SPOOL_HOST_DIR` to its mountpoint and
+   `RFC_SYNC_CONFIG_HOST_FILE` to a private copy of the
+   [v2 TOML example](../deploy/ingestion.toml.example). Render the overlay
+   and verify that Sync alone mounts the spool and that Feed has only its
+   internal control network. Run the preflight with the actual runtime UID
+   and resource limits.
+3. Qualify first against private upstream fixtures. Check
+   `acquisition_complete`, matching catalog observations, pacing, TXT and
+   XML counts, and spool cleanup. Confirm the incumbent sequence and an
+   exact-byte pinned MCP read.
+4. Before any authorized official-source run, agree on sample or full scope,
+   a time limit, and an upstream request cap. Drain incumbent Sync and
+   Feed egress and wait out known cooldown before enabling shadow egress.
+   Use a one-shot for bounded sample scope. A daemon startup queues a full
+   run. Stop shadow Feed and Sync at the end of the agreed window, wait out
+   any recorded cooldown, and resume incumbent collection. Verify the
+   incumbent's readiness and queue or outbox progress. Retain the shadow
+   spool's cooldown state through the handoff. Discard the isolated
+   snapshot and credentials when the review is complete.
+
+~~~sh
+export RFC_SHADOW_ENV=/path/to/private/shadow.env
+shadow() {
+  docker compose -p rfc-https-shadow --env-file "$RFC_SHADOW_ENV" \
+    -f compose.yml -f deploy/compose.https-acquisition.yml "$@"
+}
+shadow config --quiet
+shadow run --rm --no-deps rfc-mcp-docker-sync --check-config
+shadow run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --sample
+~~~
+
+Use the [private acquisition fixture](../scripts/https-discovery/integration.py)
+for qualification. The sample command in the snippet uses the stock image
+and is for the authorized official-source window. The remaining production
+procedures apply to the qualified schema 9 release with its matching
+checkout, images, and v1 configuration.
 
 ## Provision
 

@@ -15,7 +15,7 @@ min_request_start_interval_ms = 1000
 request_timeout_seconds = 30
 max_attempts = 3
 
-# Phase 1 validates the following settings for their later runtime consumers.
+# Phase 2 uses these bounds for independent TXT and RFCXML acquisition.
 [ingestion.pipeline]
 txt_queue_items = 64
 xml_queue_items = 64
@@ -25,6 +25,7 @@ parser_workers = 2
 raw_payload_budget_bytes = 50331648
 parse_budget_bytes = 402653184
 
+# Reserved for the later audit and commit phases.
 [ingestion.revalidation]
 max_rsync_sessions = 1
 batch_size = 512

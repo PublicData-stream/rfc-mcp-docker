@@ -1,9 +1,10 @@
 # RFC discovery and candidate ingestion
 
-The HTTPS-first Phase 1 build performs discovery on demand and through the
-Sync daemon. Both paths use the same source policy under the corpus lock.
-The existing schema 9 release continues to supply production ingestion
-until required HTTPS TXT and audit evidence can gate new publications.
+HTTPS-first Phase 2 runs the same discovery and acquisition engine for
+manual requests and daemon jobs. Successful acquisition seals HTTPS
+originals and classifies RFCXML for later processing. Required TXT audit
+and candidate publication are later phases. The qualified schema 9 release
+continues to supply production ingestion.
 [HTTPS-first design](decisions/0010-https-first-rfc-synchronization.md)
 
 ## Sync configuration
@@ -26,29 +27,26 @@ own format and cadence. [Control and Feed](control.md)
 | `ingestion.https.request_timeout_seconds` | 30 | 5–30 |
 | `ingestion.https.max_attempts` | 3 | 1–3 |
 
-The accepted-byte limit covers both catalog captures and local canonical
-TXT rehashes. The ten-minute discovery deadline applies independently.
-Transient catalog fetch errors use up to three total attempts. A valid
-`Retry-After` from a 429 or 503 delays subsequent Sync HTTPS starts. Delays
-above 30 seconds end the immediate retry and remain in effect for the
-daemon's later catalog work.
+The accepted-byte limit covers original captures and reused inputs. Discovery
+also applies it to canonical TXT rehashes. The ten-minute discovery deadline
+applies independently of acquisition. Sync schedules opening and closing
+catalog captures, TXT, RFCXML, Feed polls, and retries under one request
+budget. Valid `Retry-After` on 429 or 503 applies to all classes and survives a
+process handoff. Acquisition makes up to three attempts per artifact. A
+delay above 30 seconds ends immediate retries. The 900-second target is
+informational.
 
-The remaining tables in the example reserve and validate capacity for
-subsequent phases. Defaults are the initial upper limits for queue sizes,
-active documents, workers, payload and parse budgets, sessions, timeouts,
-and batch sizes. The queue sizes and budgets must cover the active window
-at 16 MiB raw and 128 MiB parse bytes per document. The documented 900-second
-target is informational. Set one increasing backoff of 1–120 seconds per
-rsync retry. For one total attempt, set `retry_backoff_seconds = []`.
-Revalidation cadence accepts 3600–604800 seconds.
+The pipeline table controls descriptor queue depths, the active artifact
+window, parser workers, and raw and parse budgets. The active window
+requires a reservation of 16 MiB of raw capacity and 128 MiB of parse
+capacity per slot. The revalidation and database settings are validated
+for later phases.
 
-Run `rfc-mcp-docker-sync --check-config` for the effective settings, the
-publication gate, and the list of settings awaiting runtime consumers. Its
-JSON includes the 8 MiB scratch reservation and the memory estimate, which
-includes workspace capacity, two catalog bodies, inventory buffers, raw and
-parse budgets, and compact queue descriptors. Available scratch and memory
-are capped at 512 MiB and 2 GiB and tightened by the observed filesystem,
-host, and cgroup limits. Sync uses its startup snapshot until restart.
+Run `rfc-mcp-docker-sync --check-config` with the HTTPS acquisition overlay
+to report effective configuration, the publication gate, scratch and
+cgroup capacity, and the spool's free bytes and inodes. It performs local
+checks before connecting to PostgreSQL or upstream. Sync uses its startup
+snapshot until restart. [Spool and shadow setup](deployment.md#https-first-phase-2-shadow-runbook)
 
 ### Translate v1 settings
 
@@ -63,32 +61,44 @@ their TOML equivalents and remove both old environment variables. Remove
 Choose inventory and future audit timeouts from their individual v2 fields.
 Keep the v1 file and its matched images for the existing deployment.
 
-## Run discovery
+## Run acquisition
 
-Use a disposable project with the private upstream fixture for qualification.
-The existing CLI names select full or sample discovery.
+Use a disposable project with a private upstream fixture for qualification.
+The existing manual command takes `--full` or `--sample`. The sample
+selects RFCs 2119, 8174, and 9110. In the Compose project, an invocation
+while the daemon runs uses its private Sync-UID socket. A matching request
+joins the active run. One different-scope request may wait for the next
+run. With the daemon stopped, the CLI acquires the deployment lease and
+runs directly.
 
 ~~~sh
-docker compose run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --full
-docker compose run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --sample
+docker compose -f compose.yml -f deploy/compose.https-acquisition.yml \
+  run --rm --no-deps rfc-mcp-docker-sync --phase2-reconcile --sample
+docker compose -f compose.yml -f deploy/compose.https-acquisition.yml \
+  exec -T rfc-mcp-docker-sync /usr/local/bin/rfc-mcp-docker-sync --phase2-reconcile --full
 ~~~
 
-Discovery selects the complete expected TXT set from the official opening
-catalog. Sample runs select RFCs 2119, 8174, and 9110. The fixed TXT rsync
-module supplies root-level availability through a bounded listing. Source
-sizes and times are hints. Sync rehashes selected incumbent originals before
-reporting them as potential reuse inputs for later audit. A newly expected
-TXT that has yet to appear on the mirror defers discovery. Loss of an
-already accepted required RFC, a malformed inventory, a corrupt canonical
-blob, and unequal opening and ending catalog bytes fail discovery.
+The opening HTTPS catalog supplies the expected TXT set. A bounded rsync
+inventory classifies mirror availability. New required TXT that has yet to
+appear on the mirror defers the run. Loss of incumbent required TXT,
+invalid inventory, local canonical corruption, and unequal opening and
+ending catalog bytes fail the run.
 
-The terminal JSON gives the state, scope, active publication sequence,
-catalog observations, inventory digest and counts, and selection identity
-when sealed. `discovery_deferred` and `discovery_failed` return nonzero from
-the manual command. A successful discovery leaves candidates, the active
-pointer, source observations, and the outbox as they were. Explicit
-publication is gated. Existing retained rollback remains available.
-[Deployment](deployment.md)
+On a cold run, the two queues request required TXT and RFCXML from HTTPS.
+Warm TXT reuse requires a verified HTTPS observation, a matching canonical
+digest, and compatible size. TXT remains pending audit even when inventory
+metadata matches. A positive RFCXML capture can be reused for up to 24
+hours from its original capture when its catalog and processing versions
+match and its original rehashes and parses successfully. HTTP 404, HTTP
+410, malformed captures, and failed fetches remain separate XML outcomes.
+
+The terminal report includes selection and catalog observations, final
+state, staged bytes, queue peaks, and TXT download, seal and reuse counts.
+It separately reports classified RFCXML, TXT audit, and membership counts.
+`acquisition_complete` leaves candidates, source observations, and the
+active pointer untouched. The private run spool is cleaned after the run.
+The deferred and failed states return nonzero from the manual command.
+[Control behavior](control.md#reconciliation-and-publication)
 
 ## Schema 9 release pipeline
 

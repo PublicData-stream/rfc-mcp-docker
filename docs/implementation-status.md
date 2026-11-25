@@ -996,3 +996,73 @@ python3 -B scripts/phase7/integration.py --config-only --context rootless --imag
 ```
 
 Run the same commands with context `default` on a rootful engine.
+
+## HTTPS-first RFC synchronization Phase 2
+
+Manual and daemon reconciliation run independent bounded HTTPS TXT and
+RFCXML acquisition through one deployment lease. Feed polls through
+Sync's authenticated broker. Completed runs seal originals and
+classifications in a private disk spool and confirm the ending catalog.
+The spool is removed after each run. PostgreSQL stays at schema 9 and
+new publication remains gated. [Acquisition](ingestion.md#run-acquisition) ·
+[Shadow runbook](deployment.md#https-first-phase-2-shadow-runbook)
+
+### Offline verification on 2026-11-25
+
+- The frozen workspace gate passed, including the MCP wire probe. Frozen
+  all-feature Clippy and tests passed. The scheduler test exercised lane
+  rotation and cancellation, and the operator test exercised attachment
+  and a single queued different scope.
+- Phase 0 Compose passed on both Docker engines. It exercised PostgreSQL
+  authorization, exact rsync, checked TLS, MCP, and Landlock and seccomp
+  confinement. The config-only probes passed spool ownership and
+  preflight, the Sync-only read-only config bind, and Feed's
+  internal-only network on both engines.
+- The rootless acquisition suite passed. Its cold six-RFC run made 14
+  HTTPS starts and staged 28,097 artifact bytes with a peak of three
+  active artifact jobs. Its minimum start intervals were 1,000,861 µs
+  on the cold run and 1,001,080 µs on the warm run. The warm run reused
+  incumbent HTTPS TXT and eligible RFCXML. Tests verified exact staged
+  bytes while a response in the other queue was held, one-slot
+  backpressure, spool and accepted-byte limits, differing XML outcomes,
+  deterministic content summaries, and a parser panic. Both
+  `Retry-After` forms held across a forced restart. The fixture also
+  checked Feed pacing and hint convergence, manual routing, the
+  promotion gate, incumbent reads, and retained rollback.
+- The rootful acquisition run passed the cold, fault, pacing, Feed, and
+  operator cases. Its warm run reused all six TXT and three RFCXML
+  originals and made five HTTPS starts. The idle-catalog assertion
+  timed out because the fixture passed the container variable where
+  Compose expected its host setting. After correcting the setting, the
+  focused rootful rerun passed the idle probe and retained rollback at
+  a warm minimum start interval of 1,000,655 µs. The same focused
+  rerun passed rootlessly at 1,000,570 µs. An earlier rootless fault
+  probe was corrected to target an RFC with an XML response so that
+  it reached the parser.
+- A disposable minikube profile used the rootless Docker driver,
+  Kubernetes 1.37.0, and containerd. The stock images passed the
+  preflight pod. Sync ran as UID 10002, used the read-only v2 ConfigMap
+  and its private spool, and reported a 2 GiB cgroup limit and 512 MiB
+  scratch. Feed had neither mount. A second profile verified that the
+  stock CLI reached a same-UID Unix socket peer across containers and
+  returned its sample report. The Compose fixture exercised the actual
+  daemon and denied an invocation using UID 10003. Both profiles and
+  their files were removed.
+
+All acquisition requests in the qualification use private upstream
+fixtures. Official-source performance and production rollout remain
+separate from this evidence.
+
+With the matching local images loaded, run these probes in each engine
+context. Use `default` for the rootful engine and `rootless` for the
+rootless engine.
+
+~~~sh
+export RFC_E2E_PRELOADED=1
+python3 -B scripts/phase0/integration.py --context "$context" --project "$prefix" --skip-build
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix"
+python3 -B scripts/phase7/integration.py --config-only --context "$context" --image-prefix "$prefix"
+~~~
+
+Add `--incumbent-only` to the acquisition command to repeat the warm
+reuse, idle catalog, and rollback cases in a fresh fixture.
