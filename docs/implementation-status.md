@@ -1150,8 +1150,9 @@ python3 -B scripts/phase3/integration.py --context "$context" --image-prefix "$p
 python3 -B scripts/phase7/integration.py --context "$context" --image-prefix "$prefix"
 ~~~
 
-For the pod replacement check, use a dedicated rootless Docker Minikube
-profile and preloaded pinned PostgreSQL and matching fixture images.
+For the Phase 3 pod replacement check, use the Phase 3 checkout, a dedicated
+rootless Docker Minikube profile, and preloaded pinned PostgreSQL and
+matching fixture images.
 
 ~~~sh
 probe_root=$(mktemp -d /tmp/rfc-processing-kube.XXXXXXXX)
@@ -1167,3 +1168,108 @@ rm -r -- "$probe_root"
 
 All acquisition requests were to private fixture services. The full
 official corpus startup target remains unmeasured.
+
+## HTTPS-first RFC synchronization Phase 4
+
+Implementation `aa2ce14` audits required HTTPS TXT with the packaged rsync
+checksum dry run. A mismatch requires fresh HTTPS and rsync originals with
+exact byte equality before Sync reseals the HTTPS checkpoint. The
+Sync-only audit filesystem retains bounded receipts, attempts, and
+quarantined pairs. Schema 10, the promotion gate, incumbent MCP reads, and
+explicit rollback retain their earlier behavior.
+[Audit and repair](ingestion.md#audit-and-repair) ·
+[Shadow deployment and rollback](deployment.md#https-first-phase-4-shadow-runbook)
+
+### Offline verification on 2026-11-25
+
+- The frozen Rust gate passed, including the MCP wire probe. Frozen
+  all-feature Clippy and tests also passed. The first Rust run exposed an
+  outdated positive assertion for the smaller container profile. The
+  updated assertion allows for the audit memory reservation. The parser
+  regressions also reject wrong kinds, unexpected and duplicate names,
+  incomplete receipts, disabled checksums, and oversized output.
+- Phase 0 passed on rootful Docker 29.10.1 and rootless Docker 29.10.0.
+  The shadow Compose config checks passed on both engines and verified the
+  Sync-only audit and spool mounts, rejection of a missing or RAM-backed
+  audit mount, config ownership, and resource preflight. One concurrent
+  rootless Phase 0 launch reported an unhealthy PostgreSQL container.
+  The isolated rerun of the committed image set passed.
+- The packaged rsync 3.5.2 loopback check emitted explicit unchanged rows
+  with XXH128 on protocol 33 and with MD4 when forced to protocol 29.
+  A daemon offering only `none` failed negotiation with exit 4. The
+  independently checked one-file rsync repair receipt described an exact
+  four-byte fixture transfer.
+- The final Sync image was
+  `sha256:3a641f150b6a5acfccd8eb55d07cb225287576b10e981b4e0cc7de5c03990fdb`.
+  The six-RFC cold fixture made 14 HTTPS starts and staged 28,097
+  artifact bytes with at most three active artifact jobs. Both Docker
+  engines recorded six explicit checksum matches using a 27,435-byte
+  snapshot and zero rsync payload transfers. Each checksum session took
+  109 ms in these runs.
+- The audit suite passed on both Docker engines. The probes exercised
+  held-audit overlap, missing and truncated sessions, timeout recovery,
+  local snapshot mutation, metadata-only and
+  content changes, exact repaired CAS, and restart across persisted receipts
+  and repair attempts. It checked shared HTTP cooldown, transient convergence,
+  persistent divergence, retry exhaustion, and the quarantine item cap.
+  A preliminary run stopped at the quota probe because the earlier image
+  charged each stored pair at its maximum possible size. The committed
+  image accounts for the stored pair sizes. An earlier rootful convergence
+  fixture supplied identical source bodies. The corrected fixture waits
+  for a quarantined divergent pair before updating HTTPS.
+- The populated rootless Compose fixture exercised persistent same-size
+  disagreement, corrupt CAS, missing incumbent files, startup audit and
+  checkpoint reuse, the promotion gate, and explicit retained rollback.
+  The incumbent remained ready and served exact RFC 2119 bytes. The warm
+  daemon run had a minimum HTTPS start spacing of 1,000,680 µs.
+- The rootless scheduling probe passed. It observed HTTPS progress during
+  a delayed checkpoint, verified the one-slot resource bounds, and exercised both
+  forms of `Retry-After` across SIGKILL. It also checked daemon attachment
+  and queuing for manual requests, plus Feed hint coalescing and source
+  convergence.
+- A disposable rootless Minikube 1.39.0 cluster ran Kubernetes 1.37.0 with
+  containerd. Stock preflight and Feed isolation passed. Replacing a crashed
+  Sync pod sealed its durable repair pair without another repair request.
+  Cold and warm runs made 14 and five HTTPS starts, respectively. The
+  replacement reused the other audit receipts and left publication sequence
+  zero. The first pod correctly rejected the node's RAM-backed `/tmp`.
+  The built-in 9p mount could not attach in the rootless node, so the
+  rerun used a private 1 GiB ext4 image from the host's `/tmp` mounted
+  at a node path under `/tmp`. The profile and mount were removed after
+  qualification.
+
+### Reproduce the private checks
+
+Use matching stock and fixture images with a common prefix on each
+engine. Run Compose timing probes serially for each engine. The
+qualification used the pinned PostgreSQL 19.0 image and disposable
+ext4 staging.
+
+~~~sh
+export TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target RFC_E2E_PRELOADED=1
+cargo fetch --locked --offline
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+python3 -B scripts/phase0/integration.py --context "$context" --project "$prefix" --skip-build
+python3 -B scripts/phase7/integration.py --context "$context" --image-prefix "$prefix" --config-only
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" --audit-only
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" --incumbent-only
+python3 -B scripts/https-discovery/integration.py --context "$context" --image-prefix "$prefix" --scheduler-only
+~~~
+
+For Minikube, use a disposable profile with `MINIKUBE_HOME`, `KUBECONFIG`,
+and `TMPDIR` under `/tmp`. Attach a disk-backed audit directory beneath
+the node's `/tmp` and make it writable by UID/GID 10002. The probe creates
+and removes its own subdirectory there.
+
+~~~sh
+python3 -B scripts/https-discovery/minikube.py --profile "$profile" \
+  --image-prefix "$prefix" --audit-node-dir /tmp/rfc-audit-disk
+~~~
+
+Logs, image IDs, exit statuses, and the host mount helper are under
+`/tmp/rfc-audit-qual.uQ1SHxN9` on the qualification host.
+
+All RFC requests used private fixtures. Official rsync compatibility,
+official corpus timing, and new-policy publication are later gates.

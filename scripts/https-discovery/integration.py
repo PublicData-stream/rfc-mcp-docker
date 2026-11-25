@@ -583,13 +583,13 @@ def history(project):
     )
 
 
-def fast_audit_config(work, *, batch_size=512, session_timeout=20):
-    config = work / f"audit-{batch_size}-{session_timeout}.toml"
+def fast_audit_config(work, *, batch_size=512, session_timeout=20, retry_seconds=1):
+    config = work / f"audit-{batch_size}-{session_timeout}-{retry_seconds}.toml"
     config.write_text(f"""schema_version = 2
 [ingestion.revalidation]
 batch_size = {batch_size}
 max_attempts = 2
-retry_backoff_seconds = [1]
+retry_backoff_seconds = [{retry_seconds}]
 session_timeout_seconds = {session_timeout}
 """)
     config.chmod(0o444)
@@ -720,13 +720,16 @@ def exercise_audit(project, work, sources, fresh, audit):
     # Start a divergent pair, then let the HTTPS source converge after the
     # original pair is durably quarantined.
     remote_stamp -= 5_000_000_000
-    rsync.write_bytes(second)
+    rsync.write_bytes(changed)
     os.utime(rsync, ns=(remote_stamp, remote_stamp))
     mode.write_text("normal")
-    operation = project.app("sync", "-T", *fast, args=("--phase2-reconcile", "--full"))
+    convergence_config = fast_audit_config(work, retry_seconds=4)
+    operation = project.app("sync", "-T", *convergence_config, args=("--phase2-reconcile", "--full"))
     with subprocess.Popen(operation, env=project.env, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as collector:
         def quarantined():
+            if collector.poll() is not None:
+                raise AssertionError(("repair finished before the fixture diverged", collector.communicate()))
             return subprocess.run(["sudo", "-n", "find", str(audit / "quarantine"), "-name", "receipt",
                                    "-print", "-quit"], text=True, capture_output=True,
                                   check=True, timeout=5).stdout
@@ -766,7 +769,8 @@ def exercise_audit(project, work, sources, fresh, audit):
     assert full["audit"]["repair_attempts"] == 0, full
     assert publication_snapshot(project) == snapshot
     print("Audit overlap, explicit receipts, snapshot mutation, missing and truncated sessions, "
-          "timeout recovery, pair replay, cooldown, exact repaired CAS, and quarantine bounds passed", flush=True)
+          "timeout recovery, pair replay, cooldown, convergence, exhaustion, exact repaired CAS, "
+          "and quarantine bounds passed", flush=True)
 
 
 def exercise(project, work, spool, audit, incumbent_only, old_driver=None, scheduler_only=False, audit_only=False):

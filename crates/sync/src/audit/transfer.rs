@@ -400,6 +400,14 @@ mod tests {
             [true, false, false, true]
         );
         let text = std::str::from_utf8(good).unwrap();
+        let legacy = text.replace("Client negotiated checksum: xxh128", "Client checksum: md4");
+        assert_eq!(
+            parse_compare(legacy.as_bytes(), &inputs())
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("md4")
+        );
         for bad in [
             text.replace("xxh128", "none"),
             text.replace("rfc101.txt", "rfc100.txt"),
@@ -412,5 +420,11 @@ mod tests {
         ] {
             assert!(parse_compare(bad.as_bytes(), &inputs()).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_output_beyond_the_receipt_limit() {
+        let output = vec![b'x'; OUTPUT_LIMIT as usize + 1];
+        assert!(read_bounded(output.as_slice(), OUTPUT_LIMIT).await.is_err());
     }
 }
