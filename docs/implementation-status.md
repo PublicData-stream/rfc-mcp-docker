@@ -421,6 +421,19 @@ to `scripts/ci/docker-e2e.py build` with `--builder` and
   originals with five HTTPS starts. Cleanup removed the disposable
   builders, image tags, profile, and both ext4 mounts.
 
+### Phase 3 checkpoint fixture
+
+The amd64 `phase3` check failed while removing `rfc102.xml`. The synthetic
+NUL fixture now uses RFC 542. The checkpoint probe uses `phase2.NUL_RFC` to
+expire the RFCXML row, remove the source fixture, and verify blob eviction.
+[Failing Phase 3 job](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/45605432824/job/139181936257)
+
+On 2026-11-25, both the focused `--checkpoints` probe and the full `phase3`
+CI case passed on rootful Linux amd64. The focused probe checked expiry,
+eviction, retries, corruption handling, and garbage collection. The full
+case also passed publication, accepted-reader fencing, recovery, and
+backup restoration.
+
 ## RustSec dependency checks
 
 The RustSec job audits the committed workspace `Cargo.lock` on every CI run and at 04:17 UTC daily on the default branch. `CI summary` requires RustSec, Rust checks, and Docker E2E to succeed before the release workflow can accept that commit's main-branch CI result.

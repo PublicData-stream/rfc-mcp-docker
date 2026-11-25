@@ -265,9 +265,11 @@ parser_workers = 1
     assert saved[(first["rfc"], "txt")] == first
     check_checkpoint_quota(project)
     change_cached_file(project, saved[(8174, "rfcxml")]["digest"], 'rm -- "$1"')
+    expired_rfc = phase2.NUL_RFC
+    expired_digest = saved[(expired_rfc, "rfcxml")]["digest"]
     project.sql("UPDATE rfc.ingestion_checkpoints SET expires_at=now()-interval '1 second'"
-                " WHERE rfc_id=102 AND kind='rfcxml'")
-    (project.source / "https/rfc102.xml").unlink()
+                f" WHERE rfc_id={expired_rfc} AND kind='rfcxml'")
+    (project.source / f"https/rfc{expired_rfc}.xml").unlink()
     for transport in ("rsync", "https"):
         (project.source / transport / "rfc101.txt").write_bytes(sources[101] + b"\nUpdated TXT.\n")
     ready = project.reconcile()
@@ -275,7 +277,7 @@ parser_workers = 1
     assert counts["checkpoint_txt"] == len(sources) - 1 and counts["txt_downloaded"] == 1, ready
     assert counts["xml_reused"] == counts["xml_captured"] == 1, ready
     assert counts["xml_not_found"] == len(sources)-2, ready
-    assert not project.canonical(saved[(102, "rfcxml")]["digest"]).exists()
+    assert not project.canonical(expired_digest).exists()
     generation = int(ready["generation_id"])
     retained = saved[(9110, "rfcxml")]
     assert project.sql(
