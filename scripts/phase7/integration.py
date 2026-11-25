@@ -268,6 +268,8 @@ parse_budget_bytes = 134217728
             (b"schema_version = 2\n[ingestion]\nunknown = true", "invalid ingestion TOML"),
             (b"schema_version = 2\n[ingestion.https]\nurl = 'https://invalid.example'", "invalid ingestion TOML"),
             (b"schema_version = 2\n[ingestion.rsync]\npath = '/mirror/blobs'", "migrate to schema v2"),
+            (b"schema_version = 2\n[ingestion]\ntxt_provenance = 'rsync_bootstrap'", "migrate to schema v2"),
+            (b"schema_version = 2\n[ingestion.revalidation]\nchecksum_choice = 'none'", "invalid ingestion TOML"),
             (b"schema_version = 2\n[ingestion.https]\nmax_in_flight_requests = 0", "1 through 2"),
             (b"schema_version = 2\n[ingestion.https]\nmin_request_start_interval_ms = 999", "1000 through 60000"),
             (b"schema_version = 2\n[ingestion]\nmax_accepted_bytes = 4294967297", "1 through 4294967296"),

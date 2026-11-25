@@ -16,6 +16,8 @@ class FeedUpstream(phase2.Https):
         if self.path not in ("/rfcatom.xml", "/rfcrss.xml"):
             if self.path == "/rfc-index.xml":
                 deadline = time.monotonic() + 25
+                if (root / "hold-catalog").exists():
+                    print("fixture catalog held", flush=True)
                 while (root / "hold-catalog").exists() and time.monotonic() < deadline:
                     time.sleep(0.1)
             return super().do_GET()

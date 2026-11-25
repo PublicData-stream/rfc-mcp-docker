@@ -15,7 +15,7 @@ SPEC = importlib.util.spec_from_file_location("phase1", HERE.parent / "phase1" /
 phase1 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(phase1)
 run = phase1.run
-NUL_RFC = 102
+NUL_RFC = 542
 
 
 class Project(phase1.Project):
@@ -109,7 +109,8 @@ def prepare(project, *, include_nul=False):
     if include_nul:
         entries.append(catalog_entry(NUL_RFC, "NUL bytes with RFCXML"))
         (source / f"https/rfc{NUL_RFC}.xml").write_bytes(
-            b'<rfc number="102"><back><references><name>Normative References</name>'
+            f'<rfc number="{NUL_RFC}">'.encode()
+            + b'<back><references><name>Normative References</name>'
             b'<reference><seriesInfo name="RFC" value="2119"/></reference></references></back></rfc>'
         )
     (source / "catalog.xml").write_text(

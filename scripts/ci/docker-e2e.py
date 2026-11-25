@@ -38,6 +38,7 @@ CASE_FIXTURES = {
     "phase8": ("publication-fixture",),
     "bootstrap-quick": ("publication-fixture", "control-fixture"),
     "https-publication": ("publication-fixture", "control-fixture"),
+    "https-faults": ("publication-fixture", "control-fixture"),
 }
 ARCH_NAMES = {"x86_64": "amd64", "aarch64": "arm64", "amd64": "amd64", "arm64": "arm64"}
 
@@ -159,8 +160,10 @@ def run_case(args, docker):
 def run_probe(args, docker, checkout, image_prefix):
     scripts = checkout / "scripts"
     case = "phase6" if args.case == "phase6-legacy" else args.case
+    if case in ("https-publication", "https-faults"):
+        case = "https-discovery"
     script = (scripts / "bootstrap" / "baseline.py" if args.case == "bootstrap-quick"
-              else scripts / ("https-discovery" if args.case == "https-publication" else case) / "integration.py")
+              else scripts / case / "integration.py")
     prefix_option = "--project" if args.case == "phase0" else "--image-prefix"
     command = [sys.executable, "-B", str(script), "--context", args.context, prefix_option, image_prefix]
     if args.case == "phase8":
@@ -169,6 +172,8 @@ def run_probe(args, docker, checkout, image_prefix):
         command.extend(("--phase8", "quick", "--evidence", str(args.evidence / "bootstrap-quick")))
     elif args.case == "https-publication":
         command.append("--publication-only")
+    elif args.case == "https-faults":
+        command.append("--faults-only")
     env = dict(os.environ, RFC_E2E_PRELOADED="1", TMPDIR="/tmp", PYTHONUNBUFFERED="1")
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace", dir=args.evidence) as stream:
         try:

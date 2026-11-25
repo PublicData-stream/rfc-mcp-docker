@@ -396,10 +396,14 @@ mod tests {
         let (algorithm, outcomes) = parse_compare(good, &inputs()).unwrap();
         assert_eq!(algorithm.as_deref(), Some("xxh128"));
         assert_eq!(
-            outcomes.into_values().collect::<Vec<_>>(),
+            outcomes.values().copied().collect::<Vec<_>>(),
             [true, false, false, true]
         );
         let text = std::str::from_utf8(good).unwrap();
+        let (_, rows) = text.split_once('\n').unwrap();
+        let (unknown, complete) = parse_compare(rows.as_bytes(), &inputs()).unwrap();
+        assert_eq!(unknown, None);
+        assert_eq!(complete, outcomes);
         let legacy = text.replace("Client negotiated checksum: xxh128", "Client checksum: md4");
         assert_eq!(
             parse_compare(legacy.as_bytes(), &inputs())
@@ -410,6 +414,8 @@ mod tests {
         );
         for bad in [
             text.replace("xxh128", "none"),
+            text.replace("xxh128", "unsupported"),
+            format!("Client checksum: md5\n{text}"),
             text.replace("rfc101.txt", "rfc100.txt"),
             text.replace("rfc101.txt", "rfc00101.txt"),
             text.replace(">fc........", "cL+++++++++"),

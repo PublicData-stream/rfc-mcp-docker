@@ -5,7 +5,9 @@ from email.utils import format_datetime
 from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
+import select
 import selectors
 import socket
 import socketserver
@@ -65,6 +67,8 @@ class Https(BaseHTTPRequestHandler):
                     return
             if scenario == "acquisition-db-delay":
                 print(f"checkpoint fixture request {self.path} {time.time_ns()}", flush=True)
+            if scenario == "acquisition-txt-timeout" and self.path == "/rfc/rfc200.txt":
+                wait_for_release("release-acquisition")
             if scenario in ("acquisition-hold-txt", "acquisition-hold-xml"):
                 suffix = scenario.rsplit("-", 1)[-1]
                 if self.path == f"/rfc/rfc100.{suffix}":
@@ -309,7 +313,13 @@ class Rsync(socketserver.BaseRequestHandler):
             time.sleep(45)
         if scenario == "xml-overlap":
             print("fixture rsync held for XML", flush=True)
-            wait_for_release("release-rsync")
+            peer = select.poll()
+            peer.register(self.request, select.POLLRDHUP | select.POLLHUP)
+            deadline = time.monotonic() + 25
+            while not (ROOT / "release-rsync").exists() and time.monotonic() < deadline:
+                if peer.poll(20):
+                    print("fixture rsync client disconnected", flush=True)
+                    return
         if scenario in ("benchmark", "cold-bootstrap", "phase8-paced"):
             time.sleep(0.20)
         interrupted = {"rsync-interrupted": 1024, "rsync-partial": 65536}.get(scenario)
@@ -343,8 +353,12 @@ class Relay(socketserver.ThreadingTCPServer):
 
 
 def main():
+    checksum_list = ROOT / "rsync-checksum-list"
+    daemon_env = None
+    if checksum_list.exists():
+        daemon_env = dict(os.environ, RSYNC_CHECKSUM_LIST=checksum_list.read_text().strip())
     with subprocess.Popen(["/usr/bin/rsync", "--daemon", "--no-detach", "--port=9873",
-                           "--config=/fixture-source/rsyncd.conf"]) as rsync:
+                           "--config=/fixture-source/rsyncd.conf"], env=daemon_env) as rsync:
         try:
             with Relay(("0.0.0.0", 8873), Rsync) as relay:
                 threading.Thread(target=relay.serve_forever, daemon=True).start()
