@@ -1,17 +1,22 @@
 //! Bounded HTTPS acquisition under the discovery and publication fence.
 
 use crate::{
+    Observation, Writer,
+    checkpoint::{Context, Kind},
     config::SyncConfig,
     egress::ROOT,
-    parse::{Budget, BudgetExceeded, DOCUMENT_BYTES},
+    insert_observation,
+    parse::{Budget, BudgetExceeded, DOCUMENT_BYTES, OwnedText},
+    policy::Registry,
+    register_blob,
     shutdown::Shutdown,
-    text,
     upstream::{Capture, Download, FetchAttempts, MissingXml, Source, Upstream},
     xml,
 };
 use rfc_core::{BlobDigest, Coverage, RfcNumber};
 use rfc_storage::{
-    blob::BlobReader,
+    blob::{BlobReader, BlobWriter, DurableBlob},
+    manifest::identity,
     postgres::{Result, mirror_root},
 };
 use serde::Serialize;
@@ -27,6 +32,7 @@ use std::{
     },
 };
 use tokio::{io::AsyncWriteExt, task::JoinSet};
+use tokio_postgres::GenericClient;
 
 pub(crate) struct Accepted {
     used: AtomicU64,
@@ -106,6 +112,10 @@ pub(crate) struct Original {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub observation: Option<String>,
+    #[serde(skip)]
+    pub checkpoint_expiry: Option<i64>,
+    #[serde(skip)]
+    pub checkpoint_version: Option<BlobDigest>,
 }
 
 fn serialize_digest<S: serde::Serializer>(
@@ -126,11 +136,13 @@ impl Original {
             etag: capture.etag,
             last_modified: capture.last_modified,
             observation: None,
+            checkpoint_expiry: None,
+            checkpoint_version: None,
         })
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Classification {
     Captured,
@@ -144,6 +156,11 @@ enum Classification {
 
 #[derive(Serialize)]
 struct Receipt {
+    #[serde(skip)]
+    selection: BlobDigest,
+    #[serde(skip)]
+    prepared: Option<Prepared>,
+    document_version: Option<String>,
     rfc: u32,
     kind: &'static str,
     source_url: String,
@@ -163,6 +180,13 @@ pub(crate) struct Counts {
     txt_reused: usize,
     txt_sealed: usize,
     txt_audited: usize,
+    txt_audit_pending: usize,
+    checkpoint_txt: usize,
+    checkpoint_xml: usize,
+    documents_joined: usize,
+    join_backlog_peak: usize,
+    db_commits: usize,
+    db_batch_peak: usize,
     txt_contains_nul: usize,
     txt_invalid_utf8: usize,
     xml_classified: usize,
@@ -181,12 +205,17 @@ pub(crate) struct Counts {
     parser_reservation_peak_bytes: u64,
     receipt_bytes: u64,
     content_digest: Option<String>,
+    processing_digest: Option<String>,
     txt_queue_peak: usize,
     xml_queue_peak: usize,
 }
 
 impl Counts {
     fn record(&mut self, receipt: &Receipt) {
+        let checkpoint = receipt
+            .original
+            .as_ref()
+            .is_some_and(|source| source.checkpoint_expiry.is_some());
         if receipt.kind == "txt" {
             match receipt.classification {
                 Classification::Captured => self.txt_downloaded += 1,
@@ -194,10 +223,13 @@ impl Counts {
                 _ => unreachable!("required TXT reached the ledger without an original"),
             }
             self.txt_sealed += 1;
+            self.txt_audit_pending += 1;
+            self.checkpoint_txt += usize::from(checkpoint);
             self.txt_contains_nul += usize::from(receipt.contains_nul);
             self.txt_invalid_utf8 += usize::from(receipt.invalid_utf8);
         } else {
             self.xml_classified += 1;
+            self.checkpoint_xml += usize::from(checkpoint);
             match receipt.classification {
                 Classification::Captured => self.xml_captured += 1,
                 Classification::Reused => self.xml_reused += 1,
@@ -275,6 +307,8 @@ impl Spool {
                 etag,
                 last_modified,
                 observation: None,
+                checkpoint_expiry: None,
+                checkpoint_version: None,
             };
             let mut metadata = OpenOptions::new()
                 .write(true)
@@ -299,7 +333,10 @@ impl Spool {
     }
 }
 
-pub(crate) struct Selection {
+pub(crate) struct Selection<'a> {
+    pub checkpoint: Context,
+    pub catalog: &'a xml::Catalog,
+    pub registry: &'a Registry,
     pub header: serde_json::Value,
     pub expected: Vec<RfcNumber>,
     pub txt: BTreeMap<RfcNumber, Original>,
@@ -310,13 +347,21 @@ pub(crate) struct Selection {
 impl Spool {
     pub(crate) async fn acquire(
         &self,
-        selection: Selection,
+        selection: Selection<'_>,
+        writer: &mut Writer,
         config: &SyncConfig,
         upstream: &Upstream,
         shutdown: &Shutdown,
         counts: &mut Counts,
     ) -> Result<()> {
         let options = &config.ingestion.pipeline;
+        let store = tokio::task::spawn_blocking(|| {
+            let store = BlobWriter::open(&mirror_root())?;
+            store.recover_staging()?;
+            Ok::<_, std::io::Error>(Arc::new(store))
+        })
+        .await??;
+        let mut join = Join::new(&selection.expected);
         let jobs = options
             .max_active_documents
             .min(options.result_queue_items)
@@ -374,6 +419,8 @@ impl Spool {
                         upstream: upstream.clone(),
                         shutdown: shutdown.clone(),
                         accepted: selection.accepted.clone(),
+                        store: store.clone(),
+                        selection: selection.checkpoint.key,
                     };
                     work.spawn(async move { worker.acquire(source, prior).await });
                 }
@@ -381,37 +428,75 @@ impl Spool {
             }
             match work.join_next().await {
                 Some(Ok(Ok(receipt))) if failure.is_none() => {
-                    let semantics = serde_json::to_vec(&(
-                        receipt.classification,
-                        receipt
-                            .original
-                            .as_ref()
-                            .map(|original| original.digest.to_string()),
-                        &receipt.coverage,
-                        &receipt.reference_digest,
-                        receipt.contains_nul,
-                        receipt.invalid_utf8,
-                    ));
-                    match semantics {
-                        Ok(semantics)
-                            if summaries
-                                .insert((receipt.rfc, receipt.kind), BlobDigest::hash(&semantics))
-                                .is_none() => {}
-                        Ok(_) => {
-                            failure = Some("duplicate HTTPS artifact receipt".into());
-                            shutdown.stop();
-                            continue;
-                        }
-                        Err(error) => {
-                            failure = Some(error.into());
-                            shutdown.stop();
-                            continue;
+                    let mut batch = vec![receipt];
+                    while batch.len() < config.ingestion.database.batch_size as usize {
+                        match work.try_join_next() {
+                            Some(Ok(Ok(receipt))) => batch.push(receipt),
+                            Some(Ok(Err(error))) => {
+                                failure = Some(error);
+                                break;
+                            }
+                            Some(Err(error)) => {
+                                failure = Some(error.into());
+                                break;
+                            }
+                            None => break,
                         }
                     }
-                    counts.record(&receipt);
-                    if let Err(error) = write_record(&mut ledger, &mut ledger_bytes, &receipt).await
-                    {
-                        failure = Some(error);
+                    if failure.is_none() {
+                        let result = async {
+                            shutdown.check()?;
+                            let mut keys = std::collections::BTreeSet::new();
+                            for receipt in &batch {
+                                join.validate(selection.checkpoint, receipt)?;
+                                if !keys.insert((receipt.rfc, receipt.kind)) {
+                                    return Err("duplicate HTTPS result in database batch".into());
+                                }
+                            }
+                            let database = upstream.metrics().span(crate::metrics::Stage::Database);
+                            let tx = writer.client.transaction().await?;
+                            tx.batch_execute("SET LOCAL synchronous_commit = on")
+                                .await?;
+                            for receipt in &mut batch {
+                                receipt.persist(&tx, &selection).await?;
+                            }
+                            rfc_storage::fixture_boundary("before_https_checkpoint_commit");
+                            tx.commit().await?;
+                            rfc_storage::fixture_boundary("after_https_checkpoint_commit");
+                            drop(database);
+                            counts.db_commits += 1;
+                            counts.db_batch_peak = counts.db_batch_peak.max(batch.len());
+                            for receipt in batch {
+                                let key = (receipt.rfc, receipt.kind);
+                                let semantics = serde_json::to_vec(&(
+                                    receipt.classification,
+                                    receipt
+                                        .original
+                                        .as_ref()
+                                        .map(|original| original.digest.to_string()),
+                                    receipt.coverage,
+                                    &receipt.reference_digest,
+                                    receipt.contains_nul,
+                                    receipt.invalid_utf8,
+                                ))?;
+                                if summaries
+                                    .insert(key, BlobDigest::hash(&semantics))
+                                    .is_some()
+                                {
+                                    return Err("duplicate HTTPS artifact receipt".into());
+                                }
+                                counts.record(&receipt);
+                                join.record(&receipt, counts)?;
+                                write_record(&mut ledger, &mut ledger_bytes, &receipt).await?;
+                            }
+                            Result::Ok(())
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            failure = Some(error);
+                        }
+                    }
+                    if failure.is_some() {
                         shutdown.stop();
                     }
                 }
@@ -431,10 +516,15 @@ impl Spool {
         counts.raw_reservation_peak_bytes =
             counts.stage_peak_jobs as u64 * crate::config::RAW_PER_DOCUMENT;
         counts.parser_reservation_peak_bytes =
-            counts.stage_peak_jobs.min(options.parser_workers as usize) as u64
-                * DOCUMENT_BYTES as u64;
+            counts.stage_peak_jobs as u64 * DOCUMENT_BYTES as u64;
         counts.receipt_bytes = ledger_bytes;
         if let Some(error) = failure {
+            if let Some(invalid) = error.downcast_ref::<InvalidCheckpoint>() {
+                selection
+                    .checkpoint
+                    .remove(&writer.client, Some((invalid.id, invalid.kind)))
+                    .await?;
+            }
             return Err(error);
         }
         shutdown.check()?;
@@ -450,6 +540,7 @@ impl Spool {
             digest.update(summary.as_bytes());
         }
         counts.content_digest = Some(digest.finalize().to_hex().to_string());
+        counts.processing_digest = Some(join.finish()?);
         ledger.sync_all().await?;
         let root = self.0.clone();
         tokio::task::spawn_blocking(move || File::open(root)?.sync_all()).await??;
@@ -477,6 +568,8 @@ struct Worker {
     upstream: Upstream,
     shutdown: Shutdown,
     accepted: Arc<Accepted>,
+    store: Arc<BlobWriter>,
+    selection: BlobDigest,
 }
 
 impl Worker {
@@ -486,6 +579,9 @@ impl Worker {
             _ => return Err("unexpected HTTPS artifact kind".into()),
         };
         let mut receipt = Receipt {
+            selection: self.selection,
+            prepared: None,
+            document_version: None,
             rfc: id.get(),
             kind: source.kind(),
             source_url: source.url(),
@@ -498,19 +594,44 @@ impl Worker {
             invalid_utf8: false,
             reference_digest: None,
         };
-        if let Some(prior) = prior
-            && (!matches!(source, Source::Xml(_))
-                || crate::upstream::now_us()?.saturating_sub(prior.fetched_us) <= 86_400_000_000)
-        {
-            let mut attempt = self.accepted.attempt();
-            attempt.charge(prior.length)?;
-            let status = self.classify(source, None, &prior).await?;
-            if let Some(status) = status {
-                status.apply(&mut receipt);
-                receipt.original = Some(prior);
-                receipt.classification = Classification::Reused;
-                attempt.retain();
-                return Ok(receipt);
+        if let Some(prior) = prior {
+            let now = crate::upstream::now_us()?;
+            let deadline = prior.checkpoint_expiry.or_else(|| {
+                matches!(source, Source::Xml(_)).then_some(prior.fetched_us + 86_400_000_000)
+            });
+            if deadline.is_none_or(|expiry| now < expiry) {
+                let mut attempt = self.accepted.attempt();
+                attempt.charge(prior.length)?;
+                let result = self.prepare(source, None, &prior).await;
+                match result {
+                    Ok(mut ready) => {
+                        let status = ready
+                            .parsed
+                            .take()
+                            .ok_or("cached RFCXML no longer parses")?;
+                        status.apply(&mut receipt);
+                        receipt.prepared = Some(ready);
+                        receipt.original = Some(prior);
+                        receipt.classification = Classification::Reused;
+                        attempt.retain();
+                        return Ok(receipt);
+                    }
+                    Err(error) if prior.checkpoint_expiry.is_some() => {
+                        if !error
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+                        {
+                            self.shutdown.check()?;
+                            return Err(InvalidCheckpoint {
+                                id,
+                                kind: kind(source),
+                                cause: error,
+                            }
+                            .into());
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
 
@@ -524,13 +645,14 @@ impl Worker {
         match result {
             Ok(Download::Captured(capture)) => {
                 let original = Original::captured(capture)?;
-                match self
-                    .classify(source, Some(partial.clone()), &original)
-                    .await?
-                {
+                let mut ready = self
+                    .prepare(source, Some(partial.clone()), &original)
+                    .await?;
+                match ready.parsed.take() {
                     Some(status) => status.apply(&mut receipt),
                     None => receipt.classification = Classification::Malformed,
                 }
+                receipt.prepared = Some(ready);
                 let target = self.root.join(&filename);
                 let temporary = partial.clone();
                 let _timing = self.upstream.metrics().span(crate::metrics::Stage::Install);
@@ -569,43 +691,54 @@ impl Worker {
         Ok(receipt)
     }
 
-    async fn classify(
+    async fn prepare(
         &self,
         source: Source,
         path: Option<PathBuf>,
         original: &Original,
-    ) -> Result<Option<Parsed>> {
+    ) -> Result<Prepared> {
+        let metrics = self.upstream.metrics();
+        let queue = metrics.span(crate::metrics::Stage::ParserQueue);
         let _permit = self.upstream.parse_slot(&self.shutdown).await?;
+        drop(queue);
         let original = original.clone();
         let shutdown = self.shutdown.clone();
-        let metrics = self.upstream.metrics();
+        let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
-            let _timing = metrics.parse_start();
+            let timing = metrics.parse_on_thread();
             let budget = Budget {
                 bytes: DOCUMENT_BYTES,
                 shutdown: &shutdown,
             };
             shutdown.check()?;
-            let file = match path {
+            let mut file = match &path {
                 Some(path) => OpenOptions::new()
                     .read(true)
-                    .custom_flags(libc::O_NOFOLLOW)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                     .open(path)?,
                 None => BlobReader::open(&mirror_root(), false)?.open_blob(original.digest)?,
             };
-            let mut bytes = Vec::new();
-            file.take(original.length + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 != original.length || BlobDigest::hash(&bytes) != original.digest
+            if original.length == 0
+                || original.length > source.limit() as u64
+                || !file.metadata()?.is_file()
+            {
+                return Err("HTTPS artifact is outside its original-byte budget".into());
+            }
+            let mut bytes = Vec::with_capacity(original.length as usize);
+            (&mut file).take(original.length).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != original.length
+                || file.read(&mut [0])? != 0
+                || BlobDigest::hash(&bytes) != original.digest
             {
                 return Err(
                     format!("original {} failed canonical verification", original.digest).into(),
                 );
             }
-            match source {
+            let (parsed, text) = match source {
                 Source::Txt(_) => {
-                    let index = text::index_with_budget(&bytes, &budget)?;
-                    crate::parse::validate_ranges(&bytes, &index)?;
-                    Ok(Some(Parsed {
+                    let text = OwnedText::parse(&bytes, &budget)?;
+                    let index = text.summary();
+                    let summary = Parsed {
                         coverage: (index.all_references, index.classified_references),
                         contains_nul: index.contains_nul,
                         invalid_utf8: index.invalid_utf8,
@@ -616,7 +749,8 @@ impl Worker {
                                 format!("{}:{}", edge.range.start(), edge.range.end()),
                             )
                         })),
-                    }))
+                    };
+                    (Some(summary), Some(text))
                 }
                 Source::Xml(id) => {
                     #[cfg(feature = "phase6-fixtures")]
@@ -628,8 +762,8 @@ impl Worker {
                     {
                         panic!("fixture RFCXML parser panic");
                     }
-                    match xml::references(&bytes, id, &budget) {
-                        Ok(parsed) => Ok(Some(Parsed {
+                    let parsed = match xml::references(&bytes, id, &budget) {
+                        Ok(parsed) => Some(Parsed {
                             coverage: (parsed.all, parsed.classified),
                             contains_nul: false,
                             invalid_utf8: false,
@@ -639,16 +773,39 @@ impl Worker {
                                     .into_iter()
                                     .map(|edge| (edge.kind, edge.target, edge.locator)),
                             ),
-                        })),
-                        Err(error) if error.is::<BudgetExceeded>() => Err(error),
+                        }),
+                        Err(error) if error.is::<BudgetExceeded>() => return Err(error),
                         Err(_) => {
                             shutdown.check()?;
-                            Ok(None)
+                            None
                         }
-                    }
+                    };
+                    (parsed, None)
                 }
-                _ => Err("unexpected HTTPS parser input".into()),
+                _ => return Err("unexpected HTTPS parser input".into()),
+            };
+            drop(timing);
+            shutdown.check()?;
+            let _install = metrics.span(crate::metrics::Stage::Cas);
+            let blob = if path.is_some() {
+                rfc_storage::fixture_boundary("before_https_cas_install");
+                store
+                    .install(bytes.as_slice(), source.limit() as u64)?
+                    .blob()
+            } else {
+                if parsed.is_none() {
+                    return Err("cached RFCXML no longer parses".into());
+                }
+                store.verify_durable(original.digest, i64::try_from(original.length)?)?
+            };
+            if blob.digest() != original.digest || blob.byte_length() as u64 != original.length {
+                return Err("CAS installation differs from the sealed HTTPS original".into());
             }
+            Ok(Prepared {
+                blob,
+                parsed,
+                text: text.map(|text| (bytes, text)),
+            })
         })
         .await?
     }
@@ -681,4 +838,340 @@ fn reference_digest(
         hash.update(b"\0");
     }
     hash.finalize().to_hex().to_string()
+}
+
+struct Prepared {
+    blob: DurableBlob,
+    parsed: Option<Parsed>,
+    text: Option<(Vec<u8>, OwnedText)>,
+}
+
+fn kind(source: Source) -> Kind {
+    match source {
+        Source::Txt(_) => Kind::Txt,
+        Source::Xml(_) => Kind::Xml,
+        _ => unreachable!("only RFC originals enter processing"),
+    }
+}
+
+#[derive(Debug)]
+struct InvalidCheckpoint {
+    id: RfcNumber,
+    kind: Kind,
+    cause: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for InvalidCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RFC {} checkpoint failed verification: {}",
+            self.id.get(),
+            self.cause
+        )
+    }
+}
+
+impl std::error::Error for InvalidCheckpoint {}
+
+impl Receipt {
+    async fn persist(&mut self, tx: &impl GenericClient, selection: &Selection<'_>) -> Result<()> {
+        let Some(prepared) = self.prepared.take() else {
+            if self.kind == "rfcxml"
+                && self.original.is_none()
+                && matches!(
+                    self.classification,
+                    Classification::NotFound
+                        | Classification::Gone
+                        | Classification::RetriesExhausted
+                        | Classification::FetchFailed
+                )
+            {
+                return Ok(());
+            }
+            return Err("HTTPS result is missing its prepared original".into());
+        };
+        let original = self
+            .original
+            .as_mut()
+            .ok_or("HTTPS result lacks source metadata")?;
+        let id = RfcNumber::new(self.rfc as i32).ok_or("invalid result RFC number")?;
+        let kind = if self.kind == "txt" {
+            Kind::Txt
+        } else {
+            Kind::Xml
+        };
+        if prepared.blob.digest() != original.digest
+            || u64::try_from(prepared.blob.byte_length())? != original.length
+        {
+            return Err("prepared blob disagrees with its source receipt".into());
+        }
+        register_blob(tx, prepared.blob).await?;
+        let observation = match original.observation.as_deref() {
+            Some(value) => {
+                BlobDigest::from_hex(value).ok_or("invalid existing observation identity")?
+            }
+            None => {
+                insert_observation(
+                    tx,
+                    &Observation {
+                        kind: self.kind,
+                        url: &self.source_url,
+                        observed_us: original.observed_us,
+                        fetched_us: Some(original.fetched_us),
+                        etag: original.etag.as_deref(),
+                        last_modified: original.last_modified.as_deref(),
+                        raw_digest: original.digest,
+                        https_verification: "verified",
+                    },
+                    None,
+                    matches!(kind, Kind::Txt),
+                )
+                .await?
+            }
+        };
+        let version = match prepared.text {
+            Some((bytes, text)) if matches!(kind, Kind::Txt) => Some(
+                crate::parse::store_text(
+                    tx,
+                    id,
+                    prepared.blob,
+                    selection.registry,
+                    &selection.catalog.entries[&id],
+                    &bytes,
+                    text,
+                )
+                .await?,
+            ),
+            None if matches!(kind, Kind::Xml) => None,
+            _ => return Err("parsed result has the wrong artifact kind".into()),
+        };
+        if original
+            .checkpoint_version
+            .is_some_and(|saved| version != Some(saved))
+        {
+            return Err(InvalidCheckpoint {
+                id,
+                kind,
+                cause: "sealed TXT index changed".into(),
+            }
+            .into());
+        }
+        selection
+            .checkpoint
+            .record_https(
+                tx,
+                id,
+                kind,
+                observation,
+                version,
+                self.classification == Classification::Malformed,
+            )
+            .await?;
+        original.observation = Some(observation.to_string());
+        self.document_version = version.map(|digest| digest.to_string());
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Pair {
+    txt: Option<Part>,
+    xml: Option<Part>,
+    joined: Option<BlobDigest>,
+}
+
+#[derive(Serialize)]
+struct Part {
+    original: Option<String>,
+    version: Option<String>,
+    coverage: Option<(&'static str, &'static str)>,
+    references: Option<String>,
+    outcome: Classification,
+}
+
+struct Join {
+    pairs: BTreeMap<u32, Pair>,
+    unmatched: usize,
+}
+
+impl Join {
+    fn new(expected: &[RfcNumber]) -> Self {
+        Self {
+            pairs: expected
+                .iter()
+                .map(|id| (id.get(), Pair::default()))
+                .collect(),
+            unmatched: 0,
+        }
+    }
+
+    fn validate(&self, context: Context, receipt: &Receipt) -> Result<()> {
+        if receipt.selection != context.key {
+            return Err("HTTPS result belongs to another selection".into());
+        }
+        let pair = self
+            .pairs
+            .get(&receipt.rfc)
+            .ok_or("HTTPS result is outside the selection")?;
+        let id = RfcNumber::new(receipt.rfc as i32).ok_or("invalid result RFC number")?;
+        let source = match receipt.kind {
+            "txt" if pair.txt.is_none() && pair.joined.is_none() => Source::Txt(id),
+            "rfcxml" if pair.xml.is_none() && pair.joined.is_none() => Source::Xml(id),
+            _ => return Err("duplicate or unknown HTTPS artifact result".into()),
+        };
+        if receipt.source_url != source.url() || receipt.audit_state != source.audit_state() {
+            return Err("HTTPS result disagrees with the selected source".into());
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, receipt: &Receipt, counts: &mut Counts) -> Result<()> {
+        let pair = self
+            .pairs
+            .get_mut(&receipt.rfc)
+            .ok_or("unexpected join result")?;
+        let part = Part {
+            original: receipt
+                .original
+                .as_ref()
+                .map(|value| value.digest.to_string()),
+            version: receipt.document_version.clone(),
+            coverage: receipt.coverage,
+            references: receipt.reference_digest.clone(),
+            outcome: if receipt.classification == Classification::Reused {
+                Classification::Captured
+            } else {
+                receipt.classification
+            },
+        };
+        let slot = if receipt.kind == "txt" {
+            &mut pair.txt
+        } else {
+            &mut pair.xml
+        };
+        if slot.replace(part).is_some() || pair.joined.is_some() {
+            return Err("duplicate HTTPS join result".into());
+        }
+        match (pair.txt.take(), pair.xml.take()) {
+            (Some(txt), Some(xml)) => {
+                let (all, classified) = txt.coverage.ok_or("missing TXT reference coverage")?;
+                let (coverage, use_txt) = match xml.coverage {
+                    Some((xml_all, xml_classified)) => {
+                        ((xml_all, xml_classified), xml_all != "complete")
+                    }
+                    None if matches!(
+                        xml.outcome,
+                        Classification::NotFound | Classification::Gone
+                    ) =>
+                    {
+                        ((all, classified), true)
+                    }
+                    None => ((cap_coverage(all), cap_coverage(classified)), true),
+                };
+                pair.joined = Some(identity(
+                    "rfc-https-processing-document-v1",
+                    &(
+                        receipt.rfc,
+                        &txt.original,
+                        &txt.version,
+                        &xml.original,
+                        xml.outcome,
+                        coverage,
+                        &xml.references,
+                        use_txt.then_some(&txt.references),
+                    ),
+                )?);
+                counts.documents_joined += 1;
+                self.unmatched -= 1;
+            }
+            (txt, xml) => {
+                pair.txt = txt;
+                pair.xml = xml;
+                self.unmatched += 1;
+                counts.join_backlog_peak = counts.join_backlog_peak.max(self.unmatched);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<String> {
+        let mut hash = blake3::Hasher::new_derive_key("rfc https processing selection v1");
+        for (rfc, pair) in self.pairs {
+            hash.update(&rfc.to_be_bytes());
+            hash.update(
+                pair.joined
+                    .ok_or("incomplete HTTPS document join")?
+                    .as_bytes(),
+            );
+        }
+        Ok(hash.finalize().to_hex().to_string())
+    }
+}
+
+fn cap_coverage(state: &'static str) -> &'static str {
+    if state == "complete" {
+        "partial"
+    } else {
+        state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn receipt(context: Context, id: RfcNumber, source: Source) -> Receipt {
+        Receipt {
+            selection: context.key,
+            prepared: None,
+            document_version: None,
+            rfc: id.get(),
+            kind: source.kind(),
+            source_url: source.url(),
+            classification: if matches!(source, Source::Txt(_)) {
+                Classification::Captured
+            } else {
+                Classification::NotFound
+            },
+            audit_state: source.audit_state(),
+            original: None,
+            file: None,
+            coverage: matches!(source, Source::Txt(_)).then_some(("partial", "partial")),
+            contains_nul: false,
+            invalid_utf8: false,
+            reference_digest: None,
+        }
+    }
+
+    #[test]
+    fn join_rejects_wrong_selection_and_duplicate_and_is_order_independent() {
+        let id = RfcNumber::new(100).unwrap();
+        let ctx = Context {
+            scope: "full",
+            key: BlobDigest::hash(b"selected"),
+        };
+        let stale = Context {
+            key: BlobDigest::hash(b"stale"),
+            ..ctx
+        };
+        let txt = receipt(ctx, id, Source::Txt(id));
+        let xml = receipt(ctx, id, Source::Xml(id));
+        let mut digests = Vec::new();
+        for order in [[&txt, &xml], [&xml, &txt]] {
+            let mut join = Join::new(&[id]);
+            let mut counts = Counts::default();
+            assert!(join.validate(stale, &txt).is_err());
+            for result in order {
+                join.validate(ctx, result).unwrap();
+                join.record(result, &mut counts).unwrap();
+                assert!(join.validate(ctx, result).is_err());
+            }
+            assert_eq!(counts.documents_joined, 1);
+            assert_eq!(counts.join_backlog_peak, 1);
+            digests.push(join.finish().unwrap());
+        }
+        assert_eq!(digests[0], digests[1]);
+        assert!(Join::new(&[id]).finish().is_err());
+    }
 }

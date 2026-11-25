@@ -15,6 +15,10 @@ pub(crate) enum Stage {
     Rsync,
     Parse,
     Install,
+    Cas,
+    TxtQueue,
+    XmlQueue,
+    ParserQueue,
     Database,
     #[cfg(feature = "phase2-fixtures")]
     Validation,
@@ -50,6 +54,13 @@ pub(crate) struct Record {
     pub rsync: Timing,
     pub parse: Timing,
     pub install: Timing,
+    pub cas: Timing,
+    pub txt_queue: Timing,
+    pub rfcxml_queue: Timing,
+    pub parser_queue: Timing,
+    pub parser_cpu_us: u64,
+    pub txt_received_bytes: u64,
+    pub rfcxml_received_bytes: u64,
     pub database: Timing,
     pub validation: Timing,
     pub queue: Timing,
@@ -103,6 +114,7 @@ impl Metrics {
             start: Instant::now(),
             http: false,
             parser: false,
+            thread_cpu: None,
         }
     }
 
@@ -138,8 +150,20 @@ impl Metrics {
         span
     }
 
-    pub(crate) fn received(&self, bytes: usize) {
-        self.0.lock().unwrap().received_bytes += bytes as u64;
+    pub(crate) fn parse_on_thread(&self) -> Span {
+        let mut span = self.parse_start();
+        span.thread_cpu = usage(libc::RUSAGE_THREAD).as_ref().and_then(cpu_micros);
+        span
+    }
+
+    pub(crate) fn received(&self, stage: Stage, bytes: usize) {
+        let mut record = self.0.lock().unwrap();
+        record.received_bytes += bytes as u64;
+        match stage {
+            Stage::Txt => record.txt_received_bytes += bytes as u64,
+            Stage::Xml => record.rfcxml_received_bytes += bytes as u64,
+            _ => {}
+        }
     }
 
     #[cfg(feature = "phase2-fixtures")]
@@ -270,6 +294,7 @@ pub(crate) struct Span {
     start: Instant,
     http: bool,
     parser: bool,
+    thread_cpu: Option<u64>,
 }
 
 impl Drop for Span {
@@ -281,6 +306,11 @@ impl Drop for Span {
         if self.parser {
             record.parsing -= 1;
         }
+        if let Some(start) = self.thread_cpu
+            && let Some(end) = usage(libc::RUSAGE_THREAD).as_ref().and_then(cpu_micros)
+        {
+            record.parser_cpu_us += end.saturating_sub(start);
+        }
         let timing = match self.stage {
             Stage::Catalog => &mut record.catalog,
             Stage::Txt => &mut record.txt,
@@ -289,6 +319,10 @@ impl Drop for Span {
             Stage::Rsync => &mut record.rsync,
             Stage::Parse => &mut record.parse,
             Stage::Install => &mut record.install,
+            Stage::Cas => &mut record.cas,
+            Stage::TxtQueue => &mut record.txt_queue,
+            Stage::XmlQueue => &mut record.rfcxml_queue,
+            Stage::ParserQueue => &mut record.parser_queue,
             Stage::Database => &mut record.database,
             #[cfg(feature = "phase2-fixtures")]
             Stage::Validation => &mut record.validation,

@@ -54,6 +54,8 @@ class Https(BaseHTTPRequestHandler):
         scenario = mode()
         if scenario.startswith("acquisition-"):
             print(f"acquisition start {self.path} {time.monotonic_ns()}", flush=True)
+            if scenario == "acquisition-db-delay":
+                print(f"checkpoint fixture request {self.path} {time.time_ns()}", flush=True)
             if scenario in ("acquisition-hold-txt", "acquisition-hold-xml"):
                 suffix = scenario.rsplit("-", 1)[-1]
                 if self.path == f"/rfc/rfc100.{suffix}":

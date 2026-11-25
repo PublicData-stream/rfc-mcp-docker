@@ -943,21 +943,7 @@ impl Run<'_> {
         let mut indexed = parsed.data.into_view(&bytes, &parsed.headings)?;
         let durable = self.install_durable(source, bytes.clone()).await?;
         let (policy, notices) =
-            if let Some(notices) = self.registry.pagination_notices(id, digest, &bytes)? {
-                indexed.notice_state = Coverage::Complete;
-                ("whole_paginated", notices)
-            } else {
-                (
-                    self.registry.decide(
-                        id,
-                        digest,
-                        entry,
-                        indexed.notice_family,
-                        indexed.notice_state,
-                    ),
-                    indexed.notices,
-                )
-            };
+            crate::parse::index_notices(id, digest, &self.registry, entry, &bytes, &mut indexed)?;
         let _database = self.upstream.metrics().span(Stage::Database);
         let candidate = self.writer.batch(self.id).await?;
         register_blob(&candidate.tx, durable).await?;

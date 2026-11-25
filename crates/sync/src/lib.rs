@@ -12,7 +12,6 @@ use tokio_postgres::{Client, GenericClient, Transaction};
 mod acquisition;
 #[cfg(feature = "phase2-fixtures")]
 mod bulk;
-#[cfg(feature = "phase2-fixtures")]
 mod checkpoint;
 mod config;
 mod daemon;
@@ -29,7 +28,6 @@ mod metrics;
 mod parse;
 #[cfg(feature = "phase2-fixtures")]
 mod pipeline;
-#[cfg(feature = "phase2-fixtures")]
 mod policy;
 mod publication;
 mod recovery;
@@ -271,13 +269,7 @@ impl Candidate<'_> {
     }
 
     async fn rfc_identity(&self, id: i32) -> Result<()> {
-        self.tx
-            .execute(
-                "INSERT INTO rfc.rfc_identities VALUES ($1::integer) ON CONFLICT DO NOTHING",
-                &[&id],
-            )
-            .await?;
-        Ok(())
+        ensure_rfc_identity(&self.tx, id).await
     }
 
     pub async fn observe(&self, observation: &Observation<'_>) -> Result<BlobDigest> {
@@ -298,31 +290,7 @@ impl Candidate<'_> {
         observation: &Observation<'_>,
         comparison_rsync: Option<BlobDigest>,
     ) -> Result<BlobDigest> {
-        let inputs = (
-            observation.kind,
-            observation.url,
-            observation.observed_us,
-            observation.fetched_us,
-            observation.etag,
-            observation.last_modified,
-            observation.raw_digest.to_string(),
-            observation.https_verification,
-        );
-        let id = match comparison_rsync {
-            Some(rsync) => identity("rfc-source-observation-v2", &(inputs, rsync.to_string()))?,
-            None => identity("rfc-source-observation-v1", &inputs)?,
-        };
-        self.tx.execute(
-            "INSERT INTO rfc.source_observations (identity, kind, source_url, observed_at, fetched_at, etag, last_modified, raw_digest, https_verification, comparison_rsync)
-             VALUES ($1::bytea, $2, $3,
-               timestamptz 'epoch' + ($4::bigint / 1000000) * interval '1 second' + ($4::bigint % 1000000) * interval '1 microsecond',
-               timestamptz 'epoch' + ($5::bigint / 1000000) * interval '1 second' + ($5::bigint % 1000000) * interval '1 microsecond',
-               $6, $7, $8::bytea, $9, $10::bytea) ON CONFLICT DO NOTHING",
-            &[&id.as_bytes().as_slice(), &observation.kind, &observation.url, &observation.observed_us,
-              &observation.fetched_us, &observation.etag, &observation.last_modified, &observation.raw_digest.as_bytes().as_slice(),
-              &observation.https_verification, &comparison_rsync.as_ref().map(|peer| peer.as_bytes().as_slice())],
-        ).await?;
-        Ok(id)
+        insert_observation(&self.tx, observation, comparison_rsync, false).await
     }
 
     pub async fn document(&self, document: Document<'_>) -> Result<BlobDigest> {
@@ -331,120 +299,10 @@ impl Candidate<'_> {
 
     async fn document_with_index(
         &self,
-        mut document: Document<'_>,
+        document: Document<'_>,
         indexed: Option<IndexedText<'_>>,
     ) -> Result<BlobDigest> {
-        let rfc = document.rfc.get() as i32;
-        let length = document.txt.byte_length();
-        let digest = document.txt.digest();
-        document
-            .sections
-            .sort_unstable_by_key(|section| section.ordinal);
-        document
-            .chunks
-            .sort_unstable_by_key(|chunk| chunk.range.start());
-        document
-            .notices
-            .sort_unstable_by_key(|notice| notice.ordinal);
-        let mut index_identity = index_identity(&document)?;
-        if let Some(indexed) = &indexed {
-            index_identity = identity(
-                "rfc-document-index-v2",
-                &(
-                    index_identity.to_string(),
-                    indexed.section_state.as_str(),
-                    indexed.line_starts,
-                ),
-            )?;
-        }
-        let id = identity(
-            "rfc-document-version-v1",
-            &(
-                rfc,
-                digest.to_string(),
-                document.parser_version,
-                document.index_version,
-                document.encoding,
-                document.index_state.as_str(),
-                document.notice_state.as_str(),
-                document.notice_policy,
-                index_identity.to_string(),
-            ),
-        )?;
-        let key = id.as_bytes().as_slice();
-        self.rfc_identity(rfc).await?;
-        let inserted = self.tx.execute(
-            "INSERT INTO rfc.document_versions (identity, rfc_id, txt_digest, byte_length, parser_version, index_version,
-                encoding, indexing_state, notice_state, notice_policy, index_identity, section_state, line_starts)
-             VALUES ($1::bytea, $2::integer, $3::bytea, $4::bigint, $5, $6, $7, $8::text, $9::text, $10, $11::bytea, $12::text, $13::bigint[])
-             ON CONFLICT DO NOTHING",
-            &[&key, &rfc, &digest.as_bytes().as_slice(), &length, &document.parser_version, &document.index_version,
-              &document.encoding, &document.index_state.as_str(), &document.notice_state.as_str(),
-              &document.notice_policy, &index_identity.as_bytes().as_slice(),
-              &indexed.as_ref().map(|index| index.section_state.as_str()),
-              &indexed.as_ref().map(|index| index.line_starts)],
-        ).await?;
-        if inserted == 0 {
-            let sealed: bool = self
-                .tx
-                .query_one(
-                    "SELECT sealed FROM rfc.document_versions WHERE identity = $1::bytea",
-                    &[&key],
-                )
-                .await?
-                .try_get(0)?;
-            if !sealed {
-                return Err("cannot reuse an unsealed document version".into());
-            }
-            return Ok(id);
-        }
-        for section in document.sections {
-            let (start, end) = bounds(section.body);
-            let (heading_start, heading_end) = bounds(section.raw_heading);
-            self.tx.execute(
-                "INSERT INTO rfc.sections (document_version, blob_length, section_id, parent_section_id, ordinal, depth,
-                  display_number, heading_text, start_byte, end_byte, heading_start_byte, heading_end_byte, parse_state)
-                 VALUES ($1::bytea, $2::bigint, $3, $4, $5, $6, $7, $8, $9::bigint, $10::bigint, $11::bigint, $12::bigint, $13::text)",
-                &[&key, &length, &section.id.as_str(), &section.parent.as_ref().map(SectionId::as_str), &section.ordinal,
-                  &section.depth, &section.number, &section.heading, &start, &end, &heading_start, &heading_end, &section.parse_state.as_str()],
-            ).await?;
-        }
-        for chunk in document.chunks {
-            let (start, end) = bounds(chunk.range);
-            self.tx.execute(
-                "INSERT INTO rfc.text_chunks (document_version, blob_length, start_byte, end_byte, search_text)
-                 VALUES ($1::bytea, $2::bigint, $3::bigint, $4::bigint, $5)",
-                &[&key, &length, &start, &end, &chunk.text],
-            ).await?;
-        }
-        for notice in document.notices {
-            let (start, end) = bounds(notice.range);
-            self.tx.execute(
-                "INSERT INTO rfc.notice_ranges (document_version, blob_length, ordinal, category, start_byte, end_byte, extraction_state, review_state)
-                 VALUES ($1::bytea, $2::bigint, $3, $4, $5::bigint, $6::bigint, $7::text, $8)",
-                &[&key, &length, &notice.ordinal, &notice.category, &start, &end, &notice.extraction.as_str(), &notice.review],
-            ).await?;
-        }
-        if let Some(text) = indexed.and_then(|index| index.text) {
-            self.tx
-                .batch_execute("SET LOCAL statement_timeout = '30s'")
-                .await?;
-            self.tx.execute(
-                "INSERT INTO rfc.document_lexemes (document_version, lexeme)
-                 SELECT DISTINCT $1::bytea, term.lexeme COLLATE pg_catalog.\"C\"
-                 FROM pg_catalog.ts_debug('pg_catalog.simple'::regconfig, $2::text) AS token
-                 CROSS JOIN LATERAL pg_catalog.unnest(token.lexemes) AS term(lexeme)
-                 WHERE octet_length(token.token) < 2048 AND octet_length(term.lexeme) BETWEEN 1 AND 2047",
-                &[&key, &text],
-            ).await?;
-        }
-        self.tx
-            .execute(
-                "UPDATE rfc.document_versions SET sealed = true WHERE identity = $1::bytea",
-                &[&key],
-            )
-            .await?;
-        Ok(id)
+        persist_document(&self.tx, document, indexed).await
     }
 
     pub async fn member(&self, member: &Membership<'_>) -> Result<()> {
@@ -599,6 +457,164 @@ impl Candidate<'_> {
     async fn commit(self) -> Result<()> {
         Ok(self.tx.commit().await?)
     }
+}
+
+async fn ensure_rfc_identity(db: &impl GenericClient, id: i32) -> Result<()> {
+    db.execute(
+        "INSERT INTO rfc.rfc_identities VALUES ($1::integer) ON CONFLICT DO NOTHING",
+        &[&id],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn insert_observation(
+    db: &impl GenericClient,
+    observation: &Observation<'_>,
+    comparison_rsync: Option<BlobDigest>,
+    capture_only: bool,
+) -> Result<BlobDigest> {
+    let inputs = (
+        observation.kind,
+        observation.url,
+        observation.observed_us,
+        observation.fetched_us,
+        observation.etag,
+        observation.last_modified,
+        observation.raw_digest.to_string(),
+        observation.https_verification,
+    );
+    let id = match comparison_rsync {
+        Some(rsync) => identity("rfc-source-observation-v2", &(inputs, rsync.to_string()))?,
+        None if capture_only => identity("rfc-source-observation-v3-capture", &inputs)?,
+        None => identity("rfc-source-observation-v1", &inputs)?,
+    };
+    db.execute(
+            "INSERT INTO rfc.source_observations (identity, kind, source_url, observed_at, fetched_at, etag, last_modified, raw_digest, https_verification, comparison_rsync, capture_only)
+             VALUES ($1::bytea, $2, $3,
+               timestamptz 'epoch' + ($4::bigint / 1000000) * interval '1 second' + ($4::bigint % 1000000) * interval '1 microsecond',
+               timestamptz 'epoch' + ($5::bigint / 1000000) * interval '1 second' + ($5::bigint % 1000000) * interval '1 microsecond',
+               $6, $7, $8::bytea, $9, $10::bytea, $11) ON CONFLICT DO NOTHING",
+            &[&id.as_bytes().as_slice(), &observation.kind, &observation.url, &observation.observed_us,
+              &observation.fetched_us, &observation.etag, &observation.last_modified, &observation.raw_digest.as_bytes().as_slice(),
+              &observation.https_verification, &comparison_rsync.as_ref().map(|peer| peer.as_bytes().as_slice()), &capture_only],
+        ).await?;
+    Ok(id)
+}
+
+async fn persist_document(
+    db: &impl GenericClient,
+    mut document: Document<'_>,
+    indexed: Option<IndexedText<'_>>,
+) -> Result<BlobDigest> {
+    let rfc = document.rfc.get() as i32;
+    let length = document.txt.byte_length();
+    let digest = document.txt.digest();
+    document
+        .sections
+        .sort_unstable_by_key(|section| section.ordinal);
+    document
+        .chunks
+        .sort_unstable_by_key(|chunk| chunk.range.start());
+    document
+        .notices
+        .sort_unstable_by_key(|notice| notice.ordinal);
+    let mut index_identity = index_identity(&document)?;
+    if let Some(indexed) = &indexed {
+        index_identity = identity(
+            "rfc-document-index-v2",
+            &(
+                index_identity.to_string(),
+                indexed.section_state.as_str(),
+                indexed.line_starts,
+            ),
+        )?;
+    }
+    let id = identity(
+        "rfc-document-version-v1",
+        &(
+            rfc,
+            digest.to_string(),
+            document.parser_version,
+            document.index_version,
+            document.encoding,
+            document.index_state.as_str(),
+            document.notice_state.as_str(),
+            document.notice_policy,
+            index_identity.to_string(),
+        ),
+    )?;
+    let key = id.as_bytes().as_slice();
+    ensure_rfc_identity(db, rfc).await?;
+    let inserted = db.execute(
+            "INSERT INTO rfc.document_versions (identity, rfc_id, txt_digest, byte_length, parser_version, index_version,
+                encoding, indexing_state, notice_state, notice_policy, index_identity, section_state, line_starts)
+             VALUES ($1::bytea, $2::integer, $3::bytea, $4::bigint, $5, $6, $7, $8::text, $9::text, $10, $11::bytea, $12::text, $13::bigint[])
+             ON CONFLICT DO NOTHING",
+            &[&key, &rfc, &digest.as_bytes().as_slice(), &length, &document.parser_version, &document.index_version,
+              &document.encoding, &document.index_state.as_str(), &document.notice_state.as_str(),
+              &document.notice_policy, &index_identity.as_bytes().as_slice(),
+              &indexed.as_ref().map(|index| index.section_state.as_str()),
+              &indexed.as_ref().map(|index| index.line_starts)],
+        ).await?;
+    if inserted == 0 {
+        let sealed: bool = db
+            .query_one(
+                "SELECT sealed FROM rfc.document_versions WHERE identity = $1::bytea",
+                &[&key],
+            )
+            .await?
+            .try_get(0)?;
+        if !sealed {
+            return Err("cannot reuse an unsealed document version".into());
+        }
+        return Ok(id);
+    }
+    for section in document.sections {
+        let (start, end) = bounds(section.body);
+        let (heading_start, heading_end) = bounds(section.raw_heading);
+        db.execute(
+                "INSERT INTO rfc.sections (document_version, blob_length, section_id, parent_section_id, ordinal, depth,
+                  display_number, heading_text, start_byte, end_byte, heading_start_byte, heading_end_byte, parse_state)
+                 VALUES ($1::bytea, $2::bigint, $3, $4, $5, $6, $7, $8, $9::bigint, $10::bigint, $11::bigint, $12::bigint, $13::text)",
+                &[&key, &length, &section.id.as_str(), &section.parent.as_ref().map(SectionId::as_str), &section.ordinal,
+                  &section.depth, &section.number, &section.heading, &start, &end, &heading_start, &heading_end, &section.parse_state.as_str()],
+            ).await?;
+    }
+    for chunk in document.chunks {
+        let (start, end) = bounds(chunk.range);
+        db.execute(
+                "INSERT INTO rfc.text_chunks (document_version, blob_length, start_byte, end_byte, search_text)
+                 VALUES ($1::bytea, $2::bigint, $3::bigint, $4::bigint, $5)",
+                &[&key, &length, &start, &end, &chunk.text],
+            ).await?;
+    }
+    for notice in document.notices {
+        let (start, end) = bounds(notice.range);
+        db.execute(
+                "INSERT INTO rfc.notice_ranges (document_version, blob_length, ordinal, category, start_byte, end_byte, extraction_state, review_state)
+                 VALUES ($1::bytea, $2::bigint, $3, $4, $5::bigint, $6::bigint, $7::text, $8)",
+                &[&key, &length, &notice.ordinal, &notice.category, &start, &end, &notice.extraction.as_str(), &notice.review],
+            ).await?;
+    }
+    if let Some(text) = indexed.and_then(|index| index.text) {
+        db.batch_execute("SET LOCAL statement_timeout = '30s'")
+            .await?;
+        db.execute(
+                "INSERT INTO rfc.document_lexemes (document_version, lexeme)
+                 SELECT DISTINCT $1::bytea, term.lexeme COLLATE pg_catalog.\"C\"
+                 FROM pg_catalog.ts_debug('pg_catalog.simple'::regconfig, $2::text) AS token
+                 CROSS JOIN LATERAL pg_catalog.unnest(token.lexemes) AS term(lexeme)
+                 WHERE octet_length(token.token) < 2048 AND octet_length(term.lexeme) BETWEEN 1 AND 2047",
+                &[&key, &text],
+            ).await?;
+    }
+    db.execute(
+        "UPDATE rfc.document_versions SET sealed = true WHERE identity = $1::bytea",
+        &[&key],
+    )
+    .await?;
+    Ok(id)
 }
 
 fn bounds(range: ByteRange) -> (i64, i64) {

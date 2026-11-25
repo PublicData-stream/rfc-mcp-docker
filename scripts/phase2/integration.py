@@ -159,7 +159,7 @@ COMMIT;
     assert project.sql("SELECT version FROM rfc.schema_migrations") == "1"
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8\n9"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8\n9\n10"
 
 
 def verify_ranges(project, report, sources, txt_verification="verified"):
@@ -1178,7 +1178,7 @@ def exercise_provenance_upgrade(project, old_prefix, old_driver, old_schema, rea
     before_manifests = project.sql(manifests)
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "9"
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "10"
     assert project.sql(query) == before
     assert project.sql(manifests) == before_manifests
     assert project.sql("SELECT count(*) FROM rfc.source_observations WHERE source_transport <> 'https'") == "0"
@@ -1216,7 +1216,7 @@ def exercise_provenance_upgrade(project, old_prefix, old_driver, old_schema, rea
     """) == "dual_source|rsync_integrity|t"
     project.verify_manifest(refreshed)
     assert project.sql("SELECT generation_id,publication_sequence FROM rfc.active_generation") == f"{second['generation_id']}|2"
-    print(f"Schema {old_schema} retained and published data, source identities and strict reuse survived schema 9 upgrade", flush=True)
+    print(f"Schema {old_schema} retained and published data, source identities and strict reuse survived schema 10 upgrade", flush=True)
 
 
 def benchmark_content(project, report):

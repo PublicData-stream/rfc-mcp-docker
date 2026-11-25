@@ -1,12 +1,14 @@
-//! Read-only source planning under the corpus and publication fence.
+//! Discovery and acquisition under the corpus and publication fence.
 
 use crate::{
     Writer,
     acquisition::{Accepted, Counts, Original, Selection, Spool},
+    checkpoint::Context,
     config::SyncConfig,
     egress::Lease,
     inventory,
     metrics::{Record, Stage},
+    policy::Registry,
     shutdown::Shutdown,
     upstream::{Capture, MAX_CATALOG_ENTRIES, Source, TXT_LIMIT, Upstream, XML_LIMIT},
     xml,
@@ -18,7 +20,7 @@ use rfc_storage::{
     manifest::identity,
     postgres::{Result, mirror_root},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -188,14 +190,14 @@ pub(crate) async fn execute(
     };
     let result = async {
         let deadline = started + DEADLINE;
-        let writer = shutdown.until(deadline, Writer::connect()).await?;
+        let mut writer = shutdown.until(deadline, Writer::connect()).await?;
         let _corpus = shutdown
             .until(deadline, writer.acquire_coordinator())
             .await?;
         Spool::sweep().await?;
         crate::egress::preflight(config.ingestion.max_accepted_bytes)?;
         discover(
-            &writer,
+            &mut writer,
             config,
             &upstream,
             shutdown,
@@ -222,7 +224,7 @@ pub(crate) async fn execute(
 }
 
 async fn discover(
-    writer: &Writer,
+    writer: &mut Writer,
     config: &SyncConfig,
     upstream: &Upstream,
     shutdown: &Shutdown,
@@ -365,24 +367,29 @@ async fn discover(
     }
     report.local_https_txt_audit_pending = local_with_https;
     report.local_txt_needs_https = local_without_https;
-    let registry: RegistryVersion = serde_json::from_str(include_str!("policy.json"))?;
-    let selection_id = identity(
-        "rfc-https-discovery-v1",
-        &(
-            scope.as_str(),
-            catalog_digest.to_string(),
-            POLICY,
-            PARSER,
-            INDEX,
-            &registry.version,
-            active,
-            sequence,
-        ),
-    )?
-    .to_string();
+    let registry = Registry::load()?;
+    let scope_name = scope.as_str();
+    let checkpoint = Context {
+        scope: scope_name,
+        key: identity(
+            "rfc-https-processing-selection-v1",
+            &(
+                scope_name,
+                catalog_digest.to_string(),
+                expected.iter().map(|id| id.get()).collect::<Vec<_>>(),
+                POLICY,
+                PARSER,
+                INDEX,
+                &registry.version,
+                active,
+                sequence,
+            ),
+        )?,
+    };
+    let selection_id = checkpoint.key.to_string();
     report.selection_id = Some(selection_id.clone());
 
-    let reuse_xml = if let Some(active) = active {
+    let mut reuse_xml = if let Some(active) = active {
         shutdown
             .until(
                 deadline,
@@ -392,6 +399,20 @@ async fn discover(
     } else {
         BTreeMap::new()
     };
+    let (saved_txt, saved_xml) = shutdown
+        .until(deadline, checkpoint.load_https(writer))
+        .await?;
+    reuse_txt.extend(saved_txt.into_iter().filter(|(id, prior)| {
+        expected.contains(id)
+            && inventory
+                .get(id)
+                .is_some_and(|entry| entry.length == prior.length)
+    }));
+    reuse_xml.extend(
+        saved_xml
+            .into_iter()
+            .filter(|(id, _)| expected.contains(id)),
+    );
     let accepted = Arc::new(Accepted::new(accepted));
     accepted.charge(before.bytes.len() as u64)?;
     let spool = Spool::open().await?;
@@ -399,6 +420,9 @@ async fn discover(
         spool.stage_catalog("catalog-before", &before).await?;
         let work_stop = Shutdown::new();
         let selection = Selection {
+            checkpoint,
+            catalog: &catalog,
+            registry: &registry,
             header: serde_json::json!({
                 "selection_id": selection_id,
                 "catalog_digest": catalog_digest.to_string(),
@@ -419,6 +443,7 @@ async fn discover(
         {
             let work = spool.acquire(
                 selection,
+                writer,
                 config,
                 upstream,
                 &work_stop,
@@ -435,6 +460,7 @@ async fn discover(
                 result = &mut work => result?,
             }
         }
+        rfc_storage::fixture_boundary("before_https_catalog_validation");
         let fence_deadline = Instant::now()
             + Duration::from_secs(config.ingestion.https.request_timeout_seconds * 3 + 120);
         let after = shutdown.until(fence_deadline, upstream.catalog()).await?;
@@ -443,20 +469,17 @@ async fn discover(
         let end_digest = BlobDigest::hash(&after.bytes);
         report.catalog_after = Some(observation(&after, end_digest));
         if catalog_digest != end_digest || before.bytes != after.bytes {
+            checkpoint.remove(&writer.client, None).await?;
             return Err("catalog changed during acquisition".into());
         }
         spool.stage_catalog("catalog-after", &after).await?;
+        rfc_storage::fixture_boundary("after_https_catalog_validation");
         Ok(Outcome::Complete)
     }
     .await;
     let cleanup = spool.remove().await;
     cleanup?;
     result
-}
-
-#[derive(Deserialize)]
-struct RegistryVersion {
-    version: String,
 }
 
 fn observation(capture: &Capture, digest: BlobDigest) -> Observation {
@@ -617,6 +640,8 @@ fn original(
         fetched_us: row.try_get(index + 2)?,
         etag: None,
         last_modified: None,
+        checkpoint_expiry: None,
+        checkpoint_version: None,
     })
 }
 

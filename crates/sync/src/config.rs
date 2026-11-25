@@ -170,7 +170,7 @@ struct Summary {
     config: SyncConfig,
     phase: &'static str,
     publication_gate: &'static str,
-    pending_consumers: [&'static str; 2],
+    pending_consumers: [&'static str; 1],
     informational: [&'static str; 1],
     resources: Resources,
 }
@@ -230,7 +230,7 @@ impl SyncConfig {
             config,
             phase: "acquisition",
             publication_gate: crate::discovery::PUBLICATION_GATE,
-            pending_consumers: ["ingestion.revalidation", "ingestion.database"],
+            pending_consumers: ["ingestion.revalidation"],
             informational: ["ingestion.target_bootstrap_seconds"],
             resources,
         })

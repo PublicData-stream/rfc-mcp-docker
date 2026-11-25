@@ -2,11 +2,18 @@
 
 use crate::shutdown::Shutdown;
 use crate::text::TextIndex;
-#[cfg(feature = "phase2-fixtures")]
-use crate::{Chunk, Section, text};
-use rfc_core::ByteRange;
+use crate::{
+    Chunk, Document, IndexedText, Section,
+    discovery::{INDEX, PARSER},
+    persist_document,
+    policy::Registry,
+    text, xml,
+};
+use rfc_core::{BlobDigest, ByteRange, Coverage, RfcNumber};
+use rfc_storage::blob::DurableBlob;
 use rfc_storage::postgres::Result;
 use std::fmt;
+use tokio_postgres::GenericClient;
 
 pub(crate) const DOCUMENT_BYTES: usize = 128 * 1024 * 1024;
 
@@ -36,21 +43,23 @@ impl Budget<'_> {
     }
 }
 
-#[cfg(feature = "phase2-fixtures")]
 pub(crate) struct OwnedText {
     pub headings: Vec<String>,
     pub data: TextData,
 }
 
-#[cfg(feature = "phase2-fixtures")]
 pub(crate) struct TextData {
     index: TextIndex<'static>,
     section_numbers: Vec<Option<ByteRange>>,
+    #[cfg(feature = "phase2-fixtures")]
     pub retained_bytes: usize,
 }
 
-#[cfg(feature = "phase2-fixtures")]
 impl OwnedText {
+    pub(crate) fn summary(&self) -> &TextIndex<'_> {
+        &self.data.index
+    }
+
     pub(crate) fn parse(bytes: &[u8], budget: &Budget<'_>) -> Result<Self> {
         let indexed = text::index_with_budget(bytes, budget)?;
         validate_ranges(bytes, &indexed)?;
@@ -111,13 +120,13 @@ impl OwnedText {
             data: TextData {
                 index,
                 section_numbers,
+                #[cfg(feature = "phase2-fixtures")]
                 retained_bytes,
             },
         })
     }
 }
 
-#[cfg(feature = "phase2-fixtures")]
 impl TextData {
     pub(crate) fn into_view<'a>(
         self,
@@ -183,4 +192,70 @@ pub(crate) fn validate_ranges(bytes: &[u8], indexed: &TextIndex<'_>) -> Result<(
         return Err("TXT chunks do not cover the verified blob".into());
     }
     Ok(())
+}
+
+/// Writes the same notice policy and index format as the candidate collector.
+pub(crate) async fn store_text(
+    db: &impl GenericClient,
+    rfc: RfcNumber,
+    blob: DurableBlob,
+    registry: &Registry,
+    entry: &xml::Entry,
+    bytes: &[u8],
+    text: OwnedText,
+) -> Result<BlobDigest> {
+    let mut indexed = text.data.into_view(bytes, &text.headings)?;
+    let (policy, notices) =
+        index_notices(rfc, blob.digest(), registry, entry, bytes, &mut indexed)?;
+    let (encoding, index_state) = if indexed.text.is_some() {
+        ("utf8", Coverage::Complete)
+    } else {
+        ("bytes", Coverage::Unavailable)
+    };
+    persist_document(
+        db,
+        Document {
+            rfc,
+            txt: blob,
+            parser_version: PARSER,
+            index_version: INDEX,
+            encoding,
+            index_state,
+            notice_state: indexed.notice_state,
+            notice_policy: policy,
+            sections: indexed.sections,
+            chunks: indexed.chunks,
+            notices,
+        },
+        Some(IndexedText {
+            section_state: indexed.section_state,
+            line_starts: &indexed.line_starts,
+            text: indexed.text,
+        }),
+    )
+    .await
+}
+
+pub(crate) fn index_notices<'a>(
+    rfc: RfcNumber,
+    digest: BlobDigest,
+    registry: &'a Registry,
+    entry: &xml::Entry,
+    bytes: &[u8],
+    indexed: &mut TextIndex<'a>,
+) -> Result<(&'a str, Vec<crate::Notice<'a>>)> {
+    if let Some(notices) = registry.pagination_notices(rfc, digest, bytes)? {
+        indexed.notice_state = Coverage::Complete;
+        return Ok(("whole_paginated", notices));
+    }
+    Ok((
+        registry.decide(
+            rfc,
+            digest,
+            entry,
+            indexed.notice_family,
+            indexed.notice_state,
+        ),
+        std::mem::take(&mut indexed.notices),
+    ))
 }

@@ -178,7 +178,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
                      "-d", "rfc", input=password_sql)
         self.sql("-f", "/migrations/bootstrap.sql")
         self.sql("-f", "/migrations/migrate.sql")
-        assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "9"
+        assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "10"
         assert self.sql("-c", "SELECT current_setting('server_encoding') || ':' || datlocale || ':' "
                         "|| datlocprovider::text FROM pg_database WHERE datname = current_database()") == "UTF8:und:i"
         assert self.sql("-c", "SELECT has_table_privilege('rfc_serve','rfc.generation_documents','INSERT')") == "f"
@@ -221,7 +221,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         assert defaults["schema_version"] == 2 and defaults["phase"] == "acquisition"
         assert defaults["publication_gate"] == "https_txt_audit_pending"
         assert set(defaults["pending_consumers"]) == {
-            "ingestion.revalidation", "ingestion.database",
+            "ingestion.revalidation",
         }
         for name in ("RFC_SYNC_HTTP_CONCURRENCY", "RFC_SYNC_PARSE_CONCURRENCY"):
             probe("-e", f"{name}=1", expected=f"{name} was removed")

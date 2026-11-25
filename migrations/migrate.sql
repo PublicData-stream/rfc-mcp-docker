@@ -64,4 +64,10 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 9) AS apply
 \ir 0009-ingestion-checkpoints.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (9);
 \endif
+SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 10) AS apply_v10
+\gset
+\if :apply_v10
+\ir 0010-https-processing.sql
+INSERT INTO rfc.schema_migrations (version) VALUES (10);
+\endif
 COMMIT;

@@ -121,7 +121,7 @@ def upgrade(project):
     project.check("sync", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8\n9"
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "1\n2\n3\n4\n5\n6\n7\n8\n9\n10"
     assert project.sql(f"SELECT state,manifest_format,encode(manifest_bytes,'hex') FROM rfc.generations WHERE id={old}") == "ready|1|0123"
     project.activate(old, 0, error="not eligible")
 
@@ -313,9 +313,14 @@ def check_reader_gc(project, first, old_digest, shared_digest):
     shared = project.canonical(shared_digest)
     shared_inode = shared.stat().st_ino
     with paused(project, "serve", "reader_accepted", "read", first) as reader:
-        assert json.loads(phase1.capture(gc, env=project.env))["retired_generations"] == 0
-        assert first_path.is_file()
-        assert project.sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename='rfc_serve'") == "t"
+        # Identify the paused reader by the lock it holds. Starting a GC
+        # container first can outlast the reader's idle transaction timeout.
+        assert project.sql(f"""
+            SELECT pg_terminate_backend(a.pid, 5000)
+            FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid
+            WHERE a.usename='rfc_serve' AND l.locktype='advisory' AND l.classid=0
+              AND l.objid={int(first)} AND l.granted AND l.mode='ShareLock'
+        """) == "t"
         assert json.loads(phase1.capture(gc, env=project.env))["retired_generations"] == 0
         assert first_path.is_file()
         _, stderr = release(reader)

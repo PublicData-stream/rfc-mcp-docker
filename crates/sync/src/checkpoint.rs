@@ -1,10 +1,18 @@
-use crate::{Writer, upstream};
-use rfc_core::{BlobDigest, RfcNumber};
-use rfc_storage::{blob::BlobReader, postgres::Result};
-use std::{
-    collections::BTreeMap,
-    io::{self, Read},
+#[cfg(feature = "phase2-fixtures")]
+use crate::upstream;
+use crate::{
+    Writer,
+    acquisition::Original,
+    discovery::{INDEX, PARSER},
+    upstream::MAX_CATALOG_ENTRIES,
 };
+use rfc_core::{BlobDigest, RfcNumber};
+#[cfg(feature = "phase2-fixtures")]
+use rfc_storage::blob::BlobReader;
+use rfc_storage::postgres::Result;
+use std::collections::BTreeMap;
+#[cfg(feature = "phase2-fixtures")]
+use std::io::{self, Read};
 use tokio_postgres::GenericClient;
 
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +29,7 @@ impl Kind {
         }
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) fn invalid(
         self,
         saved: Saved,
@@ -40,6 +49,7 @@ pub(crate) struct Context {
     pub key: BlobDigest,
 }
 
+#[cfg(feature = "phase2-fixtures")]
 #[derive(Clone, Copy)]
 pub(crate) struct Saved {
     pub observation: BlobDigest,
@@ -49,6 +59,7 @@ pub(crate) struct Saved {
     expires_us: i64,
 }
 
+#[cfg(feature = "phase2-fixtures")]
 impl Saved {
     pub(crate) fn fresh(self) -> Result<bool> {
         Ok(upstream::now_us()? < self.expires_us)
@@ -75,6 +86,7 @@ impl Saved {
     }
 }
 
+#[cfg(feature = "phase2-fixtures")]
 #[derive(Debug)]
 pub(crate) struct Invalid {
     pub kind: Kind,
@@ -82,6 +94,7 @@ pub(crate) struct Invalid {
     cause: Box<dyn std::error::Error + Send + Sync>,
 }
 
+#[cfg(feature = "phase2-fixtures")]
 impl std::fmt::Display for Invalid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -94,8 +107,10 @@ impl std::fmt::Display for Invalid {
     }
 }
 
+#[cfg(feature = "phase2-fixtures")]
 impl std::error::Error for Invalid {}
 
+#[cfg(feature = "phase2-fixtures")]
 #[derive(Default)]
 pub(crate) struct SavedSources {
     pub txt: BTreeMap<RfcNumber, Saved>,
@@ -103,6 +118,7 @@ pub(crate) struct SavedSources {
 }
 
 impl Context {
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) async fn load(self, writer: &Writer) -> Result<SavedSources> {
         let key = self.key.as_bytes().as_slice();
         writer
@@ -143,6 +159,7 @@ impl Context {
         Ok(sources)
     }
 
+    #[cfg(feature = "phase2-fixtures")]
     pub(crate) async fn record(
         self,
         db: &impl GenericClient,
@@ -161,6 +178,92 @@ impl Context {
             ],
         )
         .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn load_https(
+        self,
+        writer: &Writer,
+    ) -> Result<(BTreeMap<RfcNumber, Original>, BTreeMap<RfcNumber, Original>)> {
+        writer
+            .client
+            .query_one("SELECT rfc.prune_ingestion_checkpoints(NULL, NULL)", &[])
+            .await?;
+        let rows = writer.client.query(
+            "SELECT c.rfc_id::integer, c.kind, c.observation::bytea, o.raw_digest::bytea,
+                    c.byte_length::bigint, (extract(epoch FROM c.expires_at) * 1000000)::bigint,
+                    (extract(epoch FROM o.observed_at) * 1000000)::bigint,
+                    (extract(epoch FROM o.fetched_at) * 1000000)::bigint,
+                    o.etag, o.last_modified, c.document_version::bytea
+             FROM rfc.ingestion_checkpoints c JOIN rfc.source_observations o ON o.identity = c.observation
+             JOIN rfc.blobs b ON b.digest = o.raw_digest AND b.integrity_state = 'verified'
+             LEFT JOIN rfc.document_versions d ON d.identity = c.document_version
+             WHERE c.scope = $1 AND c.context = $2::bytea AND c.evidence_state = 'https'
+               AND c.expires_at > statement_timestamp() AND o.fetched_at <= statement_timestamp()
+               AND c.byte_length = b.byte_length AND o.kind = c.kind AND o.https_verification = 'verified'
+               AND CASE WHEN c.kind = 'txt' THEN
+                   d.sealed AND d.rfc_id = c.rfc_id AND d.txt_digest = o.raw_digest
+                   AND d.parser_version = $3 AND d.index_version = $4
+                   AND o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || c.rfc_id || '.txt'
+               ELSE o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || c.rfc_id || '.xml' END
+             LIMIT $5",
+            &[&self.scope, &self.key.as_bytes().as_slice(), &PARSER, &INDEX,
+              &(2 * MAX_CATALOG_ENTRIES as i64 + 1)],
+        ).await?;
+        if rows.len() > 2 * MAX_CATALOG_ENTRIES {
+            return Err("HTTPS checkpoints exceed selection bounds".into());
+        }
+        let mut txt = BTreeMap::new();
+        let mut xml = BTreeMap::new();
+        for row in rows {
+            let id = RfcNumber::new(row.try_get(0)?).ok_or("invalid checkpoint RFC number")?;
+            let sources = match row.try_get::<_, &str>(1)? {
+                "txt" => &mut txt,
+                "rfcxml" => &mut xml,
+                _ => return Err("invalid checkpoint source kind".into()),
+            };
+            let version = row
+                .try_get::<_, Option<&[u8]>>(10)?
+                .map(|bytes| bytes.try_into().map(BlobDigest::from_bytes))
+                .transpose()?;
+            sources.insert(
+                id,
+                Original {
+                    observation: Some(
+                        BlobDigest::from_bytes(row.try_get::<_, &[u8]>(2)?.try_into()?).to_string(),
+                    ),
+                    digest: BlobDigest::from_bytes(row.try_get::<_, &[u8]>(3)?.try_into()?),
+                    length: u64::try_from(row.try_get::<_, i64>(4)?)?,
+                    checkpoint_expiry: Some(row.try_get(5)?),
+                    observed_us: row.try_get(6)?,
+                    fetched_us: row.try_get(7)?,
+                    etag: row.try_get(8)?,
+                    last_modified: row.try_get(9)?,
+                    checkpoint_version: version,
+                },
+            );
+        }
+        Ok((txt, xml))
+    }
+
+    pub(crate) async fn record_https(
+        self,
+        db: &impl GenericClient,
+        id: RfcNumber,
+        kind: Kind,
+        observation: BlobDigest,
+        version: Option<BlobDigest>,
+        malformed: bool,
+    ) -> Result<()> {
+        db.query_one(
+            "SELECT rfc.store_source_checkpoint($1, $2::bytea, $3::integer, $4, $5::bytea, $6, $7::bytea)",
+            &[
+                &self.scope, &self.key.as_bytes().as_slice(), &(id.get() as i32),
+                &kind.as_str(), &observation.as_bytes().as_slice(),
+                &if malformed { "malformed" } else { "https" },
+                &version.as_ref().map(|value| value.as_bytes().as_slice()),
+            ],
+        ).await?;
         Ok(())
     }
 

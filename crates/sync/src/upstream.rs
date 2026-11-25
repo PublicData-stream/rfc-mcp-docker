@@ -447,7 +447,11 @@ impl Upstream {
         shutdown: Option<&Shutdown>,
         conditional: Option<(&Option<String>, &Option<String>)>,
     ) -> std::result::Result<Download, FetchFailure> {
-        let queue = self.metrics.span(Stage::Queue);
+        let queue = self.metrics.span(match source {
+            Source::Txt(_) => Stage::TxtQueue,
+            Source::Xml(_) => Stage::XmlQueue,
+            _ => Stage::Queue,
+        });
         let lane = match source {
             Source::Txt(_) => Lane::Txt,
             Source::Xml(_) => Lane::Xml,
@@ -672,7 +676,15 @@ impl Upstream {
             if chunk.len() > limit - length {
                 return Err(FetchFailure::terminal("HTTPS transfer exceeds byte limit"));
             }
-            self.metrics.received(chunk.len());
+            self.metrics.received(
+                match source {
+                    Source::Txt(_) => Stage::Txt,
+                    Source::Xml(_) => Stage::Xml,
+                    Source::Catalog => Stage::Catalog,
+                    Source::Feed(_) => Stage::Feed,
+                },
+                chunk.len(),
+            );
             length += chunk.len();
             if let Some(file) = &mut file {
                 charge

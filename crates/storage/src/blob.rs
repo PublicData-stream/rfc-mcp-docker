@@ -311,14 +311,15 @@ impl BlobWriter {
     }
 
     /// Verify canonical bytes and flush their existing name before publication.
-    pub fn verify_durable(&self, digest: BlobDigest, byte_length: i64) -> io::Result<()> {
-        self.verify_existing(DurableBlob {
+    pub fn verify_durable(&self, digest: BlobDigest, byte_length: i64) -> io::Result<DurableBlob> {
+        let blob = DurableBlob {
             digest,
             byte_length,
-        })?;
+        };
+        self.verify_existing(blob)?;
         let hex = digest.to_string();
         fs::fsync(directory(&self.blobs, &hex[..2])?)?;
-        Ok(())
+        Ok(blob)
     }
 
     /// Inventory a canonical shard without following an entry supplied by the filesystem.
