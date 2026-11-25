@@ -361,7 +361,7 @@ The gate used synthetic sources and a disposable localhost HTTPS proxy. Live cor
 
 ## GitHub Actions CI matrix
 
-Branch pushes and pull requests run the frozen Rust checks, all-feature checks, and HTTP mutation smoke on native Linux amd64 and arm64. The Compose matrix runs Phases 0–7 and the Phase 8 restore on amd64, and Phases 0, 5, and 7 on arm64. Each architecture builds its image bundle once. The case jobs verify the archive checksum, source revision, architecture, and loaded image IDs before running the existing probes. Phase 8 capacity and live upstream checks remain part of local qualification. [CI workflow](../.github/workflows/ci.yml) · [Docker workflow](../.github/workflows/docker-e2e.yml)
+Branch pushes and pull requests run the frozen Rust checks, all-feature checks, and HTTP mutation smoke on native Linux amd64 and arm64. The amd64 Compose matrix runs Phases 0–7, the Phase 8 restore, legacy Phase 6, the paced bootstrap, and HTTPS publication and fault probes. The arm64 matrix runs Phases 0, 5, and 7 and HTTPS fault probes. Each architecture builds one image bundle. The case jobs verify the archive checksum, source revision, architecture, and loaded image IDs before running the probes. Phase 8 capacity and live upstream checks remain part of local qualification. [CI workflow](../.github/workflows/ci.yml) · [Docker workflow](../.github/workflows/docker-e2e.yml)
 
 ### Local verification on 2026-11-23
 
@@ -388,6 +388,38 @@ Branch pushes and pull requests run the frozen Rust checks, all-feature checks, 
 - On 2026-11-23, Rust `1.100.0` (`0ef1bc386`) passed the offline Phase 0 Rust checks, all-feature Clippy and tests, and all 258 HTTP smoke cases on Linux amd64. Cargo reported `1.100.0` for all six workspace crates. A frozen workspace check with Rust `1.99.1` failed with the expected minimum-version error. Workflow lint and production Compose configuration validation passed.
 - The same rebuilt amd64 images passed Phase 0 on rootful and rootless Docker Engine `29.10.0` with Compose `5.8.0`. The probes passed for MCP `2026-07-28` over Streamable HTTP, PostgreSQL TLS and permissions, exact rsync transfer, and Landlock and seccomp. Separate `linux/amd64/v3` builds of serve, sync, and feed passed the entrypoint version checks. The AMD64v3 serve image ran ripgrep `15.2.0` with PCRE2 disabled.
 - The image bundle receipt and test logs are under `/tmp/rfc-rust100.EctmDcEt`. Cargo artifacts used `/tmp/rust/target`. Native ARM64 verification remains pending the hosted CI matrix.
+
+### Schema 10 CI build isolation
+
+The amd64 `phase2`, `phase6-legacy`, and `bootstrap-quick` jobs rejected the
+schema 10 fixture database. The build log shows `rfc-storage` compiling for
+the current checkout and being reused in the pinned historical compile.
+Both builds shared the same Cargo target mount.
+[Failing CI run](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/45605432824)
+
+The image build uses a separate BuildKit instance for the pinned schema 10
+checkout. To reproduce a mixed bundle locally, create two distinct
+`docker-container` builders on the same Docker context and pass their names
+to `scripts/ci/docker-e2e.py build` with `--builder` and
+`--schema10-builder`. The bundle carries the image sets for both revisions.
+
+- On 2026-11-25, a native Linux amd64 build compiled `rfc-storage`
+  independently on each BuildKit 0.34.1 instance. Rootful Docker 29.10.1
+  and rootless Docker 29.10.0 both loaded and verified the 15-image
+  archive. A current-only build also passed. The runner rejected absent
+  or shared builder names for a mixed bundle before invoking Docker.
+- The rootful Compose 5.8.0 replay passed `phase2`, `phase6-legacy`, and
+  `bootstrap-quick`. The six-RFC private bootstrap reached a byte-exact
+  MCP read at 33.293 seconds. The fixture made 14 HTTPS starts with a
+  minimum interval of 1,000,443 microseconds.
+- The offline Phase 0 Rust checks and workflow lint passed. The current
+  `phase0`, `phase1`, and `phase6` controls passed on rootful Compose.
+  Rootless Minikube 1.39.0 with Kubernetes 1.37.0 and
+  containerd passed stock preflight, manual and Feed-triggered
+  publication, exact MCP reads, authenticated outbox delivery, and repair
+  after pod replacement. The warm run reused six TXT and three RFCXML
+  originals with five HTTPS starts. Cleanup removed the disposable
+  builders, image tags, profile, and both ext4 mounts.
 
 ## RustSec dependency checks
 

@@ -108,9 +108,14 @@ def sha256(path):
 
 
 def image_bundle(args, docker):
-    require_native(docker, args.arch)
     current = image_targets(args.image_prefix, [case for case in args.cases if case not in LEGACY_CASES])
     legacy = image_targets(f"{args.image_prefix}-schema10", [case for case in args.cases if case in LEGACY_CASES])
+    if args.command == "build" and legacy:
+        if not args.schema10_builder:
+            raise ValueError("schema 10 cases require --schema10-builder")
+        if current and (not args.builder or args.builder == args.schema10_builder):
+            raise ValueError("mixed bundles require distinct --builder and --schema10-builder instances")
+    require_native(docker, args.arch)
     targets = current | legacy
     archive = args.bundle / "images.tar"
     manifest = args.bundle / "manifest.json"
@@ -120,10 +125,16 @@ def image_bundle(args, docker):
     if args.command == "build":
         args.bundle.mkdir(parents=True)
         with (historical_checkout() if legacy else nullcontext(ROOT)) as historical:
-            for ref, target in targets.items():
-                source = historical if ref in legacy else ROOT
-                run([*docker, "buildx", "build", "--load", "--platform", identity["platform"],
-                     "--provenance=false", "--target", target, "--tag", ref, str(source)])
+            for images, source, builder in (
+                (current, ROOT, args.builder),
+                (legacy, historical, args.schema10_builder),
+            ):
+                buildx = [*docker, "buildx", "build"]
+                if builder:
+                    buildx.extend(("--builder", builder))
+                for ref, target in images.items():
+                    run([*buildx, "--load", "--platform", identity["platform"],
+                         "--provenance=false", "--target", target, "--tag", ref, str(source)])
         ids = image_ids(docker, targets, args.arch)
         run([*docker, "image", "save", "--output", str(archive), *targets])
         receipt = {**identity, "images": ids, "archive_sha256": sha256(archive)}
@@ -203,6 +214,9 @@ def main():
         bundle.add_argument("bundle", type=temporary_path)
         bundle.add_argument("--arch", choices=("amd64", "arm64"), required=True)
         bundle.add_argument("--cases", type=case_list, required=True)
+        if command == "build":
+            bundle.add_argument("--builder", help="Buildx instance for the current checkout")
+            bundle.add_argument("--schema10-builder", help="separate Buildx instance for the schema 10 checkout")
     case = commands.add_parser("run")
     case.add_argument("case", choices=CASE_FIXTURES)
     case.add_argument("evidence", type=temporary_path)

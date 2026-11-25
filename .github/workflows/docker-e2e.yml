@@ -29,19 +29,34 @@ jobs:
     name: Build images (${{ inputs.arch }})
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
+    env:
+      RFC_E2E_BUILDKIT_IMAGE: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
-          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+          driver-opts: image=${{ env.RFC_E2E_BUILDKIT_IMAGE }}
+      - id: schema10-buildx
+        if: >-
+          ${{ contains(fromJSON(inputs.cases), 'phase2') || contains(fromJSON(inputs.cases), 'phase6-legacy')
+              || contains(fromJSON(inputs.cases), 'bootstrap-quick') }}
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.RFC_E2E_BUILDKIT_IMAGE }}
+          use: false
       - name: Build the native image bundle
+        env:
+          RFC_E2E_BUILDER: ${{ steps.buildx.outputs.name }}
+          RFC_E2E_SCHEMA10_BUILDER: ${{ steps.schema10-buildx.outputs.name }}
         run: |
           python3 -B scripts/ci/docker-e2e.py --image-prefix "$RFC_E2E_IMAGE_PREFIX" \
-            build "$RFC_E2E_BUNDLE_DIR" --arch "$RFC_E2E_ARCH" --cases "$RFC_E2E_CASES"
+            build "$RFC_E2E_BUNDLE_DIR" --arch "$RFC_E2E_ARCH" --cases "$RFC_E2E_CASES" \
+            --builder "$RFC_E2E_BUILDER" --schema10-builder "$RFC_E2E_SCHEMA10_BUILDER"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rfc-mcp-e2e-images-${{ inputs.arch }}
