@@ -19,6 +19,8 @@ class FeedUpstream(phase2.Https):
                 while (root / "hold-catalog").exists() and time.monotonic() < deadline:
                     time.sleep(0.1)
             return super().do_GET()
+        if phase2.mode().startswith("acquisition-"):
+            print(f"acquisition start {self.path} {time.monotonic_ns()}", flush=True)
         scenario = (root / "feed-mode").read_text().strip()
         self.log_message("feed scenario=%s at=%.3f", scenario, time.monotonic())
         if scenario == "rate-limited":

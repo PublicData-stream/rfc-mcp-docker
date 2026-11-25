@@ -29,12 +29,13 @@ INGESTION_PATH = "/etc/rfc-mcp/ingestion.toml"
 
 
 class Deployment:
-    def __init__(self, work, seed, prefix):
+    def __init__(self, work, seed, prefix, spool):
         self.work, self.docker = work, seed.docker
         self.ca = seed.directory / "certs/ca.crt"
         self.name = work.name + "-prod"
         self.network = self.name + "-ingress"
         self.prefix = prefix
+        self.spool = spool
         self.passwords = seed.passwords
         self.pgdata = work / "production-pgdata"
         self.pgdata.mkdir()
@@ -60,6 +61,7 @@ class Deployment:
         self.env.update(RFC_INGRESS_NETWORK=self.network, RFC_MCP_HOSTS="rfc.test",
                         RFC_MCP_ORIGINS="https://rfc.test",
                         RFC_SYNC_CONFIG_HOST_FILE=str(self.ingestion),
+                        RFC_SYNC_SPOOL_HOST_DIR=str(spool),
                         RFC_MIRROR_DIR=str(seed.directory / "mirror"),
                         RFC_PGDATA_DIR=str(self.pgdata),
                         RFC_DB_CA=str(seed.directory / "certs/ca.crt"),
@@ -102,7 +104,8 @@ class Deployment:
 
     def command(self, *args, extra=None):
         compose = [*self.docker, "compose", "-p", self.name, "-f", str(ROOT / "compose.yml"),
-                   "-f", str(HERE / "compose.yml")]
+                   "-f", str(HERE / "compose.yml"),
+                   "-f", str(ROOT / "deploy/compose.https-acquisition.yml")]
         if extra:
             compose.extend(("-f", str(extra)))
         return [*compose, *phase0.compose_args(*args)]
@@ -129,13 +132,21 @@ class Deployment:
         for service, spec in project["services"].items():
             mounts = [volume for volume in spec.get("volumes", []) if volume["target"] == INGESTION_PATH]
             path = (spec.get("environment") or {}).get("RFC_SYNC_CONFIG_FILE")
+            spool = [volume for volume in spec.get("volumes", []) if volume["target"] == "/rfc-https-spool"]
             if service == SYNC:
                 mount, = mounts
                 assert mount["type"] == "bind" and mount["source"] == str(self.ingestion)
                 assert mount["read_only"] and not mount["bind"]["create_host_path"]
                 assert path == INGESTION_PATH
+                staging, = spool
+                assert staging["type"] == "bind" and staging["source"] == str(self.spool)
+                assert not staging.get("read_only") and not staging["bind"]["create_host_path"]
             else:
-                assert not mounts and path is None
+                assert not mounts and not spool and path is None
+        assert set(project["services"][FEED]["networks"]) == {"feed_control"}
+        missing_spool = dict(self.env)
+        del missing_spool["RFC_SYNC_SPOOL_HOST_DIR"]
+        phase1.failed(self.command("config", "--quiet"), missing_spool, "Provision a private disk-backed")
         missing = dict(self.env)
         del missing["RFC_SYNC_CONFIG_HOST_FILE"]
         phase1.failed(self.command("config", "--quiet"), missing, "Set RFC_SYNC_CONFIG_HOST_FILE")
@@ -151,7 +162,8 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         assert report["publication_gate"] == "https_txt_audit_pending"
         assert report["resources"]["cgroup_memory_limit_bytes"] == 2 * 1024**3
         assert report["resources"]["scratch_available_bytes"] == 512 * 1024**2
-        print("Production Compose requires a Sync-only read-only v2 config mount", flush=True)
+        assert report["resources"]["spool_available_inodes"] >= 40016
+        print("The Phase 2 overlay isolates the spool, v2 config mount, and Feed egress", flush=True)
 
     def provision(self):
         self.check_config_mount()
@@ -194,6 +206,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
             command = [*self.docker, "run", *phase0.local_image_args(), "--rm", "--network", "none",
                        "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                        "--memory", memory, "--tmpfs", f"/tmp:size={scratch},mode=1777,noexec,nosuid,nodev",
+                       "-v", f"{self.spool}:/rfc-https-spool",
                        *options, f"{self.prefix}-sync", *args]
             if expected is not None:
                 phase1.failed(command, self.env, expected)
@@ -205,10 +218,10 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         defaults = probe()
         assert defaults["source"] == "defaults"
         assert defaults["ingestion"] == probe(*file_options)["ingestion"]
-        assert defaults["schema_version"] == 2 and defaults["phase"] == "discovery"
+        assert defaults["schema_version"] == 2 and defaults["phase"] == "acquisition"
         assert defaults["publication_gate"] == "https_txt_audit_pending"
         assert set(defaults["pending_consumers"]) == {
-            "ingestion.pipeline", "ingestion.revalidation", "ingestion.database",
+            "ingestion.revalidation", "ingestion.database",
         }
         for name in ("RFC_SYNC_HTTP_CONCURRENCY", "RFC_SYNC_PARSE_CONCURRENCY"):
             probe("-e", f"{name}=1", expected=f"{name} was removed")
@@ -450,12 +463,13 @@ def main():
         if args.config_only:
             seed = phase1.Project(work / "config-fixture", work / "unused", args.image_prefix, docker, work.name)
             seed.key = secrets.token_bytes(48)
-            deployment = Deployment(work, seed, args.image_prefix)
-            try:
-                deployment.check_config()
-                deployment.check_config_mount()
-            finally:
-                deployment.close()
+            with phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool:
+                deployment = Deployment(work, seed, args.image_prefix, spool)
+                try:
+                    deployment.check_config()
+                    deployment.check_config_mount()
+                finally:
+                    deployment.close()
             return
         phase5.phase3.fixture_driver(docker, args.image_prefix, work / "publication-driver")
         seed = phase5.Project(work / work.name, work / "publication-driver", args.image_prefix, docker)
@@ -478,20 +492,21 @@ def main():
                                             "-U", "postgres", "-d", "rfc"), env=seed.env,
                                stdout=wire, check=True, timeout=45)
             seed.run("stop", "fixtures", "postgres", timeout=50)
-            deployment = Deployment(work, seed, args.image_prefix)
-            try:
-                deployment.check_config()
-                deployment.start()
-                deployment.verify()
-                deployment.run("up", "-d", "--force-recreate", "--wait", "--wait-timeout", "55",
-                               timeout=90)
-                port = int(deployment.capture("port", "test-proxy", "8443").rsplit(":", 1)[1])
-                deployment.client.port = port
-                deployment.verify()
-                deployment.worker_lifecycle()
-                deployment.fail_closed()
-            finally:
-                deployment.close()
+            with phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool:
+                deployment = Deployment(work, seed, args.image_prefix, spool)
+                try:
+                    deployment.check_config()
+                    deployment.start()
+                    deployment.verify()
+                    deployment.run("up", "-d", "--force-recreate", "--wait", "--wait-timeout", "55",
+                                   timeout=90)
+                    port = int(deployment.capture("port", "test-proxy", "8443").rsplit(":", 1)[1])
+                    deployment.client.port = port
+                    deployment.verify()
+                    deployment.worker_lifecycle()
+                    deployment.fail_closed()
+                finally:
+                    deployment.close()
         finally:
             seed.close()
 

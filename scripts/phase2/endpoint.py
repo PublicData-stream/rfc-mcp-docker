@@ -52,6 +52,47 @@ class Https(BaseHTTPRequestHandler):
 
     def do_GET(self):
         scenario = mode()
+        if scenario.startswith("acquisition-"):
+            print(f"acquisition start {self.path} {time.monotonic_ns()}", flush=True)
+            if scenario in ("acquisition-hold-txt", "acquisition-hold-xml"):
+                suffix = scenario.rsplit("-", 1)[-1]
+                if self.path == f"/rfc/rfc100.{suffix}":
+                    deadline = time.monotonic() + 24
+                    while not (ROOT / "release-acquisition").exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+            if scenario in ("acquisition-delay", "acquisition-http-date") and self.path == "/rfc/rfc100.txt":
+                from email.utils import formatdate
+                self.send_response(429 if scenario.endswith("delay") else 503)
+                self.send_header("Retry-After", "7" if scenario.endswith("delay") else
+                                 formatdate(time.time() + 8, usegmt=True))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if scenario == "acquisition-xml-status":
+                status = {"/rfc/rfc101.xml": 410, "/rfc/rfc9110.xml": 502}.get(self.path)
+                if status is not None:
+                    self.send_response(status)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+            if self.path == "/rfc/rfc100.txt":
+                if scenario == "acquisition-truncated":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", "300")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(b"short")
+                    self.close_connection = True
+                    return
+                if scenario == "acquisition-oversized":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(4 * 1024 * 1024 + 1))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    return
         if scenario.startswith("phase8-") and self.path.startswith("/rfc/") and self.path.endswith(".xml"):
             self.benchmark_xml(scenario)
             return
