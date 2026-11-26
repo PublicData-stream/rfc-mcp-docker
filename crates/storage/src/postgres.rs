@@ -7,13 +7,18 @@ use crate::{
 use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use std::env;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::timeout;
-use tokio_postgres::{Client, GenericClient, IsolationLevel, Transaction, config::SslMode};
+use tokio_postgres::{
+    Client, Connection, GenericClient, IsolationLevel, Socket, Transaction, config::SslMode,
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
+
+mod pool;
+pub use pool::{PoolClass, PoolConfig, PoolError, ReadOutcome, ServePool};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -168,6 +173,65 @@ async fn open_session(role: RuntimeRole) -> Result<(Client, tokio::task::JoinHan
 }
 
 async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::JoinHandle<()>)> {
+    let (client, connection) = connect_transport(role, DatabaseFiles::read()?).await?;
+    struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            if let Some(driver) = &self.0 {
+                driver.abort();
+            }
+        }
+    }
+    let mut driver = AbortOnDrop(Some(tokio::spawn(async move {
+        let _ = connection.await;
+    })));
+    verify(&client, role).await?;
+    Ok((client, driver.0.take().expect("driver is present")))
+}
+
+struct DatabaseFiles {
+    password: Vec<u8>,
+    ca: Vec<u8>,
+}
+
+impl DatabaseFiles {
+    fn read() -> Result<Self> {
+        let password = PathBuf::from(
+            env::var_os("RFC_DB_PASSWORD_FILE").ok_or("RFC_DB_PASSWORD_FILE is required")?,
+        );
+        let ca = PathBuf::from(env::var_os("RFC_DB_CA_FILE").ok_or("RFC_DB_CA_FILE is required")?);
+        Ok(Self {
+            password: read_database_file(password, 4098)?,
+            ca: read_database_file(ca, 1024 * 1024)?,
+        })
+    }
+}
+
+fn read_database_file(path: PathBuf, limit: u64) -> Result<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags, open};
+    let file = File::from(open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    if !file.metadata()?.is_file() {
+        return Err("database credential path is not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err("database credential file exceeds its limit".into());
+    }
+    Ok(bytes)
+}
+
+async fn connect_transport(
+    role: RuntimeRole,
+    files: DatabaseFiles,
+) -> Result<(
+    Client,
+    Connection<Socket, <MakeRustlsConnect as tokio_postgres::tls::MakeTlsConnect<Socket>>::Stream>,
+)> {
     let host = env::var("RFC_DB_HOST")?;
     let port = env::var("RFC_DB_PORT")
         .ok()
@@ -175,11 +239,7 @@ async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::J
         .transpose()?
         .unwrap_or(5432);
     let user = env::var("RFC_DB_USER").unwrap_or_else(|_| role.name().to_owned());
-    let password_path = PathBuf::from(
-        env::var_os("RFC_DB_PASSWORD_FILE").ok_or("RFC_DB_PASSWORD_FILE is required")?,
-    );
-    let ca_path = PathBuf::from(env::var_os("RFC_DB_CA_FILE").ok_or("RFC_DB_CA_FILE is required")?);
-    let password = fs::read(password_path)?;
+    let DatabaseFiles { password, ca } = files;
     let password = match password.strip_suffix(b"\n") {
         Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
         None => password.as_slice(),
@@ -188,7 +248,7 @@ async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::J
         return Err("invalid database password file length".into());
     }
     let mut roots = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(ca_path)? {
+    for cert in CertificateDer::pem_slice_iter(&ca) {
         roots.add(cert?)?;
     }
     if roots.is_empty() {
@@ -207,7 +267,7 @@ async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::J
         // PostgreSQL must check the socket even while a read is blocked on a lock.
         options.push_str(" -cclient_connection_check_interval=100ms");
     }
-    let (client, connection) = tokio_postgres::Config::new()
+    Ok(tokio_postgres::Config::new()
         .host(&host)
         .port(port)
         .user(&user)
@@ -217,15 +277,10 @@ async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::J
         .connect_timeout(Duration::from_secs(5))
         .options(&options)
         .connect(MakeRustlsConnect::new(tls))
-        .await?;
-    let driver = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    verify(&client, role).await?;
-    Ok((client, driver))
+        .await?)
 }
 
-async fn verify(client: &Client, role: RuntimeRole) -> Result<()> {
+async fn verify(client: &impl GenericClient, role: RuntimeRole) -> Result<()> {
     let valid: bool = client.query_one(
         "SELECT current_user::text = $1 AND session_user::text = $1 AND current_database() = 'rfc'
           AND current_setting('server_version_num')::integer / 10000 = 19
@@ -503,12 +558,7 @@ impl Reader {
 
     /// Returns the current pointer and its independent monotonic sequence.
     pub async fn active(&self) -> Result<(Option<GenerationId>, i64)> {
-        let row = self.client.query_one("SELECT generation_id, publication_sequence FROM rfc.active_generation WHERE singleton", &[]).await?;
-        let generation = row
-            .try_get::<_, Option<i64>>(0)?
-            .map(|id| GenerationId::new(id).ok_or("invalid generation ID"))
-            .transpose()?;
-        Ok((generation, row.try_get(1)?))
+        active(&self.client).await
     }
 
     /// Run one bounded operation on a dedicated, disposable read session.
@@ -517,84 +567,11 @@ impl Reader {
         selection: GenerationSelection,
         operation: impl for<'a, 'b> AsyncFnOnce(&'a GenerationReadGuard<'b>) -> Result<T>,
     ) -> Result<T> {
-        let operation = async {
-            for attempt in 0..2 {
-                let tx = self
-                    .client
-                    .build_transaction()
-                    .isolation_level(IsolationLevel::ReadCommitted)
-                    .read_only(true)
-                    .start()
-                    .await?;
-                let (id, resolved_sequence) = match selection {
-                    GenerationSelection::Active => {
-                        let row = tx.query_one("SELECT generation_id, publication_sequence FROM rfc.active_generation WHERE singleton", &[]).await?;
-                        (
-                            row.try_get::<_, Option<i64>>(0)?
-                                .ok_or(GenerationUnavailable)?,
-                            Some(row.try_get(1)?),
-                        )
-                    }
-                    GenerationSelection::Pinned(generation) => {
-                        (i64::try_from(generation.get())?, None)
-                    }
-                };
-                let generation = GenerationId::new(id).ok_or("invalid generation ID")?;
-                crate::fixture_boundary("reader_resolved");
-                tx.query_one("SELECT pg_advisory_xact_lock_shared($1)", &[&id])
-                    .await?;
-                let mirror = loop {
-                    let result = BlobReader::open(&mirror_root(), true).and_then(|mirror| {
-                        let fence = mirror.generation_fence(generation)?;
-                        Ok((mirror, fence))
-                    });
-                    if result
-                        .as_ref()
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-                    {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    } else {
-                        break result;
-                    }
-                };
-                let mirror = match mirror {
-                    Ok(mirror) => Some(mirror),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(error.into()),
-                };
-                // This statement starts after taking the locks, including when the
-                // generation was retired while the advisory lock was pending.
-                let row = tx
-                    .query_opt(
-                        "SELECT last_publication_sequence FROM rfc.generations
-                     WHERE id = $1 AND state IN ('published', 'retained')",
-                        &[&id],
-                    )
-                    .await?;
-                if let Some(row) = row {
-                    let (mirror, fence) =
-                        mirror.ok_or("readable generation is missing its mirror fence")?;
-                    let sequence = resolved_sequence.unwrap_or(row.try_get(0)?);
-                    let guard = GenerationReadGuard {
-                        tx,
-                        mirror: &mirror,
-                        _fence: fence,
-                        generation,
-                        sequence,
-                    };
-                    let result = operation(&guard).await?;
-                    guard.tx.commit().await?;
-                    return Ok(result);
-                }
-                tx.rollback().await?;
-                if attempt == 1 || matches!(selection, GenerationSelection::Pinned(_)) {
-                    return Err(GenerationUnavailable.into());
-                }
-            }
-            unreachable!("generation attempts are bounded")
-        };
+        let operation = read_generation(&mut self.client, selection, async |guard| {
+            operation(guard).await.map(ReadOutcome::Complete)
+        });
         tokio::select! {
-            result = timeout(READ_DEADLINE, operation) => result?,
+            result = timeout(READ_DEADLINE, operation) => result??.into_result(),
             _ = &mut self.driver => Err("generation read session closed".into()),
         }
     }
@@ -620,6 +597,106 @@ impl Reader {
         tx.commit().await?;
         Ok(digest)
     }
+}
+
+async fn active(db: &impl GenericClient) -> Result<(Option<GenerationId>, i64)> {
+    let row = db
+        .query_one(
+            "SELECT generation_id, publication_sequence FROM rfc.active_generation WHERE singleton",
+            &[],
+        )
+        .await?;
+    let generation = row
+        .try_get::<_, Option<i64>>(0)?
+        .map(|id| GenerationId::new(id).ok_or("invalid generation ID"))
+        .transpose()?;
+    Ok((generation, row.try_get(1)?))
+}
+
+async fn read_generation<T>(
+    client: &mut Client,
+    selection: GenerationSelection,
+    operation: impl for<'a, 'b> AsyncFnOnce(&'a GenerationReadGuard<'b>) -> Result<ReadOutcome<T>>,
+) -> Result<ReadOutcome<T>> {
+    for attempt in 0..2 {
+        let tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .read_only(true)
+            .start()
+            .await?;
+        let (id, resolved_sequence) = match selection {
+            GenerationSelection::Active => {
+                let row = tx.query_one("SELECT generation_id, publication_sequence FROM rfc.active_generation WHERE singleton", &[]).await?;
+                let Some(id) = row.try_get::<_, Option<i64>>(0)? else {
+                    tx.rollback().await?;
+                    return Ok(ReadOutcome::Rejected(GenerationUnavailable.into()));
+                };
+                (id, Some(row.try_get(1)?))
+            }
+            GenerationSelection::Pinned(generation) => (i64::try_from(generation.get())?, None),
+        };
+        let generation = GenerationId::new(id).ok_or("invalid generation ID")?;
+        crate::fixture_boundary("reader_resolved");
+        tx.query_one("SELECT pg_advisory_xact_lock_shared($1)", &[&id])
+            .await?;
+        let mirror = loop {
+            let result = BlobReader::open(&mirror_root(), true).and_then(|mirror| {
+                let fence = mirror.generation_fence(generation)?;
+                Ok((mirror, fence))
+            });
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                break result;
+            }
+        };
+        let mirror = match mirror {
+            Ok(mirror) => Some(mirror),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        // This statement starts after taking the locks, including when the
+        // generation was retired while the advisory lock was pending.
+        let row = tx
+            .query_opt(
+                "SELECT last_publication_sequence FROM rfc.generations
+         WHERE id = $1 AND state IN ('published', 'retained')",
+                &[&id],
+            )
+            .await?;
+        if let Some(row) = row {
+            let (mirror, fence) =
+                mirror.ok_or("readable generation is missing its mirror fence")?;
+            let sequence = resolved_sequence.unwrap_or(row.try_get(0)?);
+            let guard = GenerationReadGuard {
+                tx,
+                mirror: &mirror,
+                _fence: fence,
+                generation,
+                sequence,
+            };
+            return match operation(&guard).await? {
+                ReadOutcome::Complete(result) => {
+                    guard.tx.commit().await?;
+                    Ok(ReadOutcome::Complete(result))
+                }
+                ReadOutcome::Rejected(error) => {
+                    guard.tx.rollback().await?;
+                    Ok(ReadOutcome::Rejected(error))
+                }
+                ReadOutcome::Interrupted(result) => Ok(ReadOutcome::Interrupted(result)),
+            };
+        }
+        tx.rollback().await?;
+        if attempt == 1 || matches!(selection, GenerationSelection::Pinned(_)) {
+            return Ok(ReadOutcome::Rejected(GenerationUnavailable.into()));
+        }
+    }
+    unreachable!("generation attempts are bounded")
 }
 
 pub async fn verify_stored_manifest(
