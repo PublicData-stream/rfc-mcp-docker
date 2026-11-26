@@ -2061,3 +2061,56 @@ Docker profile, `--image-prefix "$prefix"`, and the disk-backed spool
 and audit node paths. Use the `policy-check-sample` fixture command
 with the RFC Index, original TXT file, and RFC number to repeat a
 prospective official sample decision.
+
+## Compose schema upgrade and recovery
+
+Compose now runs two read-only database preflights before starting Serve
+and Sync. The host upgrade command compares a private database and mirror
+backup with the quiescent deployment before applying migrations. It checks
+the resulting schema and incumbent pointer in the transaction and leaves
+the application restart to the operator. [Upgrade and recovery](deployment.md#upgrade-existing-volumes)
+
+- Native Linux amd64 passed the frozen Rust gate, all-feature Clippy and
+  tests, and rootless Phase 0. Rootless Phase 7 passed startup and forced
+  recreation, production confinement, readiness under pool saturation,
+  and worker cancellation and reader-fence release. These probes used
+  Docker Engine 29.10.1, Compose 5.8.0, and PostgreSQL 19.0.
+- Rootless Phase 8 restored into fresh volumes with generation 2 at
+  sequence 2, generation 1 retained, and rights epoch 1. It verified
+  16 canonical blobs, 773 byte ranges and line starts, three manifests,
+  and the public MCP read path.
+- Populated Compose upgrades from schemas 9, 10, and 11 to 12 passed.
+  Each preserved the active pointer, verified the incumbent's
+  byte-exact MCP read and pinned reads of the readable generations, and
+  passed a second run at schema 12. The schema 11 rehearsal rejected
+  a held coordinator lock, an uninitialized catalog, a
+  malformed history, a stale or corrupt archive, a mismatched pointer,
+  and a same-length corrupted blob. A forced SQL error rolled back the
+  migration. Forced recreation with mixed images and ordinary startup
+  with an invalid history both stopped at preflight. Serve retired a
+  rejected pooled session gracefully and PostgreSQL reported no
+  open-transaction EOF during those rejections. The historical
+  publication probes also passed after each upgrade.
+- Disposable rootless Minikube passed manual publication, repair replay,
+  pod replacement, and Feed-triggered publication with authenticated
+  outbox delivery and MCP reads. The initial run stopped at fixture
+  setup because the staging mounts were owned by node root. The rerun
+  used the mapped Sync UID on both disk-backed mounts.
+
+These results use private fixtures. The migration history and image
+IDs on the reported deployment still need operator verification.
+
+Use matching native service images and current fixtures. Build the
+historical publication fixtures separately from `376fdc6`, `29896b5`,
+and `fb14073`. The schema 11 case also uses the Sync image from `fb14073`
+to check mixed-image rejection. Put evidence and fixture state under
+`/tmp` and make `b3sum` available on the test host.
+
+~~~sh
+export TMPDIR=/tmp RFC_E2E_PRELOADED=1
+for schema in 9 10 11; do
+  python3 -B scripts/https-discovery/integration.py --context rootless \
+    --image-prefix "$prefix" --compose-upgrade \
+    "--upgrade-from-schema$schema" "$historical_prefix$schema"
+done
+~~~

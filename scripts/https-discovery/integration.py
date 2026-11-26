@@ -1304,7 +1304,7 @@ def exercise_cold_daemon(project, client, sources, config, spool):
     print("Periodic reconciliation published after the startup run without Feed activity", flush=True)
 
 
-def upgrade_publication(project, old_driver, sources, old_schema):
+def upgrade_publication(project, old_driver, sources, old_schema, compose_qualification):
     current = project.env["PHASE2_DRIVER"]
     overlay = project.ingestion_overlay
     del project.ingestion_overlay
@@ -1330,6 +1330,8 @@ def upgrade_publication(project, old_driver, sources, old_schema):
     before = history(project)
     project.env["PHASE2_DRIVER"] = current
     project.ingestion_overlay = overlay
+    if compose_qualification:
+        compose_qualification(project, old_schema, sources)
     project.migrate()
     project.migrate()
     assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "12"
@@ -1357,22 +1359,26 @@ def upgrade_publication(project, old_driver, sources, old_schema):
     print(f"Populated schema {old_schema} upgraded twice and retained byte-exact rollback with original proof", flush=True)
 
 
-def upgrade_policy(project, old_driver, sources):
+def upgrade_policy(project, old_driver, sources, compose_qualification):
     current = project.env["PHASE2_DRIVER"]
     project.env["PHASE2_DRIVER"] = str(old_driver)
     old = project.operation("sync", "full")
     first, ready = None, None
-    for attempt in range(2):
+    sequence = 2 if compose_qualification else 1
+    for attempt in range(sequence + 1):
         report = json.loads(phase1.capture(old, env=project.env, timeout=100))
         generation = int(report["generation_id"])
         if attempt == 0:
             first = generation
-            project.activate(first, 0)
+        if attempt < sequence:
+            project.activate(generation, attempt)
         else:
             ready = generation
     assert project.sql(f"SELECT manifest_format FROM rfc.generations WHERE id={first}") == "3"
     before = history(project)
     project.env["PHASE2_DRIVER"] = current
+    if compose_qualification:
+        compose_qualification(project, 11, sources)
     project.migrate()
     project.migrate()
     assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "12"
@@ -1383,21 +1389,23 @@ def upgrade_policy(project, old_driver, sources):
     for id in (2119, 8174):
         result = client.call("get", id=id)[0]
         assert phase6.phase5.bytes_from(result["original"]) == sources[id]
-    publication_command(project, {"generation_id": str(ready), "expected_publication_sequence": 1},
+    publication_command(project, {"generation_id": str(ready), "expected_publication_sequence": sequence},
                         error="lacks source policy evidence")
     replacement = manual(project)
     new = int(replacement["generation_id"])
     assert replacement["acquisition"]["txt_reused"] == len(sources)
     assert project.sql(f"SELECT manifest_format FROM rfc.generations WHERE id={new}") == "4"
     publication_command(project, replacement)
-    publication_command(project, {"generation_id": str(first), "expected_publication_sequence": 2}, rollback=True)
+    publication_command(project, {"generation_id": str(first), "expected_publication_sequence": sequence + 1},
+                        rollback=True)
     original = client.call("get", id=2119)[0]["original"]
     assert phase6.phase5.bytes_from(original) == sources[2119]
     print("Populated schema 11 upgraded twice, preserved the format-3 incumbent, and published format 4", flush=True)
 
 
 def exercise(project, work, spool, audit, incumbent_only, old_driver=None, scheduler_only=False, audit_only=False,
-             publication_only=False, old_schema=None, cold_daemon_only=False, faults_only=False):
+             publication_only=False, old_schema=None, cold_daemon_only=False, faults_only=False,
+             compose_qualification=None):
     sources = phase2.prepare(project, include_nul=True)
     original = project.source / "catalog.xml"
     initial = original.read_text()
@@ -1426,9 +1434,9 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
     project.ingestion_overlay = overlay
     if old_driver:
         if old_schema == 11:
-            upgrade_policy(project, old_driver, sources)
+            upgrade_policy(project, old_driver, sources, compose_qualification)
         else:
-            upgrade_publication(project, old_driver, sources, old_schema)
+            upgrade_publication(project, old_driver, sources, old_schema, compose_qualification)
         return
     if incumbent_only:
         exercise_incumbent(project, sources, client)
@@ -1622,6 +1630,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", required=True)
+    parser.add_argument("--compose-upgrade", action="store_true",
+                        help="also exercise the production backup-verified upgrade on the historical corpus")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--cold-daemon-only", action="store_true", help="qualify automatic first publication")
     modes.add_argument("--faults-only", action="store_true", help="exercise the focused Phase 7 fault cases")
@@ -1647,6 +1657,15 @@ def main():
         old_prefix = args.upgrade_from_schema11 or args.upgrade_from_schema10 or args.upgrade_from_schema9
         old_schema = next((version for version in (9, 10, 11)
                            if getattr(args, f"upgrade_from_schema{version}")), None)
+        if args.compose_upgrade and old_schema is None:
+            parser.error("--compose-upgrade requires a populated historical upgrade mode")
+        compose_qualification = None
+        if args.compose_upgrade:
+            import compose_upgrade
+
+            def compose_qualification(project, schema, originals):
+                mixed_sync = f"{old_prefix}-sync" if schema == 11 else None
+                compose_upgrade.qualify(project, schema, originals, driver, mixed_sync)
         if old_prefix:
             old_driver = work / "publication-driver-historical"
             phase3.fixture_driver(docker, old_prefix, old_driver)
@@ -1661,7 +1680,8 @@ def main():
                          scheduler_only=args.scheduler_only, audit_only=args.audit_only,
                          publication_only=args.publication_only,
                          old_schema=old_schema,
-                         cold_daemon_only=args.cold_daemon_only, faults_only=args.faults_only)
+                         cold_daemon_only=args.cold_daemon_only, faults_only=args.faults_only,
+                         compose_qualification=compose_qualification)
             except Exception:
                 project.run("logs", "--no-color", "--tail", "15", "postgres", "sync", "fixtures", "feed",
                             "control-probe")

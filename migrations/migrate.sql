@@ -10,6 +10,15 @@ CREATE TABLE IF NOT EXISTS rfc.schema_migrations (
     version integer PRIMARY KEY CHECK (version > 0),
     applied_at timestamptz NOT NULL DEFAULT now()
 );
+\if :{?upgrade_from}
+SELECT ARRAY(SELECT version FROM rfc.schema_migrations ORDER BY version) =
+       ARRAY(SELECT generate_series(1, :upgrade_from)) AS source_matches
+\gset
+\if :source_matches
+\else
+DO $$ BEGIN RAISE EXCEPTION 'source migration history changed before upgrade'; END $$;
+\endif
+\endif
 SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 1) AS apply_v1
 \gset
 \if :apply_v1
@@ -81,5 +90,19 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 12) AS appl
 \if :apply_v12
 \ir 0012-source-policy.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (12);
+\endif
+\if :{?upgrade_from}
+SELECT ARRAY(SELECT version FROM rfc.schema_migrations ORDER BY version) =
+       ARRAY(SELECT generate_series(1, :upgrade_to))
+   AND (SELECT concat(generation_id, '|', publication_sequence)
+        FROM rfc.active_generation) IS NOT DISTINCT FROM :'upgrade_pointer'
+   AND (SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '')
+        FROM rfc.generations WHERE state IN ('published','retained')) = :'upgrade_readable'
+   AS target_matches
+\gset
+\if :target_matches
+\else
+DO $$ BEGIN RAISE EXCEPTION 'upgrade changed the expected migration history or readable generations'; END $$;
+\endif
 \endif
 COMMIT;

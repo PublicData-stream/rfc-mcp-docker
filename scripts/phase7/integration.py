@@ -151,6 +151,14 @@ class Deployment:
             else:
                 assert not mounts and not spool and not audit and path is None
         assert set(project["services"][FEED]["networks"]) == {"feed_control"}
+        for role, network, service in (("serve", "db_read", SERVE), ("sync", "db_write", SYNC)):
+            preflight = project["services"][f"{role}-db-preflight"]
+            assert set(preflight["networks"]) == {network}
+            assert preflight["image"] == project["services"][service]["image"]
+            assert not preflight.get("volumes") and not preflight.get("ports")
+            assert {secret["source"] for secret in preflight["secrets"]} == {
+                "db_ca", f"{role}_database_password"
+            }
         missing_spool = dict(self.env)
         del missing_spool["RFC_SYNC_SPOOL_HOST_DIR"]
         phase1.failed(self.command("config", "--quiet"), missing_spool, "Provision a private disk-backed")
@@ -176,7 +184,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         assert report["resources"]["audit"]["available_bytes"] >= 256 * 1024**2
         print("Base Compose isolates the spool, audit volume, v2 config, and Feed egress", flush=True)
 
-    def provision(self):
+    def provision(self, *, migrate=True):
         self.check_config_mount()
         self.run("--profile", "tools", "run", "--rm", "--no-deps", "volume-admin")
         self.run("up", "-d", "--wait", "postgres", timeout=90)
@@ -188,11 +196,13 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         self.capture("exec", "-T", "postgres", *phase1.SQL_OPTIONS, "-U", "postgres",
                      "-d", "rfc", input=password_sql)
         self.sql("-f", "/migrations/bootstrap.sql")
-        self.sql("-f", "/migrations/migrate.sql")
-        assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "12"
+        if migrate:
+            self.sql("-f", "/migrations/migrate.sql")
+            assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "12"
         assert self.sql("-c", "SELECT current_setting('server_encoding') || ':' || datlocale || ':' "
                         "|| datlocprovider::text FROM pg_database WHERE datname = current_database()") == "UTF8:und:i"
-        assert self.sql("-c", "SELECT has_table_privilege('rfc_serve','rfc.generation_documents','INSERT')") == "f"
+        if migrate:
+            assert self.sql("-c", "SELECT has_table_privilege('rfc_serve','rfc.generation_documents','INSERT')") == "f"
 
     def restore(self, dump):
         with dump.open("rb") as fixture:
@@ -539,9 +549,9 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
 
 
 @contextmanager
-def deployment(work, seed, prefix):
-    with (phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536) as spool,
-          phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label="audit") as audit):
+def deployment(work, seed, prefix, *, label_prefix=""):
+    with (phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536, label=label_prefix + "rsync") as spool,
+          phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label=label_prefix + "audit") as audit):
         stack = Deployment(work, seed, prefix, spool, audit)
         try:
             yield stack

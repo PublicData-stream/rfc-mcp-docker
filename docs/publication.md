@@ -60,7 +60,20 @@ docker compose --env-file "$RFC_ENV_FILE" exec -T postgres psql -XqAt -U postgre
     > "$BACKUP_DIR/readable"
 ```
 
-Copy every file listed in `blobs` from `blobs/blake3/<first-two-hex-digits>/<digest>` while preserving that relative path. The inventory includes originals, ready candidates, provenance and checkpoint-pinned bytes. Use a BLAKE3 tool such as `b3sum` and a byte count to check every file in the independent copy before resuming sync and feed. Save the version and image references used for the snapshot. Back up private quarantine separately when it is needed for incident review.
+Copy every file listed in `blobs` from the live mirror's
+`blobs/blake3/<first-two-hex-digits>/<digest>` to the same relative
+path under `$BACKUP_DIR/mirror`. The inventory includes originals,
+ready candidates, provenance and checkpoint-pinned bytes. Use
+`b3sum` and a byte count to check every file in the independent
+copy before resuming Sync and Feed. Save the version and image
+references used for the snapshot. Back up private quarantine
+separately when it is needed for incident review.
+
+For a [Compose schema upgrade](deployment.md#upgrade-existing-volumes),
+keep the application services stopped through verification and migration.
+Provide the independent backup directory with the dump, inventories, and
+canonical blob tree. Take the dump in the same maintenance window using
+the PostgreSQL container that the upgrade will use for verification.
 
 Restore into fresh volumes with the proxy route closed and all three application processes stopped. Provision PostgreSQL and the scoped roles as in the [deployment guide](deployment.md). Provision fresh secrets for the restored instance, or securely supply the prior cursor key when outstanding cursors must survive.
 

@@ -66,6 +66,12 @@ compose run --rm --no-deps rfc-mcp-docker-sync --check-config
 
 ## Initialize or upgrade
 
+During `compose up`, Compose checks the database using the Serve and Sync
+images and their runtime roles before starting either application. If a
+preflight fails, inspect `compose logs serve-db-preflight sync-db-preflight`
+for the expected and observed history. PostgreSQL can start by itself for
+maintenance. Use the same release image set and checkout for each step.
+
 ### Initialize fresh volumes
 
 Use the same project and environment file throughout. Begin the cold-start clock immediately before `volume-admin`. It adjusts only the backing directory roots. PostgreSQL owns `/var/lib/postgresql` and initializes data in `/var/lib/postgresql/19/docker`. The role-and-subnet HBA rules require TLS and SCRAM for runtime connections.
@@ -124,25 +130,89 @@ procedure for a populated schema 9, 10, or 11 deployment.
    directories. Preserve the shadow spool if it recorded a live upstream
    cooldown. Wait for known cooldown before switching upstream ownership.
 3. Use the current checkout and environment file to apply and verify the migration.
+   Run from the repository root. The host needs Python 3.11 or newer and `b3sum`.
+   Use the same Compose project name, environment file, Docker context,
+   and overlays throughout. Keep other Compose operations and database
+   maintenance paused while the upgrade runs. Pull the qualified digest
+   references before starting the procedure if using registry images.
 
    ~~~sh
+   export RFC_ENV_FILE=/path/to/private/rfc.env RFC_PROJECT=rfc-mcp-docker
+   compose() { docker compose --env-file "$RFC_ENV_FILE" --project-name "$RFC_PROJECT" "$@"; }
    compose config --quiet
-   compose run --rm --no-deps rfc-mcp-docker-sync --check-config
    compose up -d --wait postgres
-   compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/migrate.sql
-   compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc \
-     -c 'SELECT max(version) FROM rfc.schema_migrations' \
-     -c 'SELECT generation_id, publication_sequence FROM rfc.active_generation'
-   compose run --rm --no-deps rfc-mcp-docker-sync --phase1-check-storage
+   python3 -B scripts/deploy/upgrade.py --env-file "$RFC_ENV_FILE" \
+     --project-name "$RFC_PROJECT" --backup-dir "$BACKUP_DIR"
    compose up -d --wait rfc-mcp-docker-serve
    ~~~
 
-4. Confirm schema 12 and the backed-up sequence. Check `/ready`, an
-   exact-byte MCP `get` pinned to the incumbent generation, and a read
-   pinned to a retained generation. Historical evidence remains as
-   recorded. Reopen ingress after verifying the serving path. Start Sync,
-   verify a full audited publication and its delivered outbox event, then
-   resume Feed.
+   If using a nondefault Docker context, pass `--context` to the upgrade
+   command and use the same context in the Compose wrapper. Pass each
+   overlay with `-f` in both commands. Set `RFC_PROJECT` to the existing
+   Compose project name. The command checks the target images and Sync
+   configuration, verifies the independently stored PostgreSQL archive and
+   mirror against the quiescent deployment, and applies the migrations in
+   one transaction. Capture the dump with the same PostgreSQL tooling
+   during this maintenance window. A different archive or mirror copy
+   stops the upgrade before SQL runs. The command leaves applications
+   stopped, including when postflight fails. If the command reports schema
+   12 already present, it runs the storage checks without rewriting the
+   database. Resolve any reported postflight failure before starting Serve.
+
+4. Confirm schema 12 and the backed-up sequence. Check `/ready` and an
+   exact-byte MCP `get` for the incumbent. Confirm the result's generation
+   and sequence against the saved pointer. Use a valid pre-upgrade cursor
+   to check a retained read where available, or verify the retained
+   manifests and originals through the private storage checks in the
+   [restore rehearsal](release-readiness.md#restore-and-client-results).
+   Reopen ingress after verifying the serving path. Run
+   `compose up -d rfc-mcp-docker-sync` and verify a full audited
+   publication and its delivered outbox event. Then run
+   `compose up -d rfc-mcp-docker-feed` and confirm authenticated hint
+   delivery.
+
+### Recover a schema mismatch after Compose recreation
+
+Use this procedure when PostgreSQL reports healthy and Sync repeatedly
+reports `unsupported storage schema version`. Release `2.5.0` expects
+schema 11 and release `2.6.0` expects schema 12.
+
+1. Close ingress. Stop Feed, allow any active Sync job to finish, then stop
+   Sync and Serve. Preserve the PostgreSQL, mirror, spool, and audit backing
+   directories. Record actual container image IDs and the full database
+   migration history before changing images or applying SQL.
+
+   ~~~sh
+   compose images --format json
+   compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc \
+     -c 'SELECT version FROM rfc.schema_migrations ORDER BY version' \
+     -c 'SELECT generation_id, publication_sequence FROM rfc.active_generation'
+   ~~~
+
+2. For a complete schema 9–11 history and a schema 12 target, use the
+   [upgrade procedure](#upgrade-existing-volumes). With the original
+   `2.6.0` images, use their pinned checkout and the manual peer-socket
+   step below. Verify the independent backup and the qualified image set
+   first. If the database is already schema 12, select matching schema 12
+   images and proceed directly to the two storage checks. For absent,
+   gapped, or newer history, identify the matching deployment or backup
+   before proceeding.
+
+   ~~~sh
+   compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/migrate.sql
+   compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc \
+     -c 'SELECT version FROM rfc.schema_migrations ORDER BY version' \
+     -c 'SELECT generation_id, publication_sequence FROM rfc.active_generation'
+   compose run --rm --no-deps rfc-mcp-docker-serve --phase1-check-storage
+   compose run --rm --no-deps rfc-mcp-docker-sync --phase1-check-storage
+   ~~~
+
+3. Match the active pointer against the backup. Run
+   `compose up -d --wait rfc-mcp-docker-serve`, verify the serving path, and
+   resume services in the [upgrade order](#upgrade-existing-volumes).
+   Check the new logs for schema preflight rejections, PostgreSQL
+   open-transaction EOF, and repeated Feed delivery failures. Use the
+   fresh-volume restore procedure to roll back across schemas.
 
 ### Rollback
 
