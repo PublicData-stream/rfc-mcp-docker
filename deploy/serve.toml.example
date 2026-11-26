@@ -1,3 +1,11 @@
 # Default configuration for an ingress proxy that sets one client IP.
 client_ip_header = "X-Real-IP"
 client_ip_header_mode = "single"
+
+[database.pool]
+min_idle = 2
+max_connections = 8
+acquire_timeout_ms = 1000
+idle_timeout_seconds = 300
+max_lifetime_seconds = 1800
+shutdown_timeout_ms = 2000

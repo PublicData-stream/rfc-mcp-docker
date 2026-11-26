@@ -1,27 +1,14 @@
-use std::{
-    env, fs,
-    io::{self, Read},
-    net::IpAddr,
-    path::Path,
-    str,
-};
+use std::{io, net::IpAddr, str};
 
 use axum::http::{HeaderMap, HeaderName, StatusCode};
-use serde::Deserialize;
 
-use super::invalid;
+use super::{
+    config::{FileSettings, optional_env},
+    invalid,
+};
 
-const CONFIG_FILE: &str = "RFC_SERVE_CONFIG_FILE";
 const HEADER: &str = "RFC_MCP_CLIENT_IP_HEADER";
 const MODE: &str = "RFC_MCP_CLIENT_IP_HEADER_MODE";
-const CONFIG_BYTES: u64 = 16 * 1024;
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct FileSettings {
-    client_ip_header: Option<String>,
-    client_ip_header_mode: Option<String>,
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -73,13 +60,7 @@ pub(super) struct ClientIp {
 }
 
 impl ClientIp {
-    pub(super) fn load(proxies: Vec<IpAddr>) -> io::Result<Self> {
-        let file = optional_env(CONFIG_FILE)?
-            .as_deref()
-            .map(Path::new)
-            .map(read_settings)
-            .transpose()?
-            .unwrap_or_default();
+    pub(super) fn load(proxies: Vec<IpAddr>, file: FileSettings) -> io::Result<Self> {
         let settings = Settings::resolve(
             file,
             optional_env(HEADER)?.as_deref(),
@@ -124,14 +105,6 @@ impl ClientIp {
     }
 }
 
-fn optional_env(name: &str) -> io::Result<Option<String>> {
-    match env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(_) => Err(invalid(name)),
-    }
-}
-
 fn header(value: &str, setting: &str) -> io::Result<HeaderName> {
     HeaderName::from_bytes(value.as_bytes()).map_err(|_| invalid(setting))
 }
@@ -142,30 +115,6 @@ fn mode(value: &str, setting: &str) -> io::Result<Mode> {
         "chain" => Ok(Mode::Chain),
         _ => Err(invalid(setting)),
     }
-}
-
-fn read_settings(path: &Path) -> io::Result<FileSettings> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path).map_err(|_| invalid(CONFIG_FILE))?;
-    if !file.metadata().map_err(|_| invalid(CONFIG_FILE))?.is_file() {
-        return Err(invalid(CONFIG_FILE));
-    }
-    let mut text = String::new();
-    file.take(CONFIG_BYTES + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| invalid(CONFIG_FILE))?;
-    if text.len() as u64 > CONFIG_BYTES {
-        return Err(invalid(CONFIG_FILE));
-    }
-    // TOML decoding errors can contain source lines with configuration values.
-    toml::from_str(&text).map_err(|_| invalid(CONFIG_FILE))
 }
 
 #[cfg(test)]
@@ -222,8 +171,6 @@ mod tests {
         let error = Settings::resolve(file, Some("X-Real-IP"), None).unwrap_err();
         assert_eq!(error.to_string(), "invalid client_ip_header");
         assert!(toml::from_str::<FileSettings>("unknown_key = 1").is_err());
-        assert!(read_settings(Path::new("")).is_err());
-        assert!(read_settings(Path::new(".")).is_err());
     }
 
     #[test]

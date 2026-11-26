@@ -206,6 +206,65 @@ Verify the proxy and backend paths after container recreation. Sync owns upstrea
 
 The initial container memory limits are 768 MiB for serve, 2 GiB for sync, 128 MiB for feed, and 1 GiB for PostgreSQL. CPU limits are two for serve, sync, and PostgreSQL and 0.5 for feed. Confirm that the rootless daemon applies these settings with delegated cgroup v2 controllers. Check local logs and [control-plane health](control.md) after startup.
 
+
+### Size and operate the Serve database pool
+
+Each Serve process has one pool. The built-in values match
+[`deploy/serve.toml.example`](../deploy/serve.toml.example). Environment
+variables override individual settings in the optional Serve TOML file.
+
+| `[database.pool]` key | Environment override | Default |
+| --- | --- | ---: |
+| `min_idle` | `RFC_MCP_DB_POOL_MIN_IDLE` | 2 |
+| `max_connections` | `RFC_MCP_DB_POOL_MAX_CONNECTIONS` | 8 |
+| `acquire_timeout_ms` | `RFC_MCP_DB_POOL_ACQUIRE_TIMEOUT_MS` | 1000 |
+| `idle_timeout_seconds` | `RFC_MCP_DB_POOL_IDLE_TIMEOUT_SECONDS` | 300 |
+| `max_lifetime_seconds` | `RFC_MCP_DB_POOL_MAX_LIFETIME_SECONDS` | 1800 |
+| `shutdown_timeout_ms` | `RFC_MCP_DB_POOL_SHUTDOWN_TIMEOUT_MS` | 2000 |
+
+Allow 3–18 connections per replica and a minimum idle count between zero
+and that maximum. The idle timeout applies above the background warm
+target. An expired leased session retires after release. The acquisition
+timeout bounds the wait for capacity. Once assigned a slot, opening and
+verifying a connection uses the remaining operation time. The maximum
+connection lifetime is 86,400 seconds, the acquisition timeout is at most
+15,000 ms, and shutdown allows at most 5,000 ms for database closure.
+
+By default, six connections are available to public tools and one apiece
+is reserved for readiness and authenticated publication notifications.
+Serve can become live without a working database or published generation.
+Full identity, TLS, schema, role, and privilege verification runs on
+physical connection establishment and every checkout. A change to the
+mounted password or CA file retires idle connections that used the previous
+material when Serve next checks out a connection. Use a Serve restart for
+immediate server-side certificate or password cutover. Recreate the
+container when rotating a file-backed Compose secret by replacing the
+host file with a new inode.
+
+Multiply `max_connections` by the maximum simultaneous Serve replicas,
+including replicas that overlap during a rollout. Reserve that many slots
+within PostgreSQL's regular connection limit as reported by
+`SHOW max_connections` after subtracting PostgreSQL's reserved slots.
+Allow additional slots for each Sync daemon's leader, worker, control
+handler and outbox dispatcher, overlapping Sync CLI or recovery work,
+health probes, and database administration. Confirm the budget using
+`pg_stat_activity` and the PostgreSQL PID and memory headroom on the
+deployment host.
+
+On SIGTERM Serve closes its listeners, drains admitted requests for up to
+15 seconds, cancels stragglers, and gracefully closes verified idle
+connections in parallel. Compose allows 25 seconds for the whole stop.
+Use loopback `/metrics` to check
+`rfc_mcp_db_pool_{physical,idle,leased,connecting,retiring,waiters}`,
+connection reuse, and graceful and forced close counters. PostgreSQL may
+log forced disconnects after cancellation. Correlate by connection timing
+and backend PID when investigating unexpected errors.
+
+To roll back, select the previous Serve image and previous Serve TOML,
+remove the pool environment overrides, and recreate Serve through Compose.
+Check `/live`, `/ready`, and a pinned MCP read. Retain the cursor key across
+the rollback and use the existing PostgreSQL data and mirror.
+
 ## Operate and recover
 
 Use the same Compose project and private environment file for every command.

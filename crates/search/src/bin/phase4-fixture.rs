@@ -4,7 +4,10 @@ use rfc_core::GenerationId;
 use rfc_search::{Search, SearchError, SearchRequest};
 use rfc_storage::{
     blob::BlobWriter,
-    postgres::{Result as RepositoryResult, RuntimeRole, connect, load_manifest, mirror_root},
+    postgres::{
+        PoolConfig, Result as RepositoryResult, RuntimeRole, ServePool, connect, load_manifest,
+        mirror_root,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -23,7 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key: [u8; 48] = std::fs::read("/phase4/cursor-key")?
         .try_into()
         .map_err(|_| "fixture cursor key length differs")?;
-    let search = Search::new(&key);
+    let pool = ServePool::new(PoolConfig::default(), false).map_err(|error| error.to_string())?;
+    let search = Search::new(&key, pool.clone());
     let (lines, mut input) = tokio::sync::mpsc::channel(1);
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines() {
@@ -58,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(output)?;
         output.flush()?;
     }
+    pool.shutdown().await;
     Ok(())
 }
 

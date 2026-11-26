@@ -62,7 +62,7 @@ Start `rfc-mcp-docker-serve` with its default entry point. Configure its existin
 | `RFC_MCP_TRUSTED_PROXIES` | Comma-separated trusted proxy IPs. Serve uses the list to check the socket peer and to recognize trusted hops in chain mode. Direct callers are limited by their socket peer. |
 | `RFC_MCP_CLIENT_IP_HEADER` | Case-insensitive name of the client IP header. Default `X-Real-IP`. |
 | `RFC_MCP_CLIENT_IP_HEADER_MODE` | `single` accepts one bare IP address. `chain` accepts comma-separated bare IP addresses in client-to-Serve order. Default `single`. |
-| `RFC_SERVE_CONFIG_FILE` | Optional path to a UTF-8 TOML file with top-level `client_ip_header` and `client_ip_header_mode` keys. Environment settings take precedence per key. Explicit values in each source must be valid. |
+| `RFC_SERVE_CONFIG_FILE` | Optional path to a UTF-8 TOML file with top-level `client_ip_header` and `client_ip_header_mode` keys and a `[database.pool]` table. Environment settings take precedence per key. Explicit values in each source must be valid. |
 | `RFC_MCP_CURSOR_KEY_FILE` | Cursor key mount path. Default `/run/secrets/rfc_cursor_key`. |
 
 Terminate HTTPS at the ingress proxy and preserve the validated Host and MCP headers. Keep the database and admin listener on private routes. The server bounds request bodies to 64 KiB, reads headers within five seconds, and allows 15 seconds for a request after its headers arrive. Initial admission limits are 16 simultaneous requests and five requests per second per source with a burst of ten. Shared network egress shares a bucket. Liveness indicates the process is running. Readiness returns HTTP 200 only when an active generation is readable and the ripgrep sandbox is available. The loopback metrics report `rfc_mcp_rg_available`.
@@ -74,7 +74,15 @@ returns HTTP 400 for missing or repeated fields, malformed values, or a
 chain containing only trusted addresses. Both modes accept IPv4 and IPv6
 and normalize IPv4-mapped IPv6 addresses. [Configure the ingress proxy](deployment.md#proxy-and-network-boundaries)
 
-Propagate downstream disconnects from the proxy. Serve closes the dedicated database socket when a read is cancelled. PostgreSQL checks that socket every 100 ms during queries so it can release a blocked read promptly. [PostgreSQL TCP settings](https://www.postgresql.org/docs/19/runtime-config-connection.html#GUC-CLIENT-CONNECTION-CHECK-INTERVAL)
+Propagate downstream disconnects from the proxy. Serve leases one PostgreSQL
+session for an operation and returns it to the pool after a confirmed
+transaction completion. Cancellation or uncertain completion closes that
+session. PostgreSQL checks the socket every 100 ms during queries so it can
+release a blocked read promptly. Waiting for pool capacity can return
+`resource_limit_exceeded`. Elapsed operation deadlines return
+`deadline_exceeded`, and a database connection or verification failure can
+return `search_unavailable`. Readiness and authenticated publication
+notifications each have reserved capacity. [PostgreSQL TCP settings](https://www.postgresql.org/docs/19/runtime-config-connection.html#GUC-CLIENT-CONNECTION-CHECK-INTERVAL)
 
 Run the [private Phase 5 gate](../scripts/phase5/integration.py) after preparing the images with the Phase 0 Compose probe. It uses Python 3, the Python `jsonschema` package, and OpenSSL. The gate mounts disposable keys and test data from `/tmp`.
 

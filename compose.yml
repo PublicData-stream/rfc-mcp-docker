@@ -22,6 +22,7 @@ services:
     user: "10001:10001"
     cpus: 2.0
     mem_limit: 768m
+    stop_grace_period: 25s
     depends_on:
       postgres: {condition: service_healthy}
     environment:
@@ -33,6 +34,12 @@ services:
       # Pass through only supplied values so the Serve TOML file can supply defaults.
       RFC_MCP_CLIENT_IP_HEADER:
       RFC_MCP_CLIENT_IP_HEADER_MODE:
+      RFC_MCP_DB_POOL_MIN_IDLE:
+      RFC_MCP_DB_POOL_MAX_CONNECTIONS:
+      RFC_MCP_DB_POOL_ACQUIRE_TIMEOUT_MS:
+      RFC_MCP_DB_POOL_IDLE_TIMEOUT_SECONDS:
+      RFC_MCP_DB_POOL_MAX_LIFETIME_SECONDS:
+      RFC_MCP_DB_POOL_SHUTDOWN_TIMEOUT_MS:
       RFC_MCP_CURSOR_KEY_FILE: /run/secrets/cursor_key
       RFC_SERVE_NOTIFY_BIND: ${RFC_NOTIFY_SERVE_IP:?Set RFC_NOTIFY_SERVE_IP}:8782
       RFC_SYNC_SERVE_KEY_ID: ${RFC_SYNC_SERVE_KEY_ID:?Set RFC_SYNC_SERVE_KEY_ID}

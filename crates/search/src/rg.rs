@@ -10,18 +10,18 @@ use std::{
 };
 
 use rfc_core::{BlobDigest, GenerationId};
-use rfc_storage::postgres::{GenerationReadGuard, GenerationSelection, Reader};
+use rfc_storage::postgres::{GenerationReadGuard, GenerationSelection, PoolClass, ReadOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch},
-    time::{Instant, sleep_until, timeout_at},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    time::{Instant, timeout_at},
 };
 
 use crate::{
     Search, SearchError,
     cursor::{MAX_AGE_SECONDS, validate_context},
-    engine::{repository_error, unix_time},
+    engine::{clean_rejection, repository_error, unix_time},
     snippets::{self, MAX_SOURCE_BYTES, Source, SourceVerification},
     worker::{self, Match, Output, Pattern, WorkerError},
 };
@@ -169,81 +169,77 @@ impl Rg {
         self.available.load(Ordering::Relaxed)
     }
 
+    pub async fn reap(&self) {
+        let _ = self.workers.acquire_many(2).await;
+    }
+
     pub async fn run(
-        self: Arc<Self>,
-        search: Arc<Search>,
+        &self,
+        search: &Search,
         mut request: RgRequest,
-        fits: impl Fn(&Value, usize) -> bool + Send + Sync + 'static,
+        request_deadline: Instant,
+        fits: impl Fn(&Value, usize) -> bool + Send + Sync,
     ) -> Result<Value, SearchError> {
+        let deadline = request_deadline.min(Instant::now() + DEADLINE);
+        let scan_deadline = deadline - Duration::from_millis(100);
         let args = request.normalize()?;
         if !self.available() {
             return Err(SearchError::SandboxUnavailable);
         }
-        let permit = self
-            .workers
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| SearchError::ResourceLimit)?;
-        let (caller, mut cancelled) = watch::channel(());
-        let job = tokio::spawn(async move {
-            let permit = Arc::new(permit);
-            let now = unix_time()?;
-            let checkpoint = request
-                .cursor
-                .as_deref()
-                .map(|token| search.key.open::<Cursor>(token))
-                .transpose()?;
-            let selection = if let Some(saved) = &checkpoint {
-                if saved.v != 1 || saved.tool != "rg" || saved.args != args || saved.pos.rfc < 1 {
-                    return Err(SearchError::CursorInvalid);
-                }
-                validate_context(saved.generation, saved.sequence, saved.expiry, now)?;
-                GenerationSelection::Pinned(
-                    GenerationId::new(saved.generation).ok_or(SearchError::CursorInvalid)?,
-                )
-            } else {
-                GenerationSelection::Active
-            };
-            let deadline = Instant::now() + DEADLINE;
-            let pinned = checkpoint.is_some();
-            let reader = tokio::select! {
-                _ = cancelled.changed() => return Err(SearchError::Cancelled),
-                result = timeout_at(deadline, Reader::connect()) => result
-                    .map_err(|_| SearchError::Deadline)?
-                    .map_err(|error| repository_error(error, pinned))?,
-            };
-            let mut acquiring = cancelled.clone();
-            let (entered, mut acquired) = oneshot::channel();
-            let operation = reader.with_generation(selection, async |guard| {
-                let _ = entered.send(());
+        let permit = Arc::new(
+            self.workers
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| SearchError::ResourceLimit)?,
+        );
+        let (_caller, mut cancelled) = watch::channel(());
+        let now = unix_time()?;
+        let checkpoint = request
+            .cursor
+            .as_deref()
+            .map(|token| search.key.open::<Cursor>(token))
+            .transpose()?;
+        let selection = if let Some(saved) = &checkpoint {
+            if saved.v != 1 || saved.tool != "rg" || saved.args != args || saved.pos.rfc < 1 {
+                return Err(SearchError::CursorInvalid);
+            }
+            validate_context(saved.generation, saved.sequence, saved.expiry, now)?;
+            GenerationSelection::Pinned(
+                GenerationId::new(saved.generation).ok_or(SearchError::CursorInvalid)?,
+            )
+        } else {
+            GenerationSelection::Active
+        };
+        let pinned = checkpoint.is_some();
+        let result = search
+            .pool
+            .with_generation(PoolClass::Public, deadline, selection, async |guard| {
                 let mut scan = Scan {
                     request: &request,
-                    search: &search,
+                    search,
                     guard,
                     fits: &fits,
-                    deadline,
+                    deadline: scan_deadline,
                     cancelled: &mut cancelled,
                     remaining: worker::OUTPUT_BYTES,
                     permit,
                 };
-                Ok(scan.page(args, now, checkpoint).await?)
-            });
-            tokio::pin!(operation);
-            let result = tokio::select! {
-                biased;
-                _ = &mut acquired => operation.await,
-                result = &mut operation => result,
-                _ = acquiring.changed() => return Err(SearchError::Cancelled),
-                () = sleep_until(deadline) => return Err(SearchError::Deadline),
-            }
+                match scan.page(args, now, checkpoint).await {
+                    Ok(page)
+                        if page["truncation_reason"] == "deadline"
+                            || Instant::now() >= scan_deadline =>
+                    {
+                        Ok(ReadOutcome::Interrupted(page))
+                    }
+                    Ok(page) => Ok(ReadOutcome::Complete(page)),
+                    Err(error) => clean_rejection(error.into()),
+                }
+            })
+            .await
             .map_err(|error| repository_error(error, pinned));
-            if matches!(result, Err(SearchError::SandboxUnavailable)) {
-                self.available.store(false, Ordering::Relaxed);
-            }
-            result
-        });
-        let result = job.await.map_err(|_| SearchError::Unavailable)?;
-        drop(caller);
+        if matches!(result, Err(SearchError::SandboxUnavailable)) {
+            self.available.store(false, Ordering::Relaxed);
+        }
         result
     }
 }

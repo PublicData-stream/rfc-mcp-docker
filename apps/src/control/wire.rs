@@ -10,8 +10,9 @@ use std::{future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
-    time::timeout,
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    task::JoinSet,
+    time::{Instant, timeout, timeout_at},
 };
 
 const MAX_HEAD: usize = 8 * 1024;
@@ -37,30 +38,72 @@ pub fn address(value: &str) -> Result<SocketAddr> {
 pub async fn serve<H, F>(listener: TcpListener, link: Link, keys: Keys, handler: H) -> Result<()>
 where
     H: Fn(Command) -> F + Clone + Send + Sync + 'static,
-    F: Future<Output = std::result::Result<Outcome, Rejection>> + Send,
+    F: Future<Output = std::result::Result<Outcome, Rejection>> + Send + 'static,
+{
+    let (_keep_open, stop) = watch::channel(false);
+    serve_until(listener, link, keys, stop, move |command, _| {
+        handler(command)
+    })
+    .await
+}
+
+pub async fn serve_until<H, F>(
+    listener: TcpListener,
+    link: Link,
+    keys: Keys,
+    mut stop: watch::Receiver<bool>,
+    handler: H,
+) -> Result<()>
+where
+    H: Fn(Command, Instant) -> F + Clone + Send + Sync + 'static,
+    F: Future<Output = std::result::Result<Outcome, Rejection>> + Send + 'static,
 {
     let receiver = Arc::new(Receiver::new(link, keys)?);
     let connections = Arc::new(Semaphore::new(CONNECTIONS));
+    let mut requests = JoinSet::new();
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (stream, _) = tokio::select! {
+            biased;
+            _ = stop.wait_for(|stop| *stop) => break,
+            Some(_) = requests.join_next(), if !requests.is_empty() => continue,
+            accepted = listener.accept() => accepted?,
+        };
         let Ok(permit) = connections.clone().try_acquire_owned() else {
             continue;
         };
         let receiver = receiver.clone();
         let handler = handler.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let result = timeout(REQUEST_TIMEOUT, handle(&mut stream, &receiver, handler)).await;
-            if matches!(result, Ok(Err(_))) {
-                let _ = timeout(Duration::from_secs(1), error_response(&mut stream, 400)).await;
-            }
-        });
+        requests.spawn(run_request(stream, receiver, permit, handler));
+    }
+    drop(listener);
+    while requests.join_next().await.is_some() {}
+    Ok(())
+}
+
+async fn run_request<H, F>(
+    mut stream: TcpStream,
+    receiver: Arc<Receiver>,
+    _permit: OwnedSemaphorePermit,
+    handler: H,
+) where
+    H: FnOnce(Command, Instant) -> F,
+    F: Future<Output = std::result::Result<Outcome, Rejection>>,
+{
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let result = timeout_at(deadline, handle(&mut stream, &receiver, deadline, handler)).await;
+    if matches!(result, Ok(Err(_))) {
+        let _ = timeout(Duration::from_secs(1), error_response(&mut stream, 400)).await;
     }
 }
 
-async fn handle<H, F>(stream: &mut TcpStream, receiver: &Receiver, handler: H) -> Result<()>
+async fn handle<H, F>(
+    stream: &mut TcpStream,
+    receiver: &Receiver,
+    deadline: Instant,
+    handler: H,
+) -> Result<()>
 where
-    H: FnOnce(Command) -> F,
+    H: FnOnce(Command, Instant) -> F,
     F: Future<Output = std::result::Result<Outcome, Rejection>>,
 {
     let head = read_head(stream).await?;
@@ -120,7 +163,7 @@ where
     } else {
         let command = Command::decode(route, &body)?;
         let event_id = command.event_id();
-        let outcome = match handler(command).await {
+        let outcome = match handler(command, deadline).await {
             Ok(outcome) => outcome,
             Err(Rejection::Conflict) => return error_response(stream, 409).await,
             Err(Rejection::Unavailable) => return error_response(stream, 503).await,

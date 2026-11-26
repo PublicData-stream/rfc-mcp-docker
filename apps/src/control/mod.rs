@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 pub use auth::Keys;
 pub use feed::{FEED_LIMIT, FeedFormat, publications};
-pub use wire::{Client, address, serve};
+pub use wire::{Client, address, serve, serve_until};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

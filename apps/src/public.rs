@@ -28,7 +28,7 @@ use rfc_mcp_docker::{
     control::{self, Command, Keys, Link, Outcome, Rejection},
 };
 use rfc_search::{Rg, Search, SearchError};
-use rfc_storage::postgres::{GenerationSelection, Reader};
+use rfc_storage::postgres::{GenerationSelection, PoolClass, ReadOutcome, ServePool};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
@@ -42,18 +42,22 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use tokio::{
     net::TcpListener,
-    sync::Semaphore,
+    sync::{Semaphore, watch},
+    task::JoinSet,
     time::{Instant, timeout, timeout_at},
 };
 
 #[path = "public/client_ip.rs"]
 mod client_ip;
+#[path = "public/config.rs"]
+mod config;
 
 use client_ip::ClientIp;
 
 const RESPONSE_LIMIT: usize = 256 * 1024;
 const SEARCH_TAIL_RESERVE: usize = 4096;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const RATE: f64 = 5.0;
 const BURST: f64 = 10.0;
@@ -80,7 +84,7 @@ struct Mcp {
 }
 
 impl Mcp {
-    fn new(key: &[u8; 48], rg: Arc<Rg>) -> Result<Self, serde_json::Error> {
+    fn new(key: &[u8; 48], rg: Arc<Rg>, pool: ServePool) -> Result<Self, serde_json::Error> {
         let definitions: Vec<ToolSchema> =
             serde_json::from_str(include_str!("../schemas/tools.json"))?;
         let tools = definitions
@@ -102,33 +106,39 @@ impl Mcp {
             })
             .collect();
         Ok(Self {
-            search: Arc::new(Search::new(key)),
+            search: Arc::new(Search::new(key, pool)),
             rg,
             tools: Arc::new(tools),
         })
     }
 
-    async fn call(&self, name: &str, args: Value, id: &RequestId) -> Result<Value, SearchError> {
+    async fn call(
+        &self,
+        name: &str,
+        args: Value,
+        id: &RequestId,
+        deadline: Instant,
+    ) -> Result<Value, SearchError> {
         let fits = |value: &Value| wire_size(id, value) <= RESPONSE_LIMIT;
         match name {
             "rg" => {
                 let id = id.clone();
                 self.rg
-                    .clone()
                     .run(
-                        self.search.clone(),
+                        &self.search,
                         arguments(args)?,
+                        deadline,
                         move |value, reserve| wire_size(&id, value) <= RESPONSE_LIMIT - reserve,
                     )
                     .await
             }
-            "list" => self.search.list(arguments(args)?, fits).await,
-            "get" => self.search.get(arguments(args)?, fits).await,
-            "table" => self.search.table(arguments(args)?, fits).await,
+            "list" => self.search.list(arguments(args)?, deadline, fits).await,
+            "get" => self.search.get(arguments(args)?, deadline, fits).await,
+            "table" => self.search.table(arguments(args)?, deadline, fits).await,
             "search" => {
                 let page = self
                     .search
-                    .run_with_budget(arguments(args)?, |page| {
+                    .run_with_budget(arguments(args)?, deadline, |page| {
                         wire_size(id, &json!(page)) <= RESPONSE_LIMIT - SEARCH_TAIL_RESERVE
                     })
                     .await?;
@@ -217,7 +227,7 @@ impl ServerHandler for Mcp {
         };
         let output = tokio::select! {
             () = context.ct.cancelled() => return Err(ErrorData::internal_error("Request cancelled", None)),
-            result = timeout_at(deadline, self.call(&request.name, args, &context.id)) => {
+            result = timeout_at(deadline, self.call(&request.name, args, &context.id, deadline)) => {
                 result.unwrap_or(Err(SearchError::Deadline))
             }
         };
@@ -298,6 +308,8 @@ struct Bucket {
 
 struct Admission {
     rg: Arc<Rg>,
+    pool: ServePool,
+    readiness: Semaphore,
     in_flight: Semaphore,
     sources: Mutex<HashMap<IpAddr, Bucket>>,
     client_ip: ClientIp,
@@ -309,9 +321,17 @@ struct Admission {
 }
 
 impl Admission {
-    fn new(rg: Arc<Rg>, client_ip: ClientIp, hosts: Vec<Authority>, origins: Vec<String>) -> Self {
+    fn new(
+        rg: Arc<Rg>,
+        pool: ServePool,
+        client_ip: ClientIp,
+        hosts: Vec<Authority>,
+        origins: Vec<String>,
+    ) -> Self {
         Self {
             rg,
+            pool,
+            readiness: Semaphore::new(2),
             in_flight: Semaphore::new(REQUESTS),
             sources: Mutex::default(),
             client_ip,
@@ -445,14 +465,20 @@ async fn ready(State(state): State<Arc<Admission>>) -> StatusCode {
     if !state.rg.available() {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
-    let ready = timeout(Duration::from_secs(2), async {
-        Reader::connect()
-            .await?
-            .with_generation(GenerationSelection::Active, async |_| Ok(()))
-            .await
-    })
-    .await;
-    if matches!(ready, Ok(Ok(()))) {
+    let Ok(_permit) = state.readiness.try_acquire() else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let ready = state
+        .pool
+        .with_generation(
+            PoolClass::Readiness,
+            deadline,
+            GenerationSelection::Active,
+            async |_| Ok(ReadOutcome::Complete(())),
+        )
+        .await;
+    if ready.is_ok() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -460,14 +486,16 @@ async fn ready(State(state): State<Arc<Admission>>) -> StatusCode {
 }
 
 async fn metrics(State(state): State<Arc<Admission>>) -> String {
-    format!(
+    let mut output = format!(
         "rfc_mcp_requests_total {}\nrfc_mcp_admission_rejected_total {}\nrfc_mcp_responses_total {}\nrfc_mcp_in_flight {}\nrfc_mcp_rg_available {}\n",
         state.requests.load(Ordering::Relaxed),
         state.rejected.load(Ordering::Relaxed),
         state.responses.load(Ordering::Relaxed),
         REQUESTS - state.in_flight.available_permits(),
         u8::from(state.rg.available()),
-    )
+    );
+    state.pool.metrics(&mut output);
+    output
 }
 
 fn setting(name: &str, default: &str) -> io::Result<String> {
@@ -548,26 +576,13 @@ pub async fn run() -> ProbeResult {
                 .map_err(|_| invalid("RFC_MCP_TRUSTED_PROXIES"))
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let client_ip = ClientIp::load(proxies)?;
+    let (settings, pool_config) = config::load()?;
+    let client_ip = ClientIp::load(proxies, settings)?;
     let key_path = setting("RFC_MCP_CURSOR_KEY_FILE", "/run/secrets/rfc_cursor_key")?;
     let key: [u8; 48] = fs::read(key_path)
         .map_err(|_| invalid("RFC_MCP_CURSOR_KEY_FILE"))?
         .try_into()
         .map_err(|_| invalid("RFC_MCP_CURSOR_KEY_FILE (48 raw bytes required)"))?;
-    let rg = Arc::new(Rg::initialize().await);
-    let admission = Arc::new(Admission::new(
-        rg.clone(),
-        client_ip,
-        allowed,
-        origins.clone(),
-    ));
-    let public = super::mcp::transport(Mcp::new(&key, rg)?, Some(hosts), origins)
-        .route_layer(middleware::from_fn_with_state(admission.clone(), admit));
-    let admin = Router::new()
-        .route("/live", get(|| async { StatusCode::OK }))
-        .route("/ready", get(ready))
-        .route("/metrics", get(metrics))
-        .with_state(admission);
     let notification = match std::env::var("RFC_SERVE_NOTIFY_BIND") {
         Ok(bind) => {
             let keys = Keys::load(Link::SyncServe)?;
@@ -582,33 +597,87 @@ pub async fn run() -> ProbeResult {
     let pub_listener = TcpListener::bind(public_addr).await?;
     let admin_listener = TcpListener::bind(admin_addr).await?;
     eprintln!("RFC MCP listening on {}", pub_listener.local_addr()?);
-    tokio::try_join!(
-        async {
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                serve_public(pub_listener, public).await?,
-            )
-        },
-        async { Ok(axum::serve(admin_listener, admin).await?) },
-        async {
-            match notification {
-                Some((listener, keys)) => {
-                    control::serve(listener, Link::SyncServe, keys, notify).await
-                }
-                None => std::future::pending().await,
+    let pool = ServePool::new(pool_config, notification.is_some())?;
+    let rg = Arc::new(Rg::initialize().await);
+    let admission = Arc::new(Admission::new(
+        rg.clone(),
+        pool.clone(),
+        client_ip,
+        allowed,
+        origins.clone(),
+    ));
+    let public = super::mcp::transport(
+        Mcp::new(&key, rg.clone(), pool.clone())?,
+        Some(hosts),
+        origins,
+    )
+    .route_layer(middleware::from_fn_with_state(admission.clone(), admit));
+    let admin = Router::new()
+        .route("/live", get(|| async { StatusCode::OK }))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .with_state(admission);
+    let (stop, stopped) = watch::channel(false);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let result = {
+        let services = async {
+            tokio::try_join!(
+                async {
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        serve_http(pub_listener, public, true, stopped.clone()).await?,
+                    )
+                },
+                async { Ok(serve_http(admin_listener, admin, false, stopped.clone()).await?) },
+                async {
+                    if let Some((listener, keys)) = notification {
+                        let pool = pool.clone();
+                        control::serve_until(
+                            listener,
+                            Link::SyncServe,
+                            keys,
+                            stopped.clone(),
+                            move |command, deadline| {
+                                notify(pool.clone(), command, deadline - Duration::from_millis(100))
+                            },
+                        )
+                        .await
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        };
+        tokio::pin!(services);
+        tokio::select! {
+            result = &mut services => result,
+            _ = async { tokio::select! { _ = terminate.recv() => (), _ = interrupt.recv() => (), } } => {
+                pool.stop_warming();
+                stop.send_replace(true);
+                timeout(DRAIN_TIMEOUT, &mut services).await.unwrap_or(Ok(()))
             }
-        },
-    )?;
-    Ok(())
+        }
+    };
+    let (_, reaped) = tokio::join!(pool.shutdown(), timeout(Duration::from_secs(2), rg.reap()));
+    if reaped.is_err() {
+        return Err("Serve worker shutdown deadline elapsed".into());
+    }
+    result
 }
 
-async fn notify(command: Command) -> Result<Outcome, Rejection> {
+async fn notify(
+    pool: ServePool,
+    command: Command,
+    deadline: Instant,
+) -> Result<Outcome, Rejection> {
     let Command::Generation(event) = command else {
         return Err(Rejection::Conflict);
     };
-    let reader = Reader::connect()
+    let (active, sequence) = pool
+        .active(deadline)
         .await
         .map_err(|_| Rejection::Unavailable)?;
-    let (active, sequence) = reader.active().await.map_err(|_| Rejection::Unavailable)?;
     if sequence > event.publication_sequence {
         return Ok(Outcome::Superseded);
     }
@@ -620,25 +689,51 @@ async fn notify(command: Command) -> Result<Outcome, Rejection> {
     Ok(Outcome::Observed)
 }
 
-async fn serve_public(listener: TcpListener, router: Router) -> io::Result<()> {
+async fn serve_http(
+    listener: TcpListener,
+    router: Router,
+    public: bool,
+    mut stop: watch::Receiver<bool>,
+) -> io::Result<()> {
     let connections = Arc::new(Semaphore::new(CONNECTIONS));
+    let mut requests = JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            biased;
+            _ = stop.wait_for(|stopped| *stopped) => break,
+            Some(_) = requests.join_next(), if !requests.is_empty() => continue,
+            accepted = listener.accept() => accepted?,
+        };
         let Ok(permit) = connections.clone().try_acquire_owned() else {
             continue;
         };
         let router = router
             .clone()
             .layer(Extension(Peer(peer.ip().to_canonical())));
-        tokio::spawn(async move {
+        let mut stopping = stop.clone();
+        requests.spawn(async move {
             let _permit = permit;
             let service = TowerToHyperService::new(router);
-            let _ = http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_TIMEOUT)
-                .max_buf_size(32 * 1024)
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
+            let mut builder = http1::Builder::new();
+            if public {
+                builder
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HEADER_TIMEOUT)
+                    .max_buf_size(32 * 1024);
+            }
+            let connection = builder.serve_connection(TokioIo::new(stream), service);
+            tokio::pin!(connection);
+            tokio::select! {
+                biased;
+                _ = async { let _ = stopping.wait_for(|stopped| *stopped).await; } => {
+                    connection.as_mut().graceful_shutdown();
+                    let _ = connection.await;
+                }
+                _ = &mut connection => (),
+            }
         });
     }
+    drop(listener);
+    while requests.join_next().await.is_some() {}
+    Ok(())
 }

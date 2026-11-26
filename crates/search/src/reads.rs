@@ -1,15 +1,16 @@
 use std::ops::Range;
 
 use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
-use rfc_storage::postgres::{GenerationReadGuard, GenerationSelection, Reader};
+use rfc_storage::postgres::{GenerationReadGuard, GenerationSelection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::time::Instant;
 use tokio_postgres::Row;
 
 use crate::{
     Search, SearchError,
     cursor::{CursorKey, MAX_AGE_SECONDS, validate_context},
-    engine::{repository_error, unix_time},
+    engine::unix_time,
     snippets::{self, MAX_SOURCE_BYTES, Source, SourceVerification},
 };
 
@@ -182,11 +183,12 @@ impl<'a> PageContext<'a> {
 
     async fn read<T>(
         &self,
+        search: &Search,
+        deadline: Instant,
         call: impl for<'b, 'c> AsyncFnOnce(
             &'b GenerationReadGuard<'c>,
         ) -> rfc_storage::postgres::Result<T>,
     ) -> Result<T, SearchError> {
-        let pinned = self.cursor.is_some();
         let selection = if let Some(cursor) = &self.cursor {
             GenerationSelection::Pinned(
                 GenerationId::new(cursor.generation).ok_or(SearchError::CursorInvalid)?,
@@ -194,13 +196,7 @@ impl<'a> PageContext<'a> {
         } else {
             GenerationSelection::Active
         };
-        let reader = Reader::connect()
-            .await
-            .map_err(|error| repository_error(error, pinned))?;
-        reader
-            .with_generation(selection, call)
-            .await
-            .map_err(|error| repository_error(error, pinned))
+        search.read_generation(selection, deadline, call).await
     }
 
     fn sequence(&self, guard: &GenerationReadGuard<'_>) -> i64 {
@@ -286,6 +282,7 @@ impl Search {
     pub async fn list(
         &self,
         request: ListRequest,
+        deadline: Instant,
         fits: impl Fn(&Value) -> bool + Send + Sync,
     ) -> Result<Value, SearchError> {
         let limit = limit(request.limit)?;
@@ -297,7 +294,7 @@ impl Search {
             Sort::IdDesc => ("<", "DESC", i64::from(i32::MAX) + 1),
         };
         let after = context.cursor.as_ref().map_or(initial, |value| value.after);
-        context.read(async |guard| {
+        context.read(self, deadline, async |guard| {
             let generation = generation(guard)?;
             let tx = guard.transaction();
             let count: Option<i32> = tx.query_opt(
@@ -337,6 +334,7 @@ impl Search {
     pub async fn table(
         &self,
         request: TableRequest,
+        deadline: Instant,
         fits: impl Fn(&Value) -> bool + Send + Sync,
     ) -> Result<Value, SearchError> {
         rfc(request.id)?;
@@ -347,7 +345,7 @@ impl Search {
         let args = fingerprint(&(request.id, limit, request.max_depth))?;
         let context = PageContext::new(&self.key, "table", request.cursor.as_deref())?;
         context.check_args(&args)?;
-        context.read(async |guard| {
+        context.read(self, deadline, async |guard| {
             let (source, state) = lookup(guard, request.id).await?;
             let after = context.cursor.as_ref().map_or(-1_i64, |value| value.after);
             let rows = guard.transaction().query(
@@ -384,6 +382,7 @@ impl Search {
     pub async fn get(
         &self,
         request: GetRequest,
+        deadline: Instant,
         fits: impl Fn(&Value) -> bool + Send + Sync,
     ) -> Result<Value, SearchError> {
         rfc(request.id)?;
@@ -409,7 +408,7 @@ impl Search {
             context.check_args(&args)?;
         }
         context
-            .read(async |guard| {
+            .read(self, deadline, async |guard| {
                 let (source, section_state) = lookup(guard, request.id).await?;
                 let version =
                     BlobDigest::from_bytes(source.version.as_slice().try_into()?).to_string();

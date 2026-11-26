@@ -6,7 +6,8 @@ use std::{
 
 use rfc_core::{GenerationId, RfcNumber};
 use rfc_storage::postgres::{
-    GenerationReadGuard, GenerationSelection, GenerationUnavailable, Reader,
+    GenerationReadGuard, GenerationSelection, GenerationUnavailable, PoolClass, PoolError,
+    ReadOutcome, ServePool,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -149,6 +150,13 @@ pub(crate) fn repository_error(
     error: Box<dyn std::error::Error + Send + Sync>,
     pinned: bool,
 ) -> SearchError {
+    if let Some(pool_error) = error.downcast_ref::<PoolError>() {
+        return match pool_error {
+            PoolError::Exhausted => SearchError::ResourceLimit,
+            PoolError::Deadline => SearchError::Deadline,
+            PoolError::Unavailable => SearchError::Unavailable,
+        };
+    }
     if error.is::<GenerationUnavailable>() {
         return if pinned {
             SearchError::GenerationUnavailable
@@ -164,6 +172,17 @@ pub(crate) fn repository_error(
         Err(error) => error
             .downcast::<tokio_postgres::Error>()
             .map_or(SearchError::Unavailable, |error| (*error).into()),
+    }
+}
+
+pub(crate) fn clean_rejection<T>(
+    error: Box<dyn std::error::Error + Send + Sync>,
+) -> rfc_storage::postgres::Result<ReadOutcome<T>> {
+    match error.downcast_ref::<SearchError>() {
+        Some(SearchError::Unavailable | SearchError::Cancelled | SearchError::Deadline) | None => {
+            Err(error)
+        }
+        Some(_) => Ok(ReadOutcome::Rejected(error)),
     }
 }
 
@@ -256,31 +275,35 @@ pub struct NoticeGroup {
 
 pub struct Search {
     pub(crate) key: CursorKey,
+    pub(crate) pool: ServePool,
     blocking_reads: Arc<Semaphore>,
 }
 
 impl Search {
     /// Create a shared engine with its own dedicated cursor key.
-    pub fn new(cursor_key: &[u8; 48]) -> Self {
+    pub fn new(cursor_key: &[u8; 48], pool: ServePool) -> Self {
         Self {
             key: CursorKey::new(cursor_key),
+            pool,
             blocking_reads: Arc::new(Semaphore::new(2)),
         }
     }
 
     pub async fn run(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
-        self.run_with_budget(request, |page| within_page_budget(page).unwrap_or(false))
-            .await
+        self.run_with_budget(request, Instant::now() + DEADLINE, |page| {
+            within_page_budget(page).unwrap_or(false)
+        })
+        .await
     }
 
     /// The predicate reserves transport framing and continuation space as needed.
     pub async fn run_with_budget(
         &self,
         request: SearchRequest,
+        deadline: Instant,
         fits: impl Fn(&SearchPage) -> bool + Send + Sync,
     ) -> Result<SearchPage, SearchError> {
-        let deadline = Instant::now() + DEADLINE;
-        timeout_at(deadline, self.run_bounded(request, &fits))
+        timeout_at(deadline, self.run_bounded(request, deadline, &fits))
             .await
             .map_err(|_| SearchError::Deadline)?
     }
@@ -289,7 +312,7 @@ impl Search {
     #[doc(hidden)]
     pub async fn explain_fixture(query: &str) -> Result<Vec<String>, SearchError> {
         let mut plan = Plan::new(query::parse(query)?);
-        let reader = Reader::connect()
+        let reader = rfc_storage::postgres::Reader::connect()
             .await
             .map_err(|error| repository_error(error, false))?;
         reader
@@ -324,6 +347,7 @@ impl Search {
     async fn run_bounded(
         &self,
         request: SearchRequest,
+        deadline: Instant,
         fits: &(impl Fn(&SearchPage) -> bool + Sync),
     ) -> Result<SearchPage, SearchError> {
         let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
@@ -344,10 +368,6 @@ impl Search {
             ),
             None => GenerationSelection::Active,
         };
-        let pinned = cursor.is_some();
-        let reader = Reader::connect()
-            .await
-            .map_err(|error| repository_error(error, pinned))?;
         let mut scan = Scan {
             options: PageOptions {
                 limit,
@@ -357,37 +377,59 @@ impl Search {
             budget: Budget::default(),
             fits,
         };
-        reader
-            .with_generation(selection, async |guard| {
-                let generation = i64::try_from(guard.generation().get())
-                    .map_err(|_| SearchError::Unavailable)?;
-                let sequence = cursor
-                    .as_ref()
-                    .map_or(guard.publication_sequence(), |value| value.sequence);
-                let expiry = cursor
-                    .as_ref()
-                    .map_or(now + MAX_AGE_SECONDS, |value| value.expiry);
-                let after = cursor.as_ref().map_or(0, |value| value.after);
-                let (mut page, stop) = scan.run(self, guard, generation, sequence, after).await?;
-                if let Some(after) = stop {
-                    if expiry <= unix_time()? {
-                        return Err(SearchError::CursorExpired.into());
-                    }
-                    page.next_cursor = Some(self.key.encode(&Cursor::new(
-                        fingerprint,
-                        generation,
-                        sequence,
-                        after,
-                        expiry,
-                    ))?);
+        self.read_generation(selection, deadline, async |guard| {
+            let generation =
+                i64::try_from(guard.generation().get()).map_err(|_| SearchError::Unavailable)?;
+            let sequence = cursor
+                .as_ref()
+                .map_or(guard.publication_sequence(), |value| value.sequence);
+            let expiry = cursor
+                .as_ref()
+                .map_or(now + MAX_AGE_SECONDS, |value| value.expiry);
+            let after = cursor.as_ref().map_or(0, |value| value.after);
+            let (mut page, stop) = scan.run(self, guard, generation, sequence, after).await?;
+            if let Some(after) = stop {
+                if expiry <= unix_time()? {
+                    return Err(SearchError::CursorExpired.into());
                 }
-                if serialized_size(&page)? > MAX_RESPONSE_BYTES {
-                    return Err(SearchError::ResourceLimit.into());
-                }
-                Ok(page)
-            })
+                page.next_cursor = Some(self.key.encode(&Cursor::new(
+                    fingerprint,
+                    generation,
+                    sequence,
+                    after,
+                    expiry,
+                ))?);
+            }
+            if serialized_size(&page)? > MAX_RESPONSE_BYTES {
+                return Err(SearchError::ResourceLimit.into());
+            }
+            Ok(page)
+        })
+        .await
+    }
+
+    pub(crate) async fn read_generation<T>(
+        &self,
+        selection: GenerationSelection,
+        deadline: Instant,
+        operation: impl for<'a, 'b> AsyncFnOnce(
+            &'a GenerationReadGuard<'b>,
+        ) -> rfc_storage::postgres::Result<T>,
+    ) -> Result<T, SearchError> {
+        self.pool
+            .with_generation(
+                PoolClass::Public,
+                deadline,
+                selection,
+                async |guard| match operation(guard).await {
+                    Ok(value) => Ok(ReadOutcome::Complete(value)),
+                    Err(error) => clean_rejection(error),
+                },
+            )
             .await
-            .map_err(|error| repository_error(error, pinned))
+            .map_err(|error| {
+                repository_error(error, matches!(selection, GenerationSelection::Pinned(_)))
+            })
     }
 
     pub(crate) async fn read_original<T: Send + 'static>(
