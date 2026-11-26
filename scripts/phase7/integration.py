@@ -5,6 +5,7 @@ import argparse
 from contextlib import contextmanager, ExitStack
 import importlib.util
 from ipaddress import ip_address, ip_network
+from uuid import uuid4
 import json
 import os
 from pathlib import Path
@@ -75,6 +76,7 @@ class Deployment:
         self.keys = work / "keys"
         self.keys.mkdir()
         notify, feed = secrets.token_bytes(48), secrets.token_bytes(48)
+        self.notify_key = notify
         files = {
             "POSTGRES_KEY": (70, (seed.directory / "postgres/postgres.key").read_bytes()),
             "POSTGRES_PASSWORD": (70, seed.passwords["postgres"].encode()),
@@ -432,13 +434,16 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
                 assert request.stdout.readline().strip() == "sent"
             try:
                 wait_workers(2)
+                pids = phase5.phase3.wait_for_readers(
+                    lambda query: self.sql("-c", query), "state='idle in transaction'")
+                assert len(pids) == 2, pids
                 self.client.call("rg", **arguments, _error="resource_limit_exceeded")
             finally:
                 for request in clients:
                     _, errors = request.communicate("disconnect\n", timeout=8)
                     assert request.returncode == 0, errors
             wait_workers(0)
-        assert self.sql("-c", "SELECT count(*) FROM pg_stat_activity WHERE usename='rfc_serve'") == "0"
+        phase5.phase3.assert_readers_idle(lambda query: self.sql("-c", query), gone=pids)
         self.run("exec", "-T", SYNC, "flock", "-n", "/mirror/generation-locks/1", "true")
         started = time.monotonic()
         self.client.call("rg", **arguments, _error="deadline_exceeded")
@@ -446,6 +451,73 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
         wait_workers(0)
         self.run("exec", "-T", SYNC, "flock", "-n", "/mirror/generation-locks/1", "true")
         print("Two-worker saturation, disconnect, wall deadline, reaping, and fence release passed", flush=True)
+
+    def pool_reservations(self):
+        path = HERE.parent / "phase6" / "integration.py"
+        spec = importlib.util.spec_from_file_location("phase6_control", path)
+        control = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(control)
+        key_id = self.env["RFC_SYNC_SERVE_KEY_ID"]
+        key = self.notify_key
+        fixture = HERE.parent / "phase6" / "probe.py"
+
+        def notify(path, epoch="bootstrap", body=b"{}"):
+            wire, expected = control.request(self, path, epoch, body, to_serve=True,
+                                             credentials=(key_id, key))
+            command = [*self.docker, "run", "--rm", "-i", "--network", f"{self.name}_sync_notify",
+                       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+                       "-v", f"{fixture}:/probe.py:ro", "--entrypoint", "python3",
+                       f"{self.prefix}-fixtures", "-B", "/probe.py", self.env["RFC_NOTIFY_SERVE_IP"], "8782"]
+            result = subprocess.run(command, input=wire, capture_output=True, timeout=12, check=True)
+            head, reply = result.stdout.split(b"\r\n\r\n", 1)
+            assert head.startswith(b"HTTP/1.1 200 "), head
+            assert ("X-RFC-Response-Signature: " + control.response_mac(*expected, reply)).encode() in head
+            return json.loads(reply)
+
+        generation, sequence = self.sql(
+            "-c", "SELECT generation_id,publication_sequence FROM rfc.active_generation").split("|")
+        payload = {"event_id": str(uuid4()), "generation_id": int(generation),
+                   "publication_sequence": int(sequence)}
+        # A single public slot keeps the lock and signed notification deterministic.
+        previous = self.env.get("RFC_MCP_DB_POOL_MAX_CONNECTIONS")
+        self.env["RFC_MCP_DB_POOL_MAX_CONNECTIONS"] = "3"
+        try:
+            self.run("up", "-d", "--no-deps", "--wait", SERVE, timeout=60)
+            sql = lambda query: self.sql("-c", query)
+            with subprocess.Popen(
+                self.command("exec", "-T", "postgres", *phase1.SQL_OPTIONS, "-U", "postgres", "-d", "rfc"),
+                env=self.env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            ) as holder:
+                holder.stdin.write("BEGIN; LOCK rfc.generation_documents IN ACCESS EXCLUSIVE MODE;\n\\echo locked\n")
+                holder.stdin.flush()
+                try:
+                    assert select.select([holder.stdout], [], [], 5)[0] and holder.stdout.readline().strip() == "locked"
+                    # Recreating Serve also rotates the authenticated receiver epoch.
+                    epoch = notify("/internal/v1/identify")["epoch"]
+                    callbacks = self.command("exec", "-T", "test-proxy", "python3", "-B",
+                                             "/phase7/disconnect.py", "192.0.2.10", "get")
+                    with subprocess.Popen(callbacks, env=self.env, text=True, stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as call:
+                        try:
+                            assert select.select([call.stdout], [], [], 5)[0] and call.stdout.readline().strip() == "sent"
+                            blocked = phase5.phase3.wait_for_readers(sql, "wait_event_type='Lock'")
+                            assert len(blocked) == 1
+                            assert self.admin("/ready") == ""
+                            ack = notify("/internal/v1/generation-committed", epoch, json.dumps(payload).encode())
+                            assert ack == {"event_id": payload["event_id"], "outcome": "observed"}, ack
+                        finally:
+                            _, errors = call.communicate("disconnect\n", timeout=8)
+                            assert call.returncode == 0, errors
+                finally:
+                    holder.communicate("ROLLBACK;\n", timeout=8)
+            phase5.phase3.assert_readers_idle(sql, gone=blocked, max_connections=3)
+        finally:
+            if previous is None:
+                self.env.pop("RFC_MCP_DB_POOL_MAX_CONNECTIONS", None)
+            else:
+                self.env["RFC_MCP_DB_POOL_MAX_CONNECTIONS"] = previous
+            self.run("up", "-d", "--no-deps", "--wait", SERVE, timeout=60)
+        print("Readiness and authenticated publication passed with the public pool saturated", flush=True)
 
     def close(self):
         try:
@@ -521,6 +593,7 @@ def main():
                 port = int(stack.capture("port", "test-proxy", "8443").rsplit(":", 1)[1])
                 stack.client.port = port
                 stack.verify()
+                stack.pool_reservations()
                 stack.worker_lifecycle()
                 stack.fail_closed()
         finally:

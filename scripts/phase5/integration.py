@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import hmac
@@ -411,25 +412,59 @@ def block_corpus(project):
 
 
 def cancellation(project, client):
-    sessions = "SELECT count(*) FROM pg_stat_activity WHERE usename='rfc_serve'"
+    blocked = "wait_event_type='Lock'"
     with block_corpus(project):
         with subprocess.Popen(project.command("exec", "-T", "proxy", "python3", "-B", "/phase5/direct.py", "cancel"),
                               env=project.env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE) as request:
             try:
                 assert select.select([request.stdout], [], [], 6)[0] and request.stdout.readline().strip() == "sent"
-                waiting = "SELECT count(*) FROM pg_stat_activity WHERE usename='rfc_serve' AND wait_event_type='Lock'"
-                phase3.wait_for_sql(project, waiting, "1")
+                pids = phase3.wait_for_readers(project.sql, blocked)
+                assert len(pids) == 1, pids
             finally:
                 started = time.monotonic()
                 _, errors = request.communicate("disconnect\n", timeout=5)
             assert request.returncode == 0, errors
-            phase3.wait_for_sql(project, sessions, "0")
+            phase3.assert_readers_idle(project.sql, gone=pids)
             print(f"Disconnected database session was gone after {(time.monotonic() - started) * 1000:.0f} ms",
                   flush=True)
-        client.call("get", id=2119, _error="deadline_exceeded")
-        phase3.wait_for_sql(project, sessions, "0")
+        with ThreadPoolExecutor(max_workers=1) as work:
+            call = work.submit(client.call, "get", id=2119, _error="deadline_exceeded")
+            pids = phase3.wait_for_readers(project.sql, blocked)
+            assert len(pids) == 1, pids
+            call.result()
+        phase3.assert_readers_idle(project.sql, gone=pids)
     print("Client disconnect and a lock deadline both closed their database sessions", flush=True)
+
+
+def database_restart(project, client):
+    before = phase3.assert_readers_idle(project.sql)
+    assert before
+    project.run("stop", "postgres", timeout=40)
+    assert project.admin("/live").returncode == 0
+    assert "503" in project.admin("/ready").stderr
+    assert client.rpc("tools/list")[0]["tools"]
+    result, _ = client.rpc("tools/call", name="get", arguments={"id": 2119})
+    assert result["isError"] and result["structuredContent"]["code"] in {
+        "search_unavailable", "resource_limit_exceeded",
+    }, result
+    project.run("up", "-d", "--no-deps", "--force-recreate", "serve", timeout=30)
+    for _ in range(25):
+        if project.admin("/live").returncode == 0:
+            break
+        time.sleep(0.2)
+    assert project.admin("/live").returncode == 0
+    assert "503" in project.admin("/ready").stderr
+    assert client.rpc("tools/list")[0]["tools"]
+    project.start_postgres()
+    for _ in range(30):
+        if project.admin("/ready").returncode == 0:
+            break
+        time.sleep(0.2)
+    assert project.admin("/ready").returncode == 0
+    client.call("get", id=2119)
+    assert phase3.assert_readers_idle(project.sql)
+    print("Database restart, stale session rejection and recovery passed", flush=True)
 
 
 def publication(project, client, first, get_cursor, rg_page):
@@ -536,6 +571,7 @@ def main():
                         "-B", "/phase5/direct.py", "untrusted")
             project.run("exec", "-T", "proxy", "python3", "-B", "/phase5/direct.py", "trusted")
             cancellation(project, client)
+            database_restart(project, client)
             publication(project, client, first, cursor, rg_page)
             project.env.update(
                 PHASE5_CLIENT_IP_HEADER="X-Forwarded-For",

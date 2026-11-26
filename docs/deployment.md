@@ -226,7 +226,9 @@ Allow 3–18 connections per replica and a minimum idle count between zero
 and that maximum. The idle timeout applies above the background warm
 target. An expired leased session retires after release. The acquisition
 timeout bounds the wait for capacity. Once assigned a slot, opening and
-verifying a connection uses the remaining operation time. The maximum
+verifying a connection uses the remaining operation time. Each capacity
+class opens one connection at a time. Requests can exhaust their wait
+while that class is already connecting after an outage. The maximum
 connection lifetime is 86,400 seconds, the acquisition timeout is at most
 15,000 ms, and shutdown allows at most 5,000 ms for database closure.
 
@@ -245,11 +247,13 @@ Multiply `max_connections` by the maximum simultaneous Serve replicas,
 including replicas that overlap during a rollout. Reserve that many slots
 within PostgreSQL's regular connection limit as reported by
 `SHOW max_connections` after subtracting PostgreSQL's reserved slots.
-Allow additional slots for each Sync daemon's leader, worker, control
-handler and outbox dispatcher, overlapping Sync CLI or recovery work,
-health probes, and database administration. Confirm the budget using
-`pg_stat_activity` and the PostgreSQL PID and memory headroom on the
-deployment host.
+Allow up to 20 additional slots per Sync daemon. The leader, scheduler,
+outbox dispatcher, and current reconciliation or catalog probe can
+occupy four slots. Up to 16 admitted private requests can each need a
+short-lived writer. Count overlapping standalone reconciliation, Sync
+CLI or recovery work, PostgreSQL health probes, and administrative
+connections separately. Confirm the budget using `pg_stat_activity` and
+the PostgreSQL PID and memory headroom on the deployment host.
 
 On SIGTERM Serve closes its listeners, drains admitted requests for up to
 15 seconds, cancels stragglers, and gracefully closes verified idle

@@ -45,7 +45,7 @@ def statistics(records, duration):
     return by_tool
 
 
-def sample(stack):
+def sample(stack, *, include_companions=True):
     serve_memory, descriptors, workers = map(int, stack.capture(
         "exec", "-T", SERVE, "sh", "-ec",
         'cat /sys/fs/cgroup/memory.current; test -r /proc/1/fd; '
@@ -53,13 +53,15 @@ def sample(stack):
         "ps -o comm | grep -c '^rg$' || true",
     ).split())
     memory = {}
-    for service in (phase7.SYNC, phase7.FEED, "postgres"):
+    services = (phase7.SYNC, phase7.FEED, "postgres") if include_companions else ("postgres",)
+    for service in services:
         memory[service] = int(stack.capture("exec", "-T", service, "cat",
                                             "/sys/fs/cgroup/memory.current"))
     in_flight = next(int(line.rsplit(" ", 1)[1]) for line in stack.admin("/metrics").splitlines()
                      if line.startswith("rfc_mcp_in_flight "))
     readers, pending, running = map(int, stack.sql("-c", """
-        SELECT (SELECT count(*) FROM pg_stat_activity WHERE usename='rfc_serve'),
+        SELECT (SELECT count(*) FROM pg_stat_activity
+                WHERE usename='rfc_serve' AND backend_type='client backend'),
                count(*) FILTER (WHERE state='pending'), count(*) FILTER (WHERE state='running')
         FROM rfc.sync_jobs
     """).split("|"))
@@ -96,7 +98,7 @@ def clients(stack, work, count, mode):
             deadline = time.monotonic() + SECONDS + 23
             while any(client.poll() is None for client in clients.values()):
                 assert time.monotonic() < deadline, "load worker completion timeout"
-                measurements.append(sample(stack))
+                measurements.append(sample(stack, include_companions=mode != "comparison"))
                 time.sleep(0.35)
             records = []
             for client in clients.values():
@@ -139,7 +141,7 @@ def admission_burst(stack, work):
             _, errors = lock.communicate("ROLLBACK;\n", timeout=10)
             assert lock.returncode == 0, errors
     result = dict(Counter(row[1] for row in records))
-    assert result.get("HTTP 429") and result.get("deadline_exceeded"), result
+    assert all(result.get(code) for code in ("HTTP 429", "deadline_exceeded", "resource_limit_exceeded")), result
     return {"outcomes": result, "max_in_flight": max(row["in_flight"] for row in measurements),
             "after": recovery(stack)}
 
@@ -148,8 +150,102 @@ def recovery(stack):
     time.sleep(2.1)
     assert stack.client.rpc("tools/list")[0]["tools"]
     current = sample(stack)
-    assert current["db_readers"] == current["rg_workers"] == current["in_flight"] == 0, current
+    assert current["rg_workers"] == current["in_flight"] == 0, current
+    phase3.assert_readers_idle(lambda query: stack.sql("-c", query))
     return current
+
+
+def cpu_sample(stack):
+    return {service: int(stack.capture("exec", "-T", service, "sh", "-ec",
+                                      "sed -n 's/^usage_usec //p' /sys/fs/cgroup/cpu.stat"))
+            for service in (SERVE, "postgres")}
+
+
+def pool_metrics(stack):
+    return {name: float(value) for name, value in
+            (line.split() for line in stack.admin("/metrics").splitlines())
+            if name.startswith("rfc_mcp_db_pool_")}
+
+
+def postgres_logs(stack):
+    return stack.capture("logs", "--no-color", "postgres").splitlines()
+
+
+def connection_counts(lines):
+    authorized = [line for line in lines if "connection authorized:" in line and "user=rfc_serve " in line]
+    diagnostics = [line for line in lines if any(error in line.lower()
+                   for error in ("unexpected eof", "reset by peer", "could not receive data from client"))]
+    # PostgreSQL includes user and PID in the prefix we configure for this fixture.
+    return {
+        "connections": len(authorized),
+        "tls_handshakes": sum("ssl enabled" in line.lower() for line in authorized),
+        "serve_disconnect_diagnostics": sum("rfc_serve@" in line for line in diagnostics),
+        "other_disconnect_diagnostics": sum("rfc_serve@" not in line for line in diagnostics),
+    }
+
+
+def compare(stack, work, args):
+    candidate = stack.env["RFC_SERVE_IMAGE"]
+    for statement in (
+        "ALTER SYSTEM SET log_connections TO 'authorization'",
+        "ALTER SYSTEM SET log_line_prefix TO '%m [%p] %u@%d '",
+        "SELECT pg_reload_conf()",
+    ):
+        stack.sql("-c", statement)
+    assert stack.sql("-c", "SHOW log_connections") == "authorization"
+    stack.run("stop", phase7.SYNC, timeout=50)
+    trials = []
+    try:
+        for trial in range(args.pool_trials):
+            variants = [("dedicated", args.baseline_serve_image), ("pooled", candidate)]
+            if trial % 2:
+                variants.reverse()
+            for variant, image in variants:
+                stack.env["RFC_SERVE_IMAGE"] = image
+                start_lines = len(postgres_logs(stack))
+                stack.run("up", "-d", "--no-deps", "--force-recreate", "--wait", SERVE, timeout=80)
+                assert stack.admin("/ready") == ""
+                row = {"trial": trial + 1, "variant": variant,
+                       "image": stack.inspect(SERVE)["Image"], "profiles": {}}
+                for count in CONCURRENCY:
+                    old_cpu = cpu_sample(stack)
+                    old_metrics = pool_metrics(stack)
+                    old_log = len(postgres_logs(stack))
+                    records, samples = clients(stack, work, count, "comparison")
+                    new_log = postgres_logs(stack)[old_log:]
+                    new_cpu = cpu_sample(stack)
+                    new_metrics = pool_metrics(stack)
+                    successful = sum(record[1] == "ok" for record in records)
+                    assert successful, (variant, count, records[:10])
+                    if variant == "pooled":
+                        assert all(sample["db_readers"] <= 8 for sample in samples), samples
+                    connections = connection_counts(new_log)
+                    if connections["connections"]:
+                        assert connections["tls_handshakes"] == connections["connections"], connections
+                    waits = {key: new_metrics[key] - old_metrics.get(key, 0) for key in new_metrics
+                             if "wait_seconds_" in key}
+                    row["profiles"][count] = {
+                        "tools": statistics(records, SECONDS), **connections,
+                        "connections_per_request": connections["connections"] / len(records),
+                        "cpu_us": {name: new_cpu[name] - old_cpu[name] for name in old_cpu},
+                        "peak_memory_bytes": {key: max(sample[key] for sample in samples) for key in
+                                              ("serve_cgroup_bytes", "postgres_cgroup_bytes")},
+                        "pool_wait": waits if variant == "pooled" else None,
+                    }
+                stack.run("stop", SERVE, timeout=35)
+                row["combined_postgres_logs"] = connection_counts(postgres_logs(stack)[start_lines:])
+                trials.append(row)
+                print(json.dumps(row), flush=True)
+    finally:
+        stack.env["RFC_SERVE_IMAGE"] = candidate
+    for trial in range(1, args.pool_trials + 1):
+        dedicated, pooled = [next(row for row in trials if row["trial"] == trial and row["variant"] == variant)
+                             for variant in ("dedicated", "pooled")]
+        for count in CONCURRENCY:
+            assert (pooled["profiles"][count]["connections_per_request"] <
+                    dedicated["profiles"][count]["connections_per_request"]), (trial, count)
+        assert pooled["combined_postgres_logs"]["serve_disconnect_diagnostics"] == 0, pooled
+    return {"sample_seconds": SECONDS, "profiles": trials}
 
 
 def run_profile(root, args, publication_driver, search_driver, size):
@@ -183,6 +279,8 @@ def run_profile(root, args, publication_driver, search_driver, size):
         with phase7.deployment(work, seed, args.image_prefix) as stack:
             stack.start()
             stack.sql("-c", "ANALYZE")
+            if args.baseline_serve_image:
+                return {"rfc_count": size, **compare(stack, work, args)}
             baseline = sample(stack)
             profiles = {}
             for count in CONCURRENCY:
@@ -206,16 +304,23 @@ def run_profile(root, args, publication_driver, search_driver, size):
 
 
 def main():
-    args = arguments(argparse.ArgumentParser(description=__doc__))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--baseline-serve-image", help="compare an existing dedicated-session Serve image")
+    parser.add_argument("--pool-trials", type=int, default=3)
+    args = arguments(parser)
+    if not 1 <= args.pool_trials <= 10:
+        parser.error("--pool-trials must be within 1–10")
     with tempfile.TemporaryDirectory(prefix="rfc-phase8-capacity-", dir="/tmp") as directory:
         root = Path(directory)
         publication, search = root / "publication-driver", root / "search-driver"
         docker = ["docker", "--context", args.context]
         phase3.fixture_driver(docker, args.image_prefix, publication)
         phase4.search_driver(docker, args.image_prefix, search, False)
-        reports = [run_profile(root, args, publication, search, size) for size in (1000, 10000)]
-    (args.evidence / "capacity.json").write_text(json.dumps({
-        "warmup_seconds": 3, "sample_seconds": SECONDS, "reports": reports,
+        sizes = (1000,) if args.baseline_serve_image else (1000, 10000)
+        reports = [run_profile(root, args, publication, search, size) for size in sizes]
+    filename = "pool-comparison.json" if args.baseline_serve_image else "capacity.json"
+    (args.evidence / filename).write_text(json.dumps({
+        "warmup_seconds": 0 if args.baseline_serve_image else 3, "sample_seconds": SECONDS, "reports": reports,
     }, indent=2) + "\n")
 
 

@@ -113,7 +113,7 @@ elif sys.argv[1] == "cancel":
     body["method"] = "tools/call"
     body["params"].update(name="get", arguments={"id": 2119})
     encoded = json.dumps(body).encode()
-    with start(headers("tools/call", "203.0.113.1"), encoded, len(encoded)) as sock:
+    with start(headers("tools/call", sys.argv[2] if len(sys.argv) > 2 else "203.0.113.1"), encoded, len(encoded)) as sock:
         print("sent", flush=True)
         assert sys.stdin.readline().strip() == "disconnect"
         sock.shutdown(socket.SHUT_RDWR)

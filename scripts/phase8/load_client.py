@@ -76,16 +76,17 @@ def main():
         assert time.monotonic() < deadline, "load client start deadline"
         time.sleep(0.025)
     mode = gate.read_text().strip()
-    assert mode in {"mixed", "admission"}
+    assert mode in {"mixed", "admission", "comparison"}
     if mode == "admission":
         records = [exchange("test-proxy", 8443, context, *MIX[1])]
     else:
         records = []
         started = time.monotonic()
-        while time.monotonic() < started + duration + 3:
+        warmup = 0 if mode == "comparison" else 3
+        while time.monotonic() < started + duration + warmup:
             tick = time.monotonic()
             record = exchange("test-proxy", 8443, context, *MIX[index % len(MIX)])
-            if tick >= started + 3:
+            if tick >= started + warmup:
                 records.append(record)
             index += 1
             time.sleep(max(0, tick + 0.27 - time.monotonic()))

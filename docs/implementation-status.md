@@ -1793,3 +1793,116 @@ Local verification on 2026-11-26 used Rust 1.100.0, rootless Docker
 
 [Client IP settings](mcp.md#serving-in-docker-compose) ·
 [Proxy configuration and rollout](deployment.md#proxy-and-network-boundaries)
+
+## Serve PostgreSQL connection pool
+
+Serve shares one process-local pool among the five database-backed MCP
+tools, readiness, and authenticated publication notifications. The
+default capacity is eight physical connections. Readiness and
+notifications each have one reserved slot. A reused lease receives full
+identity, schema, TLS and privilege verification before use. Cancelled
+or uncertain sessions are discarded, and clean sessions receive bounded
+PostgreSQL and TLS shutdown on retirement. [Pool settings and rollback](deployment.md#size-and-operate-the-serve-database-pool)
+
+### Local verification on 2026-11-26
+
+- The frozen workspace gate, all-feature Clippy and tests, and 258-case
+  HTTP mutation smoke passed with Rust 1.100.0. Cargo used
+  `/tmp/rust/target`. The default Compose configuration rendered.
+- A disposable rootless Minikube profile on Kubernetes 1.37.0 reused a
+  Serve backend across MCP calls, recovered readiness and exact original
+  reads after replacing the PostgreSQL pod, and exited successfully on
+  SIGTERM with no Serve database sessions remaining. Manual publication,
+  repair replay, and authenticated outbox delivery also passed.
+- The rootful PostgreSQL 19 wire probe observed the same backend across
+  successive Gets. It exercised acquisition exhaustion, cancellation
+  during wait, TLS, verification and COMMIT, and live role, schema, grant,
+  password and CA changes. It also exercised a severed database transport,
+  a terminated backend, idle eviction, lease lifetime expiration, and
+  SIGTERM while a Get was blocked. Clean retirements emitted a PostgreSQL
+  `Terminate` message followed by TLS `close_notify`.
+- The dedicated baseline at `2b769d5` closed its socket abruptly after a
+  successful Get in the controlled wire fixture. PostgreSQL produced
+  both unexpected SSL EOF and connection-reset reports during forced
+  disconnects. Unrelated fixture clients had separate connection events.
+  These observations leave attribution of the reported production lines
+  open.
+- The same wire probe passed on rootless Docker. In one cancellation trial
+  per variant on each engine, the observed time from initiating the
+  fixture disconnect to confirming the backend disappeared was 407 ms
+  pooled and 153 ms dedicated on rootful Docker, and 151 ms pooled and
+  159 ms dedicated on rootless Docker. These are upper bounds that include
+  Docker and PostgreSQL observation overhead.
+- The Phase 5 rootless replay exercised cold Serve startup during a
+  PostgreSQL outage, database-independent discovery, recovery after
+  PostgreSQL restarted, original bytes, cursor consistency, and
+  cancellation by backend PID. The initial rootful run observed a capacity
+  timeout behind a background connection attempt while PostgreSQL was
+  down. The replay asserted that the read failed within its admission
+  budget and verified recovery.
+- Phases 1, 3, and 4 passed on rootful Docker. The checks covered storage
+  roles and TLS, exact restore data, generation publication, retirement,
+  garbage collection, and search deadlines. Phase 7 passed on rootless
+  Docker after the fixture preserved its MCP client across the pool
+  reconfiguration. Readiness and authenticated publication completed
+  while the public pool was full, and cancelled ripgrep workers were
+  killed and reaped with their generation fences retained.
+- The final image passed Phase 0, Phase 6, current-schema HTTPS publication,
+  and Phase 8 destructive restore on rootful Docker 29.10.1. Restore used
+  the same read-only MCP endpoint to verify original bytes and pinned
+  reads in the restored mirror. The final Serve image ID matched between
+  rootful and rootless Docker.
+- Phase 8 capacity passed with 1,000 and 10,000 synthetic RFCs and up to
+  32 clients. Both profiles peaked at eight Serve backends. In each
+  locked 32-request burst, 16 received HTTP 429, six reached the
+  PostgreSQL lock deadline, and ten exhausted the pool wait.
+  Quiescent samples had no open Serve transactions or advisory locks.
+
+### Dedicated-session comparison
+
+Three paired rootful amd64 trials used the same restored 1,000-RFC
+fixture, the same pinned PostgreSQL image and Compose resource limits,
+and 15 seconds of mixed tool traffic per concurrency level. Sync was
+stopped for the measured intervals. PostgreSQL authorization logs identified
+Serve's TLS connections and attributed disconnect diagnostics by role.
+
+Across the trials the dedicated image opened 3,090 TLS connections and
+logged 6,180 Serve disconnect diagnostics. The pooled image opened 21
+TLS connections and logged zero Serve disconnect diagnostics during
+ordinary workload and retirement. The separate forced-disconnect probe
+retained its expected diagnostics.
+
+The table shows medians across trials. Get latency includes successful
+requests. Connections per request includes admission and tool errors in
+the request count.
+
+| Clients | Connections/request dedicated → pooled | Successful requests/s dedicated → pooled | Get p50 / p95 / p99 ms dedicated → pooled |
+| ---: | --- | --- | --- |
+| 1 | 1.0000 → 0.0179 | 3.73 → 3.73 | 41.05 / 44.95 / 44.95 → 11.90 / 14.47 / 14.47 |
+| 4 | 1.0000 → 0.0134 | 14.93 → 14.93 | 40.74 / 51.14 / 54.37 → 12.23 / 15.46 / 21.18 |
+| 16 | 0.8791 → 0.0014 | 23.60 → 46.60 | 127.21 / 288.61 / 333.05 → 33.04 / 278.24 / 413.10 |
+| 32 | 0.3356 → 0.0000 | 26.53 → 46.00 | 95.45 / 287.37 / 368.87 → 102.20 / 644.34 / 758.12 |
+
+At 32 clients, median Serve CPU time rose from 9.14 s to 14.02 s and
+PostgreSQL CPU time fell from 30.78 s to 26.42 s. The median sampled peak
+memory was 12.1 MiB versus 11.4 MiB for Serve and 217.7 MiB versus 166.2 MiB
+for PostgreSQL. Mean pooled acquisition wait was 181 ms at 32 clients
+and 60 ms at 16 clients. The raw trials contain per-tool latencies and
+outcomes, CPU and memory samples, pool wait histograms, and PostgreSQL
+log counts for every profile.
+
+These results cover the local synthetic workload. The receipts
+`pool-comparison.json`, `capacity.json`, `restore.json`, cancellation
+timings, and wire logs are under `/tmp/rfc-pool-evidence.rUADb2vb` on
+the qualification host.
+
+The wire fixture and paired comparison commands use an existing
+directory under `/tmp` and a baseline Serve image built from
+`2b769d5956479c2e86ef7873d679af680e5630de`.
+
+~~~sh
+python3 -B scripts/phase5/pool.py --context "$context" --image-prefix "$prefix" \
+  --baseline-image "$baseline_serve_image" --evidence "$evidence"
+python3 -B scripts/phase8/capacity.py --context "$context" --image-prefix "$prefix" \
+  --baseline-serve-image "$baseline_serve_image" --evidence "$evidence"
+~~~

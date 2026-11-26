@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import hmac
@@ -266,11 +267,15 @@ def check_timeout(project, request):
         lock.stdin.flush()
         try:
             assert select.select([lock.stdout], [], [], 5)[0] and lock.stdout.readline().strip() == "locked"
-            result = expect_error(request, "relation::updates:100", "deadline_exceeded")
-            assert result["elapsed_us"] < 15_000_000, result
+            with ThreadPoolExecutor(max_workers=1) as work:
+                reply = work.submit(expect_error, request, "relation::updates:100", "deadline_exceeded")
+                pids = phase3.wait_for_readers(project.sql, "wait_event_type='Lock'")
+                assert len(pids) == 1, pids
+                result = reply.result()
+                assert result["elapsed_us"] < 15_000_000, result
         finally:
             lock.communicate("ROLLBACK;\n", timeout=10)
-    phase3.wait_for_sql(project, "SELECT count(*) FROM pg_stat_activity WHERE usename='rfc_serve'", "0")
+    phase3.assert_readers_idle(project.sql, gone=pids)
     assert 102 in hit_ids(page(request, "relation::updates:100"))
 
 

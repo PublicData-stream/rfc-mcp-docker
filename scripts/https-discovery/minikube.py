@@ -209,7 +209,7 @@ print(response.read().decode())
         """, "sh", self.node_work])
         return sources, writer, reader
 
-    def run(self, *, automatic):
+    def run(self, *, automatic, serve_pool=False):
         self.apply_resource({"apiVersion": "v1", "kind": "Namespace",
                              "metadata": {"name": self.namespace}})
         self.execute([*self.docker, "exec", "--user", "0", self.node,
@@ -424,12 +424,44 @@ print(response.read().decode())
         sync("sync", args=())
         self.delivered(2)
         self.delivered(1)
+        if serve_pool:
+            self.verify_serve_pool(2, sources[2119])
         print("Minikube manual publication and repair replay passed with exact MCP reads and daemon outbox delivery",
               flush=True)
         print(f"Minikube pod replacement reused {expected} TXT and "
               f"{warm['acquisition']['xml_reused']} RFCXML originals. HTTPS starts "
               f"{cold['metrics']['https_requests']} cold and {warm['metrics']['https_requests']} warm.",
               flush=True)
+
+    def verify_serve_pool(self, sequence, original):
+        readers = ("SELECT pid FROM pg_stat_activity WHERE usename='rfc_serve' "
+                   "AND backend_type='client backend' ORDER BY pid")
+        self.verify_served(sequence, original)
+        before = set(self.database("-c", readers).splitlines())
+        self.verify_served(sequence, original)
+        assert before.intersection(self.database("-c", readers).splitlines())
+
+        database = json.loads(self.kubectl("get", "pod", "postgres", "-o", "json"))
+        self.kubectl("delete", "pod/postgres", "--wait=true", "--timeout=55s", timeout=60)
+
+        def admin(path):
+            return subprocess.run([*self.kube, "exec", "serve", "--", "wget",
+                                   "-qO-", f"http://127.0.0.1:8781{path}"],
+                                  capture_output=True, timeout=8).returncode
+
+        assert admin("/live") == 0
+        assert admin("/ready") != 0
+        self.apply("Pod", "postgres", database["spec"])
+        self.kubectl("wait", "pod/postgres", "--for=condition=Ready", "--timeout=90s", timeout=95)
+        self.verify_served(sequence, original)
+        # The fixture has RestartPolicy Never so the clean exit is inspectable.
+        subprocess.run([*self.kube, "exec", "serve", "--", "sh", "-ec", "kill -TERM 1"],
+                       capture_output=True, timeout=8)
+        self.kubectl("wait", "pod/serve", "--for=jsonpath={.status.phase}=Succeeded",
+                     "--timeout=25s", timeout=30)
+        assert self.database("-c", readers) == ""
+        print("Minikube Serve pool reused a backend, recovered after PostgreSQL restart, "
+              "and closed sessions on SIGTERM", flush=True)
 
     def add_feed_publication(self):
         entry = phase2.catalog_entry(200, "Feed-triggered publication")
@@ -458,6 +490,8 @@ def main():
     parser.add_argument("--profile", required=True, help="dedicated single-node Docker Minikube profile")
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", required=True)
+    parser.add_argument("--serve-pool", action="store_true",
+                        help="qualify Serve pool lifecycle after the manual publication probe")
     for stage in ("spool", "audit"):
         parser.add_argument(f"--{stage}-node-dir", required=True,
                             help="private disk-backed mount beneath the Minikube node's /tmp")
@@ -473,7 +507,7 @@ def main():
             probe = Probe(args.profile, args.context, args.image_prefix, Path(work),
                           args.spool_node_dir, args.audit_node_dir)
             try:
-                probe.run(automatic=automatic)
+                probe.run(automatic=automatic, serve_pool=args.serve_pool)
             except Exception:
                 subprocess.run([*probe.kube, "get", "pods"], check=False, timeout=15)
                 for name in ("stock-sync", "serve", "sync", "feed"):

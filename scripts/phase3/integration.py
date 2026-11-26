@@ -151,6 +151,38 @@ def wait_for_sql(project, query, expected):
     raise AssertionError(f"waiting for {expected}: {query}")
 
 
+READER_SESSIONS = ("FROM pg_stat_activity WHERE usename='rfc_serve' "
+                   "AND backend_type='client backend'")
+
+
+def reader_pids(sql, predicate="true"):
+    return {int(pid) for pid in sql(f"SELECT pid {READER_SESSIONS} AND ({predicate})").splitlines()}
+
+
+def wait_for_readers(sql, predicate):
+    expiry = time.monotonic() + 2.3
+    while time.monotonic() < expiry:
+        pids = reader_pids(sql, predicate)
+        if pids:
+            return pids
+        time.sleep(0.035)
+    raise AssertionError(f"Serve backends did not reach {predicate}")
+
+
+def assert_readers_idle(sql, *, gone=(), max_connections=8):
+    gone = set(gone)
+    expiry = time.monotonic() + 2.3
+    while time.monotonic() < expiry:
+        sessions = reader_pids(sql)
+        unsafe = reader_pids(sql, "state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL "
+                             "OR EXISTS (SELECT FROM pg_locks WHERE locktype='advisory' "
+                             "AND pg_locks.pid=pg_stat_activity.pid)")
+        if not (gone & sessions or unsafe) and len(sessions) <= max_connections:
+            return sessions
+        time.sleep(0.035)
+    raise AssertionError({"sessions": sessions, "busy_or_locked": unsafe, "must_be_gone": gone})
+
+
 def upgrade(project):
     migration = (phase2.REPO / "migrations" / "migrate.sql").read_text().split("SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 3)")[0]
     migration = migration.replace(r"\ir 0001-storage.sql", r"\i /migrations/0001-storage.sql").replace(
