@@ -434,8 +434,13 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
                 assert request.stdout.readline().strip() == "sent"
             try:
                 wait_workers(2)
+                # The last query before starting a worker loads its notices.
+                # Readiness and other pool lanes also use short transactions.
                 pids = phase5.phase3.wait_for_readers(
-                    lambda query: self.sql("-c", query), "state='idle in transaction'")
+                    lambda query: self.sql("-c", query),
+                    "state='idle in transaction' AND "
+                    "query LIKE '%FROM rfc.notice_ranges WHERE document_version=%'",
+                )
                 assert len(pids) == 2, pids
                 self.client.call("rg", **arguments, _error="resource_limit_exceeded")
             finally:

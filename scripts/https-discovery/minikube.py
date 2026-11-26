@@ -140,11 +140,17 @@ print(response.read().decode())
 
     def verify_policy_replicas(self, serve, expected):
         secondary = "serve-secondary"
-        self.service(secondary, [8780])
-        serve(secondary)
-        self.kubectl("wait", f"pod/{secondary}", "--for=condition=Ready", "--timeout=55s")
-        for service in ("serve", secondary):
-            result = self.mcp(service, "get", id=2119, format="base64")
+
+        def start_secondary():
+            serve(secondary)
+            self.kubectl("wait", f"pod/{secondary}", "--for=condition=Ready", "--timeout=55s")
+            ready = [*self.kube, "exec", secondary, "--", "wget", "-qO-", "http://127.0.0.1:8781/ready"]
+            phase6.wait(lambda: subprocess.run(ready, capture_output=True, timeout=10).returncode == 0)
+            return self.kubectl("get", f"pod/{secondary}", "-o", "jsonpath={.status.podIP}")
+
+        replica = start_secondary()
+        for target in ("serve", replica):
+            result = self.mcp(target, "get", id=2119, format="base64")
             assert not result["isError"], result
             assert phase6.phase5.bytes_from(result["structuredContent"]["original"]) == expected
         cursor = self.mcp("serve", "list", limit=1)["structuredContent"]["next_cursor"]
@@ -153,17 +159,17 @@ print(response.read().decode())
                                   "--rfc", "2119", "--ceiling", "metadata_only", "--reason", "rights_revoked",
                                   "--review-ref", "private Minikube fixture", "--expect-epoch", "0")
         assert "rights epoch 1" in restricted, restricted
-        def denied(service):
-            result = self.mcp(service, "get", id=2119)
+
+        def denied(target):
+            result = self.mcp(target, "get", id=2119)
             assert result["isError"] and result["structuredContent"]["code"] == "source_policy_restricted", result
+
         denied("serve")
-        denied(secondary)
-        resumed = self.mcp(secondary, "list", limit=1, cursor=cursor)
+        denied(replica)
+        resumed = self.mcp(replica, "list", limit=1, cursor=cursor)
         assert resumed["isError"] and resumed["structuredContent"]["code"] == "cursor_expired", resumed
         self.kubectl("delete", "pod", secondary, "--timeout=55s")
-        serve(secondary)
-        self.kubectl("wait", f"pod/{secondary}", "--for=condition=Ready", "--timeout=55s")
-        denied(secondary)
+        denied(start_secondary())
         print("Minikube applied rights restrictions across two Serve replicas and pod replacement", flush=True)
 
     def delivered(self, sequence):

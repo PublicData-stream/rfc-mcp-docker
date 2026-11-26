@@ -67,8 +67,11 @@ rfc-mcp-docker-sync policy explain --rfc 8174
 
 Review representative positives and negatives, inspect unresolved evidence,
 and record maintainer approval of each applicable permissive rule and the
-complete audit report. Before disclosing text under the new policy, validate
-the candidate over the normal MCP transport and record the rollout decision.
+complete audit report. For a schema 11 backup, verify the backup's origin
+against the independent operator inventory. The fixture provenance marker
+is available on format-4 generations. Before disclosing text under the
+new policy, validate the candidate over the normal MCP transport and record
+the rollout decision.
 Install the matching Sync build and pin the reviewed registry in the target
 database using the report. The review reference identifies the maintainer's
 approval of the exact report and bundle. Keep reports and their attestation

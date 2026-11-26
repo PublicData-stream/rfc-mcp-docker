@@ -1906,3 +1906,109 @@ python3 -B scripts/phase5/pool.py --context "$context" --image-prefix "$prefix" 
 python3 -B scripts/phase8/capacity.py --context "$context" --image-prefix "$prefix" \
   --baseline-serve-image "$baseline_serve_image" --evidence "$evidence"
 ~~~
+
+## Automated source policy
+
+Sync records immutable source-policy receipts in schema 12 and binds the
+registry to format-4 manifests. Serve requires receipt-backed excerpt
+rights and checks the database rights epoch before releasing buffered MCP
+tool responses. Private Sync commands audit a generation, explain an RFC,
+pin an approved registry, or tighten an RFC's rights ceiling.
+
+### Official sample check
+
+The fixture driver read the official RFC Index and exact original TXT
+over a local path. It classified the following samples prospectively,
+before any registry pin. The table records the classifier output for
+these samples.
+
+| RFCs | Proposed decision | Evidence |
+| --- | --- | --- |
+| 2119 | `whole_only` | Exact-digest manual whole-document review |
+| 7540, 8174, 9000 | `excerpt_allowed` | IETF TLP 5.0 template, verified bylines and original notice ranges |
+| 6749 | `metadata_only` | TLP 4.0 template review pending |
+| 8446, 9110 | `metadata_only` | Unresolved pre-5378 material |
+| 5743, 5744, 5745 | `metadata_only` | Conflicting legal terms detected by the conservative scanner |
+| 8720, 8726, 8763 | `metadata_only` | IAB, Independent, and IRTF rule review pending |
+
+The sample index and originals were fetched over paced HTTPS. The
+sample classification exercises the policy engine. Production eligibility
+requires a complete private corpus audit with audited source proofs,
+maintainer review, and the exact approved pin. The full audit is pending
+a supplied verified corpus snapshot.
+
+### Local verification
+
+The frozen Rust gate, all-feature Clippy and tests, and Phase 8 HTTP smoke
+passed on native Linux amd64. The policy tests cover RFC 8174's manual
+fallback and automatic candidate receipt, exact CRLF contributor and
+authorship ranges, and unsupported or conflicting evidence. PostgreSQL
+19 applied schema 12 twice in a disposable cluster.
+
+- Rootless Compose Phase 0 passed the stock wire, database role, TLS,
+  and confinement checks. Phase 4 passed the generated graph oracle,
+  the 10,000-RFC search probe and receipt-backed snippet checks.
+- Phase 5 passed all five MCP tools. An isolated fixture pin enabled
+  RFC 8174 exact-byte excerpts with complete notices. The production
+  approval command rejected the fixture audit. A pending response
+  blocked at the rights fence was discarded after revocation. Earlier
+  cursors expired and rollback to the affected retained generation
+  was rejected.
+- The populated schema 11 fixture from `fb14073` migrated twice.
+  The original format-3 manifest, sequence, and whole-document reads
+  survived. Sync refused to publish a ready pre-upgrade candidate,
+  reused verified TXT for the format-4 replacement, and rolled back
+  to the retained generation with exact originals.
+- The HTTPS publication probe passed audit, sequence, rollback,
+  exact read, and recovery checks. The fault probe passed the stock
+  fixture guard, required HTTPS timeout, audit filesystem exhaustion,
+  and database disconnect cases.
+- Phase 7 passed production confinement, pool-lane isolation, worker
+  cancellation and fence release, and simulated Landlock refusal.
+  The worker count initially included an unrelated transaction.
+  The corrected probe selects the notice query held by the stalled
+  worker and still requires both sessions to release their fences.
+- The Phase 8 destructive restore verified 16 blobs, 773 byte ranges
+  and line starts, and three manifests. It preserved the active
+  sequence and enforced the restored restriction at rights epoch 1.
+- Rootless Minikube passed manual and Feed-triggered audited
+  publication. Two Serve pods observed the same committed rights
+  restriction, an older cursor expired on the second pod, and the
+  restriction survived replacing that pod. The disposable cluster
+  and staging mounts were removed after the check. The first attempt
+  briefly refused the connection to a new Service endpoint. The
+  corrected probe waits for application readiness and addresses the
+  replica directly.
+
+See the [source-policy operator guide](source-policy.md) for the
+review, activation, restriction, and recovery procedure.
+
+### Repeat the focused checks
+
+Use native images from the current checkout, a historical
+`phase3-fixture` image from `fb14073` for the populated upgrade,
+and private evidence and staging paths under `/tmp`. Isolate the
+historical and current BuildKit Cargo caches.
+
+~~~sh
+export TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target RFC_E2E_PRELOADED=1
+scripts/phase0/check-rust.sh
+cargo clippy --workspace --all-targets --all-features --frozen -- -D warnings
+cargo test --workspace --all-features --frozen
+python3 -B scripts/phase8/http-smoke.py
+python3 -B scripts/phase0/integration.py --context rootless --project "$prefix" --skip-build
+python3 -B scripts/phase4/integration.py --context rootless --image-prefix "$prefix" --skip-fixture-build
+python3 -B scripts/phase5/integration.py --context rootless --image-prefix "$prefix"
+python3 -B scripts/https-discovery/integration.py --context rootless --image-prefix "$prefix" \
+  --upgrade-from-schema11 "$schema11_prefix"
+python3 -B scripts/phase7/integration.py --context rootless --image-prefix "$prefix"
+python3 -B scripts/https-discovery/integration.py --context rootless --image-prefix "$prefix" --publication-only
+python3 -B scripts/https-discovery/integration.py --context rootless --image-prefix "$prefix" --faults-only
+python3 -B scripts/phase8/integration.py --context rootless --image-prefix "$prefix" --evidence "$restore_dir"
+~~~
+
+Run `scripts/https-discovery/minikube.py` with a disposable rootless
+Docker profile, `--image-prefix "$prefix"`, and the disk-backed spool
+and audit node paths. Use the `policy-check-sample` fixture command
+with the RFC Index, original TXT file, and RFC number to repeat a
+prospective official sample decision.
