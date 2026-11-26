@@ -6,6 +6,7 @@ use serde::Serialize;
 pub const FORMAT_VERSION: i32 = 1;
 pub const INGESTION_FORMAT_VERSION: i32 = 2;
 pub const AUDIT_FORMAT_VERSION: i32 = 3;
+pub const POLICY_FORMAT_VERSION: i32 = 4;
 
 /// RFC number, TXT digest, document-version identity, catalog metadata identity.
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -42,11 +43,14 @@ pub struct Manifest {
     pub coverage: Vec<Coverage>,
     pub ingestion: Option<Ingestion>,
     pub audit: Option<Audit>,
+    pub policy: Option<(String, String, bool)>,
 }
 
 impl Manifest {
     pub fn version(&self) -> i32 {
-        if self.audit.is_some() {
+        if self.policy.is_some() {
+            POLICY_FORMAT_VERSION
+        } else if self.audit.is_some() {
             AUDIT_FORMAT_VERSION
         } else if self.ingestion.is_some() {
             INGESTION_FORMAT_VERSION
@@ -70,8 +74,19 @@ impl Manifest {
             self.edges,
             self.coverage,
         );
-        let bytes = match (self.ingestion, self.audit) {
-            (Some(ingestion), Some(audit)) => serde_json::to_vec(&(
+        let bytes = match (self.ingestion, self.audit, self.policy) {
+            (Some(ingestion), Some(audit), Some(policy)) => serde_json::to_vec(&(
+                POLICY_FORMAT_VERSION,
+                inputs.0,
+                inputs.1,
+                inputs.2,
+                inputs.3,
+                inputs.4,
+                ingestion,
+                audit,
+                policy,
+            )),
+            (Some(ingestion), Some(audit), None) => serde_json::to_vec(&(
                 AUDIT_FORMAT_VERSION,
                 inputs.0,
                 inputs.1,
@@ -81,7 +96,7 @@ impl Manifest {
                 ingestion,
                 audit,
             )),
-            (Some(ingestion), None) => serde_json::to_vec(&(
+            (Some(ingestion), None, None) => serde_json::to_vec(&(
                 INGESTION_FORMAT_VERSION,
                 inputs.0,
                 inputs.1,
@@ -90,7 +105,7 @@ impl Manifest {
                 inputs.4,
                 ingestion,
             )),
-            (None, None) => serde_json::to_vec(&(
+            (None, None, None) => serde_json::to_vec(&(
                 FORMAT_VERSION,
                 inputs.0,
                 inputs.1,
@@ -98,7 +113,7 @@ impl Manifest {
                 inputs.3,
                 inputs.4,
             )),
-            (None, Some(_)) => unreachable!("audit evidence requires ingestion metadata"),
+            _ => unreachable!("audit and policy evidence require ingestion metadata"),
         }
         .expect("manifest contains only JSON primitives and arrays");
         let digest = BlobDigest::hash(&bytes);
@@ -140,6 +155,7 @@ mod tests {
             )],
             ingestion: None,
             audit: None,
+            policy: None,
         }
     }
 

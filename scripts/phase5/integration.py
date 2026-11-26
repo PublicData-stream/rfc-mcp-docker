@@ -2,6 +2,7 @@
 """Verify the production server binary over MCP in disposable private Compose."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -72,7 +73,12 @@ class Project(phase3.Project):
         }
         catalog = self.source / "catalog.xml"
         entries = "".join(phase2.catalog_entry(rfc, title) for rfc, (_, title) in additions.items())
-        catalog.write_text(catalog.read_text().replace("</rfc-index>", entries + "</rfc-index>"))
+        old = phase2.catalog_entry(8174, "RFC 8174", "<updates><doc-id>RFC2119</doc-id></updates>")
+        verified = old.replace("<date>", "<author><name>B. Leiba</name></author><date>")
+        verified = verified.replace("<year>2026</year>", "<year>2017</year>").replace("<stream>IRTF", "<stream>IETF")
+        index = catalog.read_text()
+        assert old in index
+        catalog.write_text(index.replace(old, verified).replace("</rfc-index>", entries + "</rfc-index>"))
         for rfc, payload in [(101, BINARY), *((rfc, pair[0]) for rfc, pair in additions.items())]:
             sources[rfc] = payload
             for transport in ("https", "rsync"):
@@ -86,6 +92,14 @@ class Project(phase3.Project):
                             policy="whole_paginated" if rfc in {101, 105, 106} else "excerpt_allowed")
             if notice:
                 override["notices"] = [dict(category="copyright", start_byte=0, end_byte=len(notice))]
+            else:
+                original = sources[rfc]
+                start = original.index(b"Copyright (c)")
+                end = original.index(b"\r\n\r\n1. Duplicate")
+                override["notices"] = [dict(category="copyright", start_byte=start, end_byte=end)]
+                override["attribution"] = "Fixture Author"
+                override["license"] = dict(family="test", version="1", section="fixture",
+                                           url="https://example.invalid/fixture-license")
             registry["overrides"].append(override)
         (Path(self.env["PHASE5_DIR"]) / "fixture-policy.json").write_text(json.dumps(registry))
         return sources
@@ -494,6 +508,88 @@ def publication(project, client, first, get_cursor, rg_page):
     client.call("get", id=105, cursor=get_cursor, _error="generation_unavailable")
     client.call("rg", **rg_args, cursor=rg_cursor, _error="generation_unavailable")
     print("Fresh reads and authenticated continuations passed publication, rollback and retirement", flush=True)
+    return second
+
+
+def policy_revocation(project, client, retained):
+    audit = project.app("sync", "-T", args=("policy", "audit", "--format", "json"))
+    report = json.loads(subprocess.check_output(audit, env=project.env, timeout=40))
+    assert report["complete"] and report["full"] and report["fixture"], report
+    assert report["total_documents"] == len(report["rows"]), report
+    proposed = next(row for row in report["rows"] if row["rfc"] == 8174)
+    assert proposed["current"] == "whole_only" and proposed["proposed"] == "excerpt_allowed", proposed
+    path = Path(project.env["PHASE5_DIR"]) / "candidate-audit.json"
+    path.write_text(json.dumps(report))
+    approve = project.app("sync", "-T", "-v", f"{path}:/phase5/candidate-audit.json:ro",
+                          args=("policy", "approve", "--registry", report["registry_digest"], "--audit-report",
+                                "/phase5/candidate-audit.json", "--review-ref", "private test report"))
+    attempt = subprocess.run(approve, env=project.env, capture_output=True, text=True, timeout=40)
+    assert attempt.returncode and "official-corpus report" in attempt.stderr, attempt
+    assert project.sql("SELECT registry_digest IS NULL FROM rfc.policy_state") == "t"
+    explain = project.app("sync", "-T", args=("policy", "explain", "--rfc", "102"))
+    receipt = json.loads(subprocess.check_output(explain, env=project.env, timeout=40))
+    assert receipt["current_receipt"]["decision"] == "excerpt_allowed", receipt
+    assert receipt["proposed_receipt"]["decision"] == "metadata_only", receipt
+    client.call("get", id=8174, range={"start_byte": 0, "end_byte": 32}, _error="source_policy_restricted")
+
+    # A local fixture pin exercises automatic promotion. The production CLI
+    # rejects the same fixture audit above.
+    project.sql("""
+        SELECT rfc.approve_policy(p.registry_digest,p.classifier,g.manifest_digest,g.manifest_digest,
+                                  'isolated fixture only')
+        FROM rfc.active_generation a JOIN rfc.generation_policy p ON p.generation_id=a.generation_id
+        JOIN rfc.generations g ON g.id=a.generation_id
+    """)
+    third = int(project.reconcile()["generation_id"])
+    project.activate(third, 4)
+    result = client.call("get", id=8174, range={"start_byte": 0, "end_byte": 32})[0]
+    original = (phase2.REPO / "fixtures/rfc/rfc8174.txt").read_bytes()
+    assert bytes_from(result["original"]) == original[:32]
+    group = result["notice_groups"][0]
+    assert group["policy"] == {"decision": "excerpt_allowed", "approval_method": "automatic", "rule_id": "ietf-tlp-5"}
+    assert group["attribution"] == "IETF, RFC 8174, Barry Leiba"
+    assert group["license"]["section"] == "3.c(iii)"
+    for notice in group["notices"]:
+        assert bytes_from(notice) == original[notice["start_byte"]:notice["end_byte"]]
+    first = client.call("get", id=105, max_bytes=16)[0]
+    cursor = first["next_cursor"]
+    assert cursor
+    assert first["notice_groups"][0]["policy"]["decision"] == "whole_paginated"
+
+    # Hold the writer fence until the HTTP response is waiting at its final
+    # authorization check. The reader has already selected the original.
+    with subprocess.Popen(project.psql(), env=project.env, text=True, bufsize=1,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as sql:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                sql.stdin.write("BEGIN; SET LOCAL ROLE rfc_sync; SELECT pg_try_advisory_xact_lock(-4::bigint);\n")
+                sql.stdin.flush()
+                assert sql.stdout.readline().strip() == "t"
+                pending = executor.submit(client.call, "get", id=105, max_bytes=16,
+                                          _error="source_policy_restricted")
+                query = ("SELECT EXISTS (SELECT FROM pg_locks WHERE locktype='advisory' "
+                         "AND objid=4294967292::oid AND mode='ShareLock' AND NOT granted)")
+                deadline = time.monotonic() + 8
+                while project.sql(query) != "t":
+                    assert not pending.done() and time.monotonic() < deadline
+                    time.sleep(0.05)
+                sql.stdin.write("SELECT rfc.restrict_policy(105,'metadata_only','rights_revoked',"
+                                "'isolated synthetic qualification',0); COMMIT;\n")
+                sql.stdin.flush()
+                assert sql.stdout.readline().strip() == "1"
+                pending.result(timeout=12)
+            finally:
+                sql.stdin.close()
+                sql.stdin = None
+                _, errors = sql.communicate(timeout=12)
+                assert sql.returncode == 0, errors
+    client.call("get", id=105, cursor=cursor, _error="cursor_expired")
+    client.call("get", id=105, _error="source_policy_restricted")
+    assert client.call("get", id=2119)[0]["original"]
+    project.activate(retained, 5, "rollback", error="rollback would restore revoked permissions")
+    denied = client.call("table", id=105)[0]
+    assert all("original_heading" not in section for section in denied["sections"])
+    print("Policy audit, receipt, buffered revocation and stale cursor checks passed", flush=True)
 
 
 def upgrade(project):
@@ -514,12 +610,12 @@ def upgrade(project):
                 'fixture-v4', 'fixture-v4', 'utf8', 'complete', 'complete', 'whole_only',
                 decode(repeat('7c', 32), 'hex'), true)
     """)
-    record = "SELECT to_jsonb(d) FROM rfc.document_versions d WHERE rfc_id=98765"
+    record = "SELECT to_jsonb(d) - 'policy_receipt' FROM rfc.document_versions d WHERE rfc_id=98765"
     before = project.sql(record)
     project.check("serve", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "\n".join(map(str, range(1, 12)))
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "\n".join(map(str, range(1, 13)))
     assert project.sql(record) == before
 
 
@@ -572,7 +668,8 @@ def main():
             project.run("exec", "-T", "proxy", "python3", "-B", "/phase5/direct.py", "trusted")
             cancellation(project, client)
             database_restart(project, client)
-            publication(project, client, first, cursor, rg_page)
+            retained = publication(project, client, first, cursor, rg_page)
+            policy_revocation(project, client, retained)
             project.env.update(
                 PHASE5_CLIENT_IP_HEADER="X-Forwarded-For",
                 PHASE5_CLIENT_IP_HEADER_MODE="chain",

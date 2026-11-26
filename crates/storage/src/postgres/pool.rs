@@ -469,6 +469,40 @@ impl ServePool {
         result.into_result()
     }
 
+    /// Authorize handoff of a buffered response under the database rights fence.
+    pub async fn authorize_response<T>(
+        &self,
+        expected: i64,
+        deadline: Instant,
+        response: impl FnOnce() -> T,
+    ) -> Result<Option<T>> {
+        let class = PoolClass::Public;
+        let mut lease = self.acquire(class, deadline).await?;
+        let client = lease.session.client.as_mut().expect("leased client");
+        let result = timeout_at(deadline, async {
+            let tx = client.build_transaction().read_only(true).start().await?;
+            tx.query_one(
+                "SELECT pg_catalog.pg_advisory_xact_lock_shared($1)",
+                &[&crate::policy::RIGHTS_LOCK],
+            )
+            .await?;
+            let epoch: i64 = tx
+                .query_one(
+                    "SELECT rights_epoch FROM rfc.policy_state WHERE singleton",
+                    &[],
+                )
+                .await?
+                .try_get(0)?;
+            let output = (epoch == expected).then(response);
+            tx.commit().await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(output)
+        })
+        .await
+        .map_err(|_| PoolError::Deadline)??;
+        self.release(class, lease.session);
+        Ok(result)
+    }
+
     pub async fn active(&self, deadline: Instant) -> Result<(Option<GenerationId>, i64)> {
         let class = PoolClass::Notification;
         let mut lease = self.acquire(class, deadline).await?;

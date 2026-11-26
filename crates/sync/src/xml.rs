@@ -28,6 +28,8 @@ pub(crate) struct Entry {
     pub month: Option<String>,
     pub status: Option<String>,
     pub has_txt: bool,
+    #[serde(skip)]
+    pub authors: Vec<String>,
 }
 
 pub(crate) struct CatalogEdge {
@@ -76,6 +78,12 @@ pub(crate) fn catalog(bytes: &[u8]) -> Result<Catalog> {
         }
         let title = cat_text(node, "title")?.ok_or("missing RFC catalog title")?;
         let stream = cat_text(node, "stream")?.map(str::to_owned);
+        let authors = node
+            .children()
+            .filter(|child| child.has_tag_name((CATALOG_NS, "author")))
+            .filter_map(|author| cat_text(author, "name").transpose())
+            .map(|name| name.map(str::to_owned))
+            .collect::<Result<Vec<_>>>()?;
         let status = cat_text(node, "current-status")?.map(str::to_owned);
         let (date, month) = publication_date(node)?;
         let has_txt = match single(node, (CATALOG_NS, "format"))? {
@@ -132,6 +140,7 @@ pub(crate) fn catalog(bytes: &[u8]) -> Result<Catalog> {
                 month,
                 status,
                 has_txt,
+                authors,
             },
         );
     }

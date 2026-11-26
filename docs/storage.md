@@ -82,3 +82,12 @@ python3 scripts/phase1/integration.py --image-prefix rfc-phase1-regression
 ```
 
 The Phase 1 runner makes two disposable Compose projects and keeps fixture inputs, credentials, dumps, and named-volume backing data under `/tmp`. It captures a quiescent database dump and the reachable blobs, initializes provisioned roles and database grants in the fresh project, imports blobs by digest, then restores schema, ownership, grants, and rows. The read repository checks all fixture manifests and byte ranges in the restored project. The fixture-only binary is built as a separate Docker target.
+
+## Source policy receipts
+
+Schema 12 stores immutable decision receipts. The document version references
+the receipt with a composite foreign key for its RFC, TXT digest and policy.
+The receipt is part of the BLAKE3 document identity, and manifest format 4
+binds the generation's registry and classifier. Historical manifests keep
+their original format and identity. Unreferenced receipts are removed by
+guarded garbage collection. The rights ledger persists independently.

@@ -96,3 +96,12 @@ The [Phase 8 restore probe](../scripts/phase8/integration.py) exercised distinct
 | curl 8.18.0 over HTTP/1.1 | HTTP 200 at `2026-07-28` | HTTP 400, unsupported | HTTP 405, unsupported |
 
 Other clients need to support the pinned request metadata and headers, including direct calls without initialization. Legacy initialization, stdio, and standalone HTTP+SSE are unsupported. Hosted clients require their own integration test. [Observed Phase 8 results](implementation-status.md#phase-8)
+
+## Receipt-backed notices
+
+A partial original points to a complete notice group in the same response.
+A receipt-backed group can include `license` with its family, version,
+section and URL, and `policy` with its effective decision, method and rule.
+Use the supplied attribution and notices when redistributing an excerpt.
+Notices count toward the 256 KiB wire limit. A rights change expires earlier
+cursors. [Source policy](source-policy.md)

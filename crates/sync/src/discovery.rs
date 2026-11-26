@@ -150,7 +150,7 @@ pub async fn reconcile_audited_fixture(scope: Scope, reviews: Option<&str>) -> R
     let config = SyncConfig::load()?;
     let upstream = Upstream::discovery_fixture(config.ingestion.https)?
         .with_parsers(config.ingestion.pipeline.parser_workers);
-    let registry = reviews.map(serde_json::from_str).transpose()?;
+    let registry = reviews.map(Registry::fixture).transpose()?;
     reconcile_standalone(scope, config, upstream, registry).await
 }
 
@@ -530,10 +530,21 @@ async fn discover(
     }
     report.local_https_txt_audit_pending = local_with_https;
     report.local_txt_needs_https = local_without_https;
-    let registry = match registry {
+    let mut registry = match registry {
         Some(registry) => registry,
         None => Registry::load()?,
     };
+    let classifier = rfc_storage::policy::CLASSIFIER;
+    registry.approved = writer
+        .client
+        .query_one(
+            "SELECT coalesce(registry_digest = $1::bytea AND classifier = $2, false)
+         FROM rfc.policy_state WHERE singleton",
+            &[&registry.digest.as_bytes().as_slice(), &classifier],
+        )
+        .await?
+        .try_get(0)?;
+    let registry_digest = registry.digest.to_string();
     let scope_name = scope.as_str();
     let checkpoint = Context {
         scope: scope_name,
@@ -546,7 +557,9 @@ async fn discover(
                 POLICY,
                 PARSER,
                 INDEX,
-                &registry.version,
+                &registry_digest,
+                classifier,
+                registry.approved,
                 active,
                 sequence,
             ),
@@ -575,10 +588,7 @@ async fn discover(
 
     let mut reuse_xml = if let Some(active) = active {
         shutdown
-            .until(
-                deadline,
-                load_prior_xml(writer, active, catalog_digest, &registry.version),
-            )
+            .until(deadline, load_prior_xml(writer, active, catalog_digest))
             .await?
     } else {
         BTreeMap::new()
@@ -617,7 +627,8 @@ async fn discover(
                 "policy_version": POLICY,
                 "parser_version": PARSER,
                 "index_version": INDEX,
-                "registry_version": registry.version,
+                "registry_digest": registry_digest,
+                "classifier": classifier,
             }),
             expected: expected.into_iter().collect(),
             txt: reuse_txt,
@@ -673,7 +684,8 @@ async fn discover(
                 .ok_or("missing inventory digest")?,
             sequence,
             catalog: &catalog,
-            registry_version: &registry.version,
+            registry_digest: registry.digest,
+            fixture: upstream.is_fixture(),
             before: &before,
             after: &after,
             documents,
@@ -802,7 +814,6 @@ async fn load_prior_xml(
     writer: &Writer,
     generation: i64,
     catalog: BlobDigest,
-    registry: &str,
 ) -> Result<BTreeMap<RfcNumber, Original>> {
     let rows = writer
         .client
@@ -819,18 +830,17 @@ async fn load_prior_xml(
          LEFT JOIN rfc.generation_source_evidence e
            ON (e.generation_id, e.rfc_id) = (d.generation_id, d.rfc_id)
          WHERE d.generation_id = $1 AND c.raw_digest = $2::bytea
-           AND g.parser_version = $3 AND g.index_version = $4 AND i.policy_registry = $5
+           AND g.parser_version = $3 AND g.index_version = $4
            AND o.kind = 'rfcxml' AND o.https_verification = 'verified'
            AND (e.generation_id IS NULL OR e.rfcxml_outcome = 'captured')
            AND o.source_url = 'https://www.rfc-editor.org/rfc/rfc' || d.rfc_id || '.xml'
            AND o.fetched_at BETWEEN clock_timestamp() - interval '24 hours' AND clock_timestamp()
-         ORDER BY d.rfc_id LIMIT $6",
+         ORDER BY d.rfc_id LIMIT $5",
             &[
                 &generation,
                 &catalog.as_bytes().as_slice(),
                 &PARSER,
                 &INDEX,
-                &registry,
                 &(MAX_CATALOG_ENTRIES as i64 + 1),
             ],
         )

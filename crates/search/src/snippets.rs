@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rfc_core::{BlobDigest, RfcNumber};
+use rfc_storage::policy::{MAX_NOTICE_BYTES, MAX_NOTICES, Policy, Receipt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_postgres::{Row, Transaction};
@@ -15,8 +16,6 @@ use crate::{
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOKEN_SOURCE_BYTES: usize = 256 * 1024;
-const MAX_NOTICE_BYTES: usize = 64 * 1024;
-const MAX_NOTICES: usize = 128;
 const MAX_EXCERPTS: usize = 8;
 const START: u8 = 1;
 const STOP: u8 = 2;
@@ -33,7 +32,8 @@ pub(crate) struct Source {
     pub url: String,
     pub version: Vec<u8>,
     pub encoding: String,
-    pub policy: String,
+    pub policy: Policy,
+    receipt: Option<Receipt>,
     pub notice_state: String,
     pub verification: Option<SourceVerification>,
 }
@@ -76,18 +76,58 @@ impl SourceVerification {
 
 impl Source {
     pub fn from_row(row: &Row) -> Result<Self, SearchError> {
+        let rfc = RfcNumber::new(row.get(0)).ok_or(SearchError::Unavailable)?;
+        let digest = BlobDigest::from_bytes(
+            row.get::<_, &[u8]>(3)
+                .try_into()
+                .map_err(|_| SearchError::Unavailable)?,
+        );
+        let base = Policy::parse(row.get::<_, &str>(6)).unwrap_or(Policy::MetadataOnly);
+        let receipt = match (
+            row.try_get::<_, Option<&[u8]>>("policy_identity")?,
+            row.try_get::<_, Option<&str>>("policy_evidence")?,
+        ) {
+            (None, None) => None,
+            (Some(identity), Some(evidence)) => {
+                let receipt: Receipt =
+                    serde_json::from_str(evidence).map_err(|_| SearchError::Unavailable)?;
+                if receipt
+                    .digest()
+                    .map_err(|_| SearchError::Unavailable)?
+                    .as_bytes()
+                    .as_slice()
+                    != identity
+                    || receipt.rfc != rfc.get()
+                    || receipt.source_digest != digest.to_string()
+                    || receipt.decision != base
+                {
+                    return Err(SearchError::Unavailable);
+                }
+                Some(receipt)
+            }
+            _ => return Err(SearchError::Unavailable),
+        };
+        let ceiling = row
+            .try_get::<_, Option<&str>>("policy_ceiling")?
+            .map_or(Ok(Policy::ExcerptAllowed), |cap| {
+                Policy::parse(cap).ok_or(SearchError::Unavailable)
+            })?;
+        let policy = if base == Policy::ExcerptAllowed
+            && !receipt.as_ref().is_some_and(Receipt::eligible_for_excerpt)
+        {
+            Policy::MetadataOnly
+        } else {
+            base.min(ceiling)
+        };
         Ok(Self {
-            rfc: RfcNumber::new(row.get(0)).ok_or(SearchError::Unavailable)?,
+            rfc,
             title: row.get(1),
             stream: row.get(2),
-            digest: BlobDigest::from_bytes(
-                row.get::<_, &[u8]>(3)
-                    .try_into()
-                    .map_err(|_| SearchError::Unavailable)?,
-            ),
+            digest,
             length: usize::try_from(row.get::<_, i64>(4)).map_err(|_| SearchError::Unavailable)?,
             encoding: row.get(5),
-            policy: row.get(6),
+            policy,
+            receipt,
             notice_state: row.get(7),
             url: row.get(8),
             version: row.get(9),
@@ -100,7 +140,9 @@ impl Source {
     }
 
     pub fn permits_excerpt(&self) -> bool {
-        self.policy == "excerpt_allowed" && self.notice_state == "complete" && self.stream.is_some()
+        self.policy == Policy::ExcerptAllowed
+            && self.notice_state == "complete"
+            && self.stream.is_some()
     }
 
     pub fn notice_group(
@@ -115,11 +157,29 @@ impl Source {
             source_verification: self.verification.clone(),
             source_name: "RFC Editor",
             stream: self.stream.clone(),
-            attribution: if self.stream.as_deref() == Some("IETF") {
-                "RFC Editor, IETF stream"
-            } else {
-                "RFC Editor"
-            },
+            attribution: self
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.attribution.clone())
+                .unwrap_or_else(|| {
+                    if self.stream.as_deref() == Some("IETF") {
+                        "RFC Editor, IETF stream".into()
+                    } else {
+                        "RFC Editor".into()
+                    }
+                }),
+            license: self
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.license.clone()),
+            policy: self
+                .receipt
+                .as_ref()
+                .map(|receipt| crate::engine::NoticePolicy {
+                    decision: self.policy,
+                    approval_method: receipt.approval_method,
+                    rule_id: receipt.rule_id.clone(),
+                }),
             digest: self.digest.to_string(),
             notices,
             included_in_whole,
@@ -147,7 +207,7 @@ pub(crate) async fn notices(
 ) -> Result<Option<Vec<OriginalRange>>, SearchError> {
     let notices = tx
         .query(
-            "SELECT start_byte::bigint,end_byte::bigint,extraction_state::text,review_state
+            "SELECT start_byte::bigint,end_byte::bigint,extraction_state::text,review_state,category
          FROM rfc.notice_ranges WHERE document_version=$1::bytea ORDER BY ordinal LIMIT 129",
             &[&source.version],
         )
@@ -155,9 +215,23 @@ pub(crate) async fn notices(
     if notices.is_empty() || notices.len() > MAX_NOTICES {
         return Ok(None);
     }
+    if source
+        .receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.notices.len() != notices.len())
+    {
+        return Ok(None);
+    }
     let mut notice_bytes = 0_usize;
     let mut notice_ranges = Vec::with_capacity(notices.len());
-    for row in notices {
+    for (ordinal, row) in notices.into_iter().enumerate() {
+        if source.receipt.as_ref().is_some_and(|receipt| {
+            let span = &receipt.notices[ordinal];
+            (span.start_byte, span.end_byte, span.category.as_str())
+                != (row.get(0), row.get(1), row.get(4))
+        }) {
+            return Ok(None);
+        }
         let start = usize::try_from(row.get::<_, i64>(0)).map_err(|_| SearchError::Unavailable)?;
         let end = usize::try_from(row.get::<_, i64>(1)).map_err(|_| SearchError::Unavailable)?;
         let review = row.get::<_, &str>(3);

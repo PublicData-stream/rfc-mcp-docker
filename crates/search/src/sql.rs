@@ -234,7 +234,10 @@ impl Plan {
             m.document_version::bytea,
             coalesce(p.method, (SELECT o.verification_method FROM rfc.source_observations o
                 WHERE o.identity=m.txt_observation LIMIT 1)) AS verification_method,
-            p.algorithm AS verification_algorithm,ARRAY[");
+            p.algorithm AS verification_algorithm, d.policy_receipt::bytea AS policy_identity,
+            receipt.receipt::text AS policy_evidence,
+            (SELECT cap.ceiling FROM rfc.policy_restrictions cap WHERE cap.rfc_id = m.rfc_id
+                ORDER BY cap.epoch DESC LIMIT 1) AS policy_ceiling,ARRAY[");
         let mut params = Vec::new();
         for (slot, leaf) in self.leaves.iter().enumerate() {
             if slot != 0 {
@@ -295,6 +298,7 @@ impl Plan {
         sql.push_str(
             "] AS predicates FROM rfc.generation_documents m
             JOIN rfc.document_versions d ON d.identity=m.document_version
+            LEFT JOIN rfc.policy_receipts receipt ON receipt.identity = d.policy_receipt
             LEFT JOIN LATERAL (
                 SELECT method, algorithm FROM rfc.generation_source_evidence p
                 WHERE (p.generation_id,p.rfc_id) = (m.generation_id,m.rfc_id) LIMIT 1
@@ -305,7 +309,7 @@ impl Plan {
             SELECT f.*,",
         );
         sql.push_str(&self.expression);
-        sql.push_str(" FROM f ORDER BY f.rfc_id");
+        sql.push_str(" AS matches FROM f ORDER BY f.rfc_id");
         Evaluation { sql, params }
     }
 }

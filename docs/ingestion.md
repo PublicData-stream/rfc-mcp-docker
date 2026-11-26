@@ -2,7 +2,7 @@
 
 Sync runs the same HTTPS-first discovery and durable processing for
 manual requests and daemon jobs. It installs original HTTPS TXT and RFCXML
-in BLAKE3 CAS, seals TXT indexes in PostgreSQL schema 11, and joins both
+in BLAKE3 CAS, seals TXT indexes in PostgreSQL schema 12, and joins both
 outcomes in the Sync coordinator. Each required TXT receives a current rsync
 audit or a fresh dual-source byte comparison. Manual reconciliation prepares
 a ready candidate. The daemon promotes its own full candidates.
@@ -247,3 +247,11 @@ See the [pinned schema 9 ingestion guide](https://github.com/PublicData-stream/r
 for the retired acquisition profiles and their benchmark commands. The
 [HTTPS-first timing decision](decisions/0010-https-first-rfc-synchronization.md#cold-start-timing)
 describes the current production pacing constraint.
+
+## Source policy decisions
+
+Sync binds the exact TXT digest, rights-relevant index metadata, template and
+verified notice ranges into a receipt. The registry and classifier identities
+are part of checkpoint selection. Policy changes reclassify verified bytes
+through normal reconciliation, with original reuse under the existing source
+evidence rules. [Audit and approval](source-policy.md#audit-and-activate-a-policy-bundle)

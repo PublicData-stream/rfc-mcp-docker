@@ -4,7 +4,7 @@ use super::Availability;
 use crate::{Writer, diagnostics::Diagnostic};
 use rfc_storage::postgres::Result;
 use serde::Serialize;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use tokio::time::timeout;
 use tokio_postgres::{IsolationLevel, Row};
 
@@ -91,6 +91,8 @@ pub(super) struct Snapshot {
     pub pending_job: Option<Job>,
     pub last_terminal_job: Option<Job>,
     pub oldest_pending_notification: Option<Notification>,
+    pub rights_epoch: i64,
+    pub policy_documents: BTreeMap<String, i64>,
 }
 
 pub(super) async fn read() -> std::result::Result<Snapshot, Availability> {
@@ -130,6 +132,29 @@ async fn snapshot() -> Result<Snapshot> {
         "SELECT publication_sequence, generation_id, attempts, (extract(epoch FROM next_attempt_at) * 1000)::bigint
          FROM rfc.notification_outbox WHERE delivery_state = 'pending' ORDER BY publication_sequence LIMIT 1", &[],
     ).await?;
+    let epoch = tx
+        .query_one(
+            "SELECT rights_epoch FROM rfc.policy_state WHERE singleton",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    let active: Option<i64> = pointer.try_get(0)?;
+    let policy_documents = tx.query(
+        "SELECT effective, count(*) FROM (
+            SELECT CASE
+                WHEN cap.ceiling = 'metadata_only' OR d.notice_policy = 'unresolved'
+                    OR (d.notice_policy = 'excerpt_allowed' AND d.policy_receipt IS NULL) THEN 'metadata_only'
+                WHEN cap.ceiling = 'whole_only' AND d.notice_policy IN ('whole_paginated','excerpt_allowed') THEN 'whole_only'
+                WHEN cap.ceiling = 'whole_paginated' AND d.notice_policy = 'excerpt_allowed' THEN 'whole_paginated'
+                ELSE d.notice_policy END AS effective
+            FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity = m.document_version
+            LEFT JOIN LATERAL (SELECT ceiling FROM rfc.policy_restrictions r WHERE r.rfc_id = m.rfc_id
+                ORDER BY epoch DESC LIMIT 1) cap ON true
+            WHERE m.generation_id = $1
+        ) counted GROUP BY effective", &[&active],
+    ).await?.into_iter().map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+        .collect::<Result<_>>()?;
     tx.commit().await?;
 
     let mut snapshot = Snapshot {
@@ -140,6 +165,8 @@ async fn snapshot() -> Result<Snapshot> {
         pending_job: None,
         last_terminal_job: None,
         oldest_pending_notification: None,
+        rights_epoch: epoch,
+        policy_documents,
     };
     for row in rows {
         let job = Job::read(row)?;

@@ -109,9 +109,8 @@ Use the [operating checks](#operate-and-recover) to match the active PostgreSQL 
 
 ### Upgrade existing volumes
 
-The upgrade starts from a populated schema 9 release and uses the current
-matching schema 11 images. Follow the same maintenance procedure for a
-schema 10 shadow stack.
+The upgrade uses matching schema 12 images. Follow this maintenance
+procedure for a populated schema 9, 10, or 11 deployment.
 
 1. Close public ingress. In the previous checkout, stop Feed, allow the
    running job to settle, stop Sync, and stop Serve. Save the previous
@@ -138,7 +137,7 @@ schema 10 shadow stack.
    compose up -d --wait rfc-mcp-docker-serve
    ~~~
 
-4. Confirm schema 11 and the backed-up sequence. Check `/ready`, an
+4. Confirm schema 12 and the backed-up sequence. Check `/ready`, an
    exact-byte MCP `get` pinned to the incumbent generation, and a read
    pinned to a retained generation. Historical evidence remains as
    recorded. Reopen ingress after verifying the serving path. Start Sync,
@@ -147,7 +146,7 @@ schema 10 shadow stack.
 
 ### Rollback
 
-For rollback within schema 11, stop Feed and Sync, read the active sequence,
+For rollback within schema 12, stop Feed and Sync, read the active sequence,
 and select a retained generation. Serve can continue handling reads.
 
 ~~~sh
@@ -352,3 +351,12 @@ Run the [Phase 8 release qualification](release-readiness.md) for the full accep
 Use the [pinned Phase 5 shadow runbook](https://github.com/PublicData-stream/rfc-mcp-docker/blob/7117e2f2ec3604358813d909204af08562d090ee/docs/deployment.md)
 or the [pinned schema 9 deployment guide](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/docs/deployment.md)
 with matching images and configuration when reproducing historical checks.
+
+## Source policy rollout
+
+Drain the schema 11 deployment, verify an independent backup, and apply
+migration 12 with matching Sync and Serve images. Check readiness and
+retained whole-document delivery. Historical receiptless excerpt decisions
+are withheld until a new version qualifies. Reconcile before promoting a new
+generation. Activate automatic grants only after the [private corpus audit
+and maintainer review](source-policy.md#audit-and-activate-a-policy-bundle).

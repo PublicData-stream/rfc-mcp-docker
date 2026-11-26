@@ -130,7 +130,7 @@ impl BlobReader {
         Ok(())
     }
 
-    pub(crate) fn generation_fence(&self, generation: GenerationId) -> io::Result<File> {
+    pub fn generation_fence(&self, generation: GenerationId) -> io::Result<File> {
         generation_fence(
             &self.root,
             generation,

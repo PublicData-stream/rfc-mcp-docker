@@ -116,26 +116,55 @@ class Probe:
         assert current == str(sequence), active
         ready = [*self.kube, "exec", "serve", "--", "wget", "-qO-", "http://127.0.0.1:8781/ready"]
         phase6.wait(lambda: subprocess.run(ready, capture_output=True, timeout=10).returncode == 0)
-        body, headers = phase6.phase5.envelope("tools/call", {
-            "name": "get", "arguments": {"id": 2119, "format": "base64"},
-        })
-        response = self.kubectl("exec", "-i", "fixtures", "--", "python3", "-B", "-c", """
-import http.client
-import json
-import sys
-body, headers = json.load(sys.stdin)
-conn = http.client.HTTPConnection("serve", 8780, timeout=10)
-conn.request("POST", "/mcp", json.dumps(body), headers)
-response = conn.getresponse()
-assert response.status == 200, response.status
-print(response.read().decode())
-""", input=json.dumps((body, headers)))
-        result = json.loads(response)["result"]
+        result = self.mcp("serve", "get", id=2119, format="base64")
         assert not result["isError"], result
         document = result["structuredContent"]
         assert document["publication_sequence"] == current and document["generation_id"] == generation
         assert document["original"]["source_verification"]["method"] == "rsync_checksum_match"
         assert phase6.phase5.bytes_from(document["original"]) == expected
+
+    def mcp(self, service, tool, **arguments):
+        body, headers = phase6.phase5.envelope("tools/call", {"name": tool, "arguments": arguments})
+        response = self.kubectl("exec", "-i", "fixtures", "--", "python3", "-B", "-c", """
+import http.client
+import json
+import sys
+service, body, headers = json.load(sys.stdin)
+conn = http.client.HTTPConnection(service, 8780, timeout=10)
+conn.request("POST", "/mcp", json.dumps(body), headers)
+response = conn.getresponse()
+assert response.status == 200, response.status
+print(response.read().decode())
+""", input=json.dumps((service, body, headers)))
+        return json.loads(response)["result"]
+
+    def verify_policy_replicas(self, serve, expected):
+        secondary = "serve-secondary"
+        self.service(secondary, [8780])
+        serve(secondary)
+        self.kubectl("wait", f"pod/{secondary}", "--for=condition=Ready", "--timeout=55s")
+        for service in ("serve", secondary):
+            result = self.mcp(service, "get", id=2119, format="base64")
+            assert not result["isError"], result
+            assert phase6.phase5.bytes_from(result["structuredContent"]["original"]) == expected
+        cursor = self.mcp("serve", "list", limit=1)["structuredContent"]["next_cursor"]
+        assert cursor
+        restricted = self.kubectl("exec", "sync", "--", "/phase6/sync", "policy", "restrict",
+                                  "--rfc", "2119", "--ceiling", "metadata_only", "--reason", "rights_revoked",
+                                  "--review-ref", "private Minikube fixture", "--expect-epoch", "0")
+        assert "rights epoch 1" in restricted, restricted
+        def denied(service):
+            result = self.mcp(service, "get", id=2119)
+            assert result["isError"] and result["structuredContent"]["code"] == "source_policy_restricted", result
+        denied("serve")
+        denied(secondary)
+        resumed = self.mcp(secondary, "list", limit=1, cursor=cursor)
+        assert resumed["isError"] and resumed["structuredContent"]["code"] == "cursor_expired", resumed
+        self.kubectl("delete", "pod", secondary, "--timeout=55s")
+        serve(secondary)
+        self.kubectl("wait", f"pod/{secondary}", "--for=condition=Ready", "--timeout=55s")
+        denied(secondary)
+        print("Minikube applied rights restrictions across two Serve replicas and pod replacement", flush=True)
 
     def delivered(self, sequence):
         query = ("SELECT count(*),count(*) FILTER (WHERE delivery_state='delivered') "
@@ -316,14 +345,17 @@ print(response.read().decode())
                   "RFC_SYNC_SERVE_KEY_FILE": "/run/secrets/notify"}
         feed = {"RFC_FEED_SYNC_KEY_ID": "fixture-feed",
                 "RFC_FEED_SYNC_KEY_FILE": "/run/secrets/feed"}
-        self.pod("serve", f"{self.prefix}-serve", 10001, ["/usr/local/bin/rfc-mcp-docker-serve"], env={
-            **database, **notify, "RFC_MCP_BIND": "$(POD_IP):8780",
-            "RFC_SERVE_NOTIFY_BIND": "$(POD_IP):8782", "RFC_MCP_HOSTS": "rfc.test",
-            "RFC_MCP_CURSOR_KEY_FILE": "/run/secrets/cursor",
-        }, mounts=(ca, self.host("mirror", "/mirror", "mirror"),
-                   self.host("reader", "/phase1/db-password", "reader"),
-                   self.host("cursor", "/run/secrets/cursor", "cursor-key"),
-                   self.host("notify", "/run/secrets/notify", "notify-key-serve")), readiness=8780, bind_ip=True)
+        def serve(name):
+            self.pod(name, f"{self.prefix}-serve", 10001, ["/usr/local/bin/rfc-mcp-docker-serve"], env={
+                **database, **notify, "RFC_MCP_BIND": "$(POD_IP):8780",
+                "RFC_SERVE_NOTIFY_BIND": "$(POD_IP):8782", "RFC_MCP_HOSTS": "rfc.test",
+                "RFC_MCP_CURSOR_KEY_FILE": "/run/secrets/cursor",
+            }, mounts=(ca, self.host("mirror", "/mirror", "mirror"),
+                       self.host("reader", "/phase1/db-password", "reader"),
+                       self.host("cursor", "/run/secrets/cursor", "cursor-key"),
+                       self.host("notify", "/run/secrets/notify", "notify-key-serve")), readiness=8780, bind_ip=True)
+
+        serve("serve")
         self.kubectl("wait", "--for=condition=Ready", "pod/serve", "--timeout=55s")
         self.kubectl("exec", "serve", "--", "sh", "-ec",
                      "test ! -e /rfc-https-spool && test ! -e /rfc-rsync-audit")
@@ -373,6 +405,7 @@ print(response.read().decode())
             self.delivered(2)
             self.verify_served(2, sources[2119])
             assert self.database("-c", "SELECT count(*) FROM rfc.control_events WHERE status='completed'") == "1"
+            self.verify_policy_replicas(serve, sources[2119])
             print("Minikube status, watch, and diagnose passed through kubectl exec as Sync", flush=True)
             print("Minikube fresh daemon and brokered Feed publications passed with authenticated outbox and MCP reads",
                   flush=True)

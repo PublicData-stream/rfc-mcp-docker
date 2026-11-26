@@ -60,3 +60,10 @@ The optional `limit` defaults to 20 and accepts 1–100. Pass `next_cursor` alon
 The engine accepts up to 8 KiB of query text, 4 KiB per decoded literal, 128 syntax nodes, 16 levels of nesting, and 64 normalized token terms. Per-page work is limited to 512 evaluated RFCs, 32 MiB in original reads, and 512 MiB in exact comparisons, calculated as document bytes times distinct full-text literals. The SQL statement timeout is 5 seconds and the search deadline is 15 seconds.
 
 Set `include_snippets` to request original-byte excerpts from positive full-text evidence. Each excerpt carries original byte coordinates and refers to the document's complete notice group. The engine returns at most eight excerpts per document and groups excerpts for at most ten documents. Token excerpts require an exact round trip through PostgreSQL's token highlighting on up to 256 KiB of original UTF-8. Where policy, byte verification, notices, or the 256 KiB serialized search payload budget prevent excerpts, the confirmed hit remains available as metadata.
+
+## Source policy and original matches
+
+Metadata remains available for restricted documents. Original snippets and
+regex excerpts require a qualifying receipt and complete notice inventory.
+Regex scanning excludes restricted RFCs and reports them through omissions
+and coverage. Rights restrictions also apply to pinned generations.

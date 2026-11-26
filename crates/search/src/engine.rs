@@ -266,11 +266,22 @@ pub struct NoticeGroup {
     pub source_verification: Option<crate::snippets::SourceVerification>,
     pub source_name: &'static str,
     pub stream: Option<String>,
-    pub attribution: &'static str,
+    pub attribution: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<rfc_storage::policy::License>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<NoticePolicy>,
     pub digest: String,
     pub notices: Vec<OriginalRange>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) included_in_whole: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NoticePolicy {
+    pub decision: rfc_storage::policy::Policy,
+    pub approval_method: rfc_storage::policy::Method,
+    pub rule_id: String,
 }
 
 pub struct Search {
@@ -378,6 +389,12 @@ impl Search {
             fits,
         };
         self.read_generation(selection, deadline, async |guard| {
+            if cursor
+                .as_ref()
+                .is_some_and(|value| value.rights_epoch != guard.rights_epoch())
+            {
+                return Err(SearchError::CursorExpired.into());
+            }
             let generation =
                 i64::try_from(guard.generation().get()).map_err(|_| SearchError::Unavailable)?;
             let sequence = cursor
@@ -398,6 +415,7 @@ impl Search {
                     sequence,
                     after,
                     expiry,
+                    guard.rights_epoch(),
                 ))?);
             }
             if serialized_size(&page)? > MAX_RESPONSE_BYTES {
@@ -601,8 +619,8 @@ impl Scan<'_> {
                 return Err(SearchError::Unavailable);
             }
             for (index, row) in batch.iter().enumerate() {
-                let truth: Option<bool> = row.get(13);
-                let facts: Vec<Option<bool>> = row.get(12);
+                let truth: Option<bool> = row.try_get("matches")?;
+                let facts: Vec<Option<bool>> = row.try_get("predicates")?;
                 if truth == Some(true) {
                     let source = Source::from_row(row)?;
                     if !push_hit(&mut page, &source, self.fits) {

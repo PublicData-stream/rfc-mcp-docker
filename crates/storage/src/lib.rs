@@ -2,6 +2,7 @@
 
 pub mod blob;
 pub mod manifest;
+pub mod policy;
 pub mod postgres;
 
 /// The dedicated Compose fixture binary can pause or terminate at durable boundaries.

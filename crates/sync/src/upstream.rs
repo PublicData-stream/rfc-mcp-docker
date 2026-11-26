@@ -291,7 +291,6 @@ impl Upstream {
         self.rsync_module
     }
 
-    #[cfg(feature = "phase6-fixtures")]
     pub(crate) fn is_fixture(&self) -> bool {
         self.https_origin != OFFICIAL_HTTPS
     }

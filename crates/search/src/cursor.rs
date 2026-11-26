@@ -21,12 +21,21 @@ pub(crate) struct Cursor {
     query: String,
     pub generation: i64,
     pub sequence: i64,
+    #[serde(default, rename = "e")]
+    pub rights_epoch: i64,
     pub after: i32,
     pub expiry: u64,
 }
 
 impl Cursor {
-    pub fn new(query: String, generation: i64, sequence: i64, after: i32, expiry: u64) -> Self {
+    pub fn new(
+        query: String,
+        generation: i64,
+        sequence: i64,
+        after: i32,
+        expiry: u64,
+        rights_epoch: i64,
+    ) -> Self {
         Self {
             version: VERSION,
             tool: TOOL.into(),
@@ -34,6 +43,7 @@ impl Cursor {
             query,
             generation,
             sequence,
+            rights_epoch,
             after,
             expiry,
         }
@@ -112,7 +122,7 @@ mod tests {
     fn cursors_bind_context_and_expire() {
         let key = CursorKey::new(&[7; 48]);
         let cursor = key
-            .encode(&Cursor::new("query".into(), 1, 2, 3, 1900))
+            .encode(&Cursor::new("query".into(), 1, 2, 3, 1900, 0))
             .unwrap();
         assert_eq!(key.decode(&cursor, "query", 100).unwrap().after, 3);
         assert!(matches!(

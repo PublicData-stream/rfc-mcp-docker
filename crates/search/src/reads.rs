@@ -1,7 +1,10 @@
 use std::ops::Range;
 
 use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
-use rfc_storage::postgres::{GenerationReadGuard, GenerationSelection};
+use rfc_storage::{
+    policy::Policy,
+    postgres::{GenerationReadGuard, GenerationSelection},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
@@ -22,8 +25,12 @@ const MAX_HEADING: usize = 4096;
 const DOCUMENT: &str = "SELECT m.rfc_id::integer,m.title,m.stream,d.txt_digest::bytea,
     d.byte_length::bigint,d.encoding,d.notice_policy,d.notice_state::text,
     o.source_url,d.identity::bytea,coalesce(d.section_state::text,'unavailable'),
-    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm
+    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm, d.policy_receipt::bytea AS policy_identity,
+    receipt.receipt::text AS policy_evidence,
+    (SELECT cap.ceiling FROM rfc.policy_restrictions cap WHERE cap.rfc_id = m.rfc_id
+      ORDER BY cap.epoch DESC LIMIT 1) AS policy_ceiling
     FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity=m.document_version
+    LEFT JOIN rfc.policy_receipts receipt ON receipt.identity = d.policy_receipt
     JOIN rfc.source_observations o ON o.identity=m.txt_observation
     LEFT JOIN rfc.generation_source_evidence p ON (p.generation_id,p.rfc_id) = (m.generation_id,m.rfc_id)
     WHERE m.generation_id=$1 AND m.rfc_id=$2::integer";
@@ -120,6 +127,8 @@ struct PageCursor {
     generation: i64,
     #[serde(rename = "s")]
     sequence: i64,
+    #[serde(default, rename = "e")]
+    rights_epoch: i64,
     expiry: u64,
     #[serde(rename = "p")]
     after: i64,
@@ -196,7 +205,18 @@ impl<'a> PageContext<'a> {
         } else {
             GenerationSelection::Active
         };
-        search.read_generation(selection, deadline, call).await
+        search
+            .read_generation(selection, deadline, async |guard| {
+                if self
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.rights_epoch != guard.rights_epoch())
+                {
+                    return Err(SearchError::CursorExpired.into());
+                }
+                call(guard).await
+            })
+            .await
     }
 
     fn sequence(&self, guard: &GenerationReadGuard<'_>) -> i64 {
@@ -225,6 +245,7 @@ impl<'a> PageContext<'a> {
             args: args.into(),
             generation: generation(guard)?,
             sequence: self.sequence(guard),
+            rights_epoch: guard.rights_epoch(),
             expiry,
             after,
             document,
@@ -458,11 +479,13 @@ impl Search {
                         )
                     };
 
-                let whole_only = selection_is_whole && source.policy == "whole_only";
+                let whole_only = selection_is_whole && source.policy == Policy::WholeOnly;
                 let reviewed_pages = selection_is_whole
-                    && source.policy == "whole_paginated"
+                    && source.policy == Policy::WholePaginated
                     && source.notice_state == "complete";
-                if !whole_only && !reviewed_pages && !source.permits_excerpt() {
+                if (whole_only && position != 0)
+                    || (!whole_only && !reviewed_pages && !source.permits_excerpt())
+                {
                     return Err(SearchError::SourcePolicyRestricted.into());
                 }
                 if scope.format == Format::Text && source.encoding != "utf8" {

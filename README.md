@@ -11,3 +11,7 @@ See [Docker Compose deployment](docs/deployment.md), the [MCP API](docs/mcp.md),
 See [Phase 8 release readiness](docs/release-readiness.md) for qualification commands, the acceptance matrix, and public-release gates.
 
 See the [HTTPS-first decision](docs/decisions/0010-https-first-rfc-synchronization.md#cold-start-timing) for the cold-start timing contract and the upstream pacing constraint.
+
+Original-text delivery follows the verified RFC redistribution policy. Sync
+can classify a reviewed license family automatically after private corpus
+qualification and approval of the exact registry. [Source policy](docs/source-policy.md)

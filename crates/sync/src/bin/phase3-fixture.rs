@@ -10,7 +10,12 @@ use rfc_storage::{
         verify_stored_manifest,
     },
 };
-use std::{collections::BTreeMap, io::Read, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, Read},
+    process::Stdio,
+    time::Duration,
+};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -29,6 +34,15 @@ async fn main() -> Result<()> {
                 .read_to_end(&mut bytes)?;
             assert!(bytes.len() <= 4 * 1024 * 1024);
             println!("{}", BlobDigest::hash(&bytes));
+        }
+        [action, index, source, rfc] if action == "policy-check-sample" => {
+            rfc_mcp_docker_sync::policy_cli::qualify_sample(index, source, rfc)?;
+        }
+        [action] if action == "policy-receipt-digests" => {
+            for line in std::io::stdin().lock().lines() {
+                let receipt: rfc_storage::policy::Receipt = serde_json::from_str(&line?)?;
+                println!("{}", receipt.digest()?);
+            }
         }
         [action, id, sequence] if matches!(action.as_str(), "publish" | "rollback") => {
             println!(

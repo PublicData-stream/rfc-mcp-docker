@@ -34,8 +34,12 @@ const DEADLINE: Duration = Duration::from_secs(5);
 const SOURCES: &str = "SELECT m.rfc_id::integer,m.title,m.stream,d.txt_digest::bytea,
     d.byte_length::bigint,d.encoding,d.notice_policy,d.notice_state::text,
     o.source_url,d.identity::bytea,
-    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm
+    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm, d.policy_receipt::bytea AS policy_identity,
+    receipt.receipt::text AS policy_evidence,
+    (SELECT cap.ceiling FROM rfc.policy_restrictions cap WHERE cap.rfc_id = m.rfc_id
+      ORDER BY cap.epoch DESC LIMIT 1) AS policy_ceiling
     FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity=m.document_version
+    LEFT JOIN rfc.policy_receipts receipt ON receipt.identity = d.policy_receipt
     JOIN rfc.source_observations o ON o.identity=m.txt_observation
     LEFT JOIN LATERAL (
         SELECT method, algorithm FROM rfc.generation_source_evidence p
@@ -121,6 +125,8 @@ struct Cursor {
     args: String,
     generation: i64,
     sequence: i64,
+    #[serde(default, rename = "e")]
+    rights_epoch: i64,
     expiry: u64,
     pos: Position,
     coverage_gap: bool,
@@ -214,6 +220,12 @@ impl Rg {
         let result = search
             .pool
             .with_generation(PoolClass::Public, deadline, selection, async |guard| {
+                if checkpoint
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.rights_epoch != guard.rights_epoch())
+                {
+                    return Ok(ReadOutcome::Rejected(SearchError::CursorExpired.into()));
+                }
                 let mut scan = Scan {
                     request: &request,
                     search,
@@ -473,6 +485,7 @@ impl Scan<'_, '_> {
                 args,
                 generation,
                 sequence,
+                rights_epoch: self.guard.rights_epoch(),
                 pos: position,
                 coverage_gap,
                 expiry: saved.map_or(now + MAX_AGE_SECONDS, |c| c.expiry),

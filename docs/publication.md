@@ -6,7 +6,7 @@ The PostgreSQL `rfc.active_generation` row identifies the active generation and 
 
 Run these commands with Sync's database credentials, writable mirror, and private staging mounts. Stop Feed and Sync before independently preparing and promoting a candidate. A manual request that attaches to a daemon run receives that run's result.
 
-Sync on schema 11 seals each full candidate with a
+Sync on schema 12 seals each full candidate with a
 sealed selection, audited HTTPS TXT, and a classified RFCXML outcome for
 every RFC. Reconciliation and promotion share the existing corpus lock.
 [Acquisition and rollout](ingestion.md#run-acquisition)
@@ -69,3 +69,15 @@ Restore into fresh volumes with the proxy route closed and all three application
 3. Confirm the saved pointer, sequence, manifests, original ranges, database privileges, and readonly serve mount. Start serve and check loopback readiness and the same pinned MCP reads used before backup. Start sync and feed after the read path passes, then reopen the proxy route.
 
 For a corrupt canonical original, close the proxy route, quiesce the stack, and retain the suspect file for investigation. Restore from a matching verified backup or roll back to a complete retained generation with an expected sequence. A rollback cannot recover shared bytes if the rollback target references the same corrupt digest. Recheck readiness, manifests, and original-byte reads before reopening traffic. [Phase 8 restore rehearsal](release-readiness.md#restore-and-client-results)
+
+## Rights changes and rollback
+
+Format-4 candidates bind source policy alongside HTTPS and rsync evidence.
+Promotion checks the matching approval pin for automatic grants. An operator
+must record a cross-generation restriction before publishing a rights
+downgrade that would leave revoked permissions available on a retained
+generation. Rollback checks the target against current restrictions.
+
+Keep the rights ledger independently of generation backups. Restore the
+latest verified ledger and confirm its epoch and the approved pin before
+reopening ingress. [Restriction procedure](source-policy.md#restrict-an-rfc)

@@ -172,6 +172,10 @@ def prepare_backup(root, args, driver, backup):
         seed.activate(int(second), 1)
         phase3.changed_catalog(seed, "Phase 8 ready candidate")
         ready = seed.reconcile()["generation_id"]
+        restrict = seed.app("sync", "-T", args=("policy", "restrict", "--rfc", "8174",
+                            "--ceiling", "metadata_only", "--reason", "rights_revoked",
+                            "--review-ref", "private restore qualification", "--expect-epoch", "0"))
+        assert "rights epoch 1" in subprocess.check_output(restrict, env=seed.env, text=True, timeout=30)
         dump(seed.command(), seed.env, work / "fixture.dump")
         seed.run("stop", "fixtures", "postgres", timeout=50)
         with phase7.deployment(work, seed, args.image_prefix) as stack:
@@ -183,6 +187,8 @@ def prepare_backup(root, args, driver, backup):
             assert stack.admin("/ready") == ""
             assert stack.sql("-c", "SELECT pg_try_advisory_lock(-1)") == "t"
             baseline = reads(stack.client)
+            stack.client.call("get", id=8174, _error="source_policy_restricted")
+            assert stack.sql("-c", "SELECT rights_epoch FROM rfc.policy_state WHERE singleton") == "1"
             pointer = stack.sql("-c", POINTER_QUERY)
             assert pointer == f"{second}|2"
             readable = stack.sql("-c", READABLE_QUERY).splitlines()
@@ -239,7 +245,9 @@ def restore(root, args, driver, backup, baseline, baseline_verify):
             stack.open(SERVE, "test-proxy")
             assert stack.admin("/ready") == ""
             assert reads(stack.client) == baseline
-            return {"verified": actual, "pointer": inventory["pointer"],
+            stack.client.call("get", id=8174, _error="source_policy_restricted")
+            assert stack.sql("-c", "SELECT rights_epoch FROM rfc.policy_state WHERE singleton") == "1"
+            return {"verified": actual, "rights_epoch": 1, "pointer": inventory["pointer"],
                     "readable": inventory["readable"], "compatibility": compatibility(stack)}
 
 

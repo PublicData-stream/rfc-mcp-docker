@@ -28,7 +28,9 @@ use rfc_mcp_docker::{
     control::{self, Command, Keys, Link, Outcome, Rejection},
 };
 use rfc_search::{Rg, Search, SearchError};
-use rfc_storage::postgres::{GenerationSelection, PoolClass, ReadOutcome, ServePool};
+use rfc_storage::postgres::{
+    GenerationSelection, PoolClass, ReadOutcome, ServePool, observe_rights,
+};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
@@ -212,8 +214,8 @@ impl ServerHandler for Mcp {
             .extensions
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<RequestBudget>())
-            .copied();
-        let deadline = budget.map_or_else(
+            .cloned();
+        let deadline = budget.as_ref().map_or_else(
             || started + REQUEST_TIMEOUT,
             |budget| budget.deadline - Duration::from_millis(100),
         );
@@ -225,15 +227,27 @@ impl ServerHandler for Mcp {
         } else {
             None
         };
-        let output = tokio::select! {
+        let resumable = args.get("cursor").is_some();
+        let (output, epoch) = tokio::select! {
             () = context.ct.cancelled() => return Err(ErrorData::internal_error("Request cancelled", None)),
-            result = timeout_at(deadline, self.call(&request.name, args, &context.id, deadline)) => {
-                result.unwrap_or(Err(SearchError::Deadline))
+            result = timeout_at(deadline, observe_rights(self.call(&request.name, args, &context.id, deadline))) => {
+                result.unwrap_or((Err(SearchError::Deadline), None))
             }
         };
         let result = match output {
             Ok(value) if wire_size(&context.id, &value) <= RESPONSE_LIMIT => {
-                CallToolResult::structured(value)
+                match (budget.as_ref(), epoch) {
+                    (Some(budget), Some(epoch)) => {
+                        *budget.rights.lock().expect("response rights") = Some(ResponseRights {
+                            epoch,
+                            id: context.id.clone(),
+                            resumable,
+                            source_url,
+                        });
+                        CallToolResult::structured(value)
+                    }
+                    _ => tool_error(SearchError::Unavailable, source_url),
+                }
             }
             Ok(_) => tool_error(SearchError::ResourceLimit, source_url),
             Err(error) => tool_error(error, source_url),
@@ -295,10 +309,18 @@ fn tool_error(error: SearchError, source_url: Option<String>) -> CallToolResult 
 #[derive(Clone, Copy)]
 struct Peer(IpAddr);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RequestBudget {
     serial: u64,
     deadline: Instant,
+    rights: Arc<Mutex<Option<ResponseRights>>>,
+}
+
+struct ResponseRights {
+    epoch: i64,
+    id: RequestId,
+    resumable: bool,
+    source_url: Option<String>,
 }
 
 struct Bucket {
@@ -431,9 +453,12 @@ async fn admit(
         return admission.overloaded();
     }
     let deadline = now + REQUEST_TIMEOUT;
-    request
-        .extensions_mut()
-        .insert(RequestBudget { serial, deadline });
+    let rights = Arc::new(Mutex::new(None));
+    request.extensions_mut().insert(RequestBudget {
+        serial,
+        deadline,
+        rights: rights.clone(),
+    });
     let response = timeout_at(deadline, async {
         let (mut parts, body) = next.run(request).await.into_parts();
         let Ok(body) = to_bytes(body, RESPONSE_LIMIT).await else {
@@ -453,7 +478,44 @@ async fn admit(
             body.len(),
             now.elapsed().as_millis()
         );
-        Response::from_parts(parts, Body::from(body))
+        let rights = rights.lock().expect("response rights").take();
+        if let Some(rights) = rights {
+            rfc_storage::fixture_boundary("before_policy_response");
+            let protocol = parts.headers.get("mcp-protocol-version").cloned();
+            let response = admission
+                .pool
+                .authorize_response(rights.epoch, deadline, move || {
+                    Response::from_parts(parts, Body::from(body))
+                })
+                .await;
+            if let Ok(Some(response)) = response {
+                return response;
+            }
+            let error = match response {
+                Ok(None) if rights.resumable => SearchError::CursorExpired,
+                Ok(None) => SearchError::SourcePolicyRestricted,
+                _ => SearchError::Unavailable,
+            };
+            let mut result = json!(tool_error(error, rights.source_url));
+            result["resultType"] = json!("complete");
+            let body = json!({"jsonrpc":"2.0", "id":rights.id, "result":result});
+            let mut rejection = (
+                [
+                    (header::CACHE_CONTROL, "no-store"),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                ],
+                axum::Json(body),
+            )
+                .into_response();
+            if let Some(protocol) = protocol {
+                rejection
+                    .headers_mut()
+                    .insert("mcp-protocol-version", protocol);
+            }
+            rejection
+        } else {
+            Response::from_parts(parts, Body::from(body))
+        }
     })
     .await
     .unwrap_or_else(|_| StatusCode::GATEWAY_TIMEOUT.into_response());

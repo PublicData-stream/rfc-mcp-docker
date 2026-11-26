@@ -6,7 +6,7 @@ use crate::{
     Chunk, Document, IndexedText, Section,
     discovery::{INDEX, PARSER},
     persist_document,
-    policy::Registry,
+    policy::{Registry, notice_rows},
     text, xml,
 };
 use rfc_core::{BlobDigest, ByteRange, Coverage, RfcNumber};
@@ -200,9 +200,14 @@ pub(crate) async fn store_text(
     bytes: &[u8],
     text: OwnedText,
 ) -> Result<BlobDigest> {
-    let mut indexed = text.data.into_view(bytes, &text.headings)?;
-    let (policy, notices) =
-        index_notices(rfc, blob.digest(), registry, entry, bytes, &mut indexed)?;
+    let indexed = text.data.into_view(bytes, &text.headings)?;
+    let receipt = registry.classify(rfc, blob.digest(), entry, bytes, false)?;
+    let notices = notice_rows(&receipt);
+    let notice_state = if notices.is_empty() {
+        Coverage::Unavailable
+    } else {
+        Coverage::Complete
+    };
     let (encoding, index_state) = if indexed.text.is_some() {
         ("utf8", Coverage::Complete)
     } else {
@@ -217,8 +222,8 @@ pub(crate) async fn store_text(
             index_version: INDEX,
             encoding,
             index_state,
-            notice_state: indexed.notice_state,
-            notice_policy: policy,
+            notice_state,
+            notice_policy: receipt.decision.name(),
             sections: indexed.sections,
             chunks: indexed.chunks,
             notices,
@@ -228,30 +233,7 @@ pub(crate) async fn store_text(
             line_starts: &indexed.line_starts,
             text: indexed.text,
         }),
+        Some(&receipt),
     )
     .await
-}
-
-pub(crate) fn index_notices<'a>(
-    rfc: RfcNumber,
-    digest: BlobDigest,
-    registry: &'a Registry,
-    entry: &xml::Entry,
-    bytes: &[u8],
-    indexed: &mut TextIndex<'a>,
-) -> Result<(&'a str, Vec<crate::Notice<'a>>)> {
-    if let Some(notices) = registry.pagination_notices(rfc, digest, bytes)? {
-        indexed.notice_state = Coverage::Complete;
-        return Ok(("whole_paginated", notices));
-    }
-    Ok((
-        registry.decide(
-            rfc,
-            digest,
-            entry,
-            indexed.notice_family,
-            indexed.notice_state,
-        ),
-        std::mem::take(&mut indexed.notices),
-    ))
 }

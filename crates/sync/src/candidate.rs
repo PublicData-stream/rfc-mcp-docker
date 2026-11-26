@@ -35,7 +35,8 @@ pub(crate) struct Selection<'a> {
     pub inventory: &'a str,
     pub sequence: i64,
     pub catalog: &'a xml::Catalog,
-    pub registry_version: &'a str,
+    pub registry_digest: BlobDigest,
+    pub fixture: bool,
     pub before: &'a Capture,
     pub after: &'a Capture,
     pub documents: Join,
@@ -123,8 +124,21 @@ async fn build(
                 &selection.scope.as_str(),
                 &bytes(&before),
                 &bytes(&after),
-                &selection.registry_version,
+                &selection.registry_digest.to_string(),
                 &serde_json::to_string(&catalog_only)?,
+            ],
+        )
+        .await?;
+    candidate
+        .tx
+        .execute(
+            "INSERT INTO rfc.generation_policy (generation_id,registry_digest,classifier,fixture)
+         VALUES ($1,$2::bytea,$3,$4)",
+            &[
+                &candidate.generation(),
+                &bytes(&selection.registry_digest),
+                &rfc_storage::policy::CLASSIFIER,
+                &selection.fixture,
             ],
         )
         .await?;
@@ -299,6 +313,20 @@ async fn store_document(
     let observation = digest(&input.observation)?;
     let version = digest(&txt.version.ok_or("missing TXT document version")?)?;
     let xml_observation = xml.observation.as_deref().map(digest).transpose()?;
+    let metadata = crate::policy::metadata_digest(entry)?.to_string();
+    let bound = candidate
+        .tx
+        .query_one(
+            "SELECT EXISTS (SELECT FROM rfc.document_versions d
+         JOIN rfc.policy_receipts p ON p.identity = d.policy_receipt
+         WHERE d.identity = $1::bytea AND p.receipt ->> 'metadata_digest' = $2)",
+            &[&bytes(&version), &metadata],
+        )
+        .await?
+        .try_get::<_, bool>(0)?;
+    if !bound {
+        return Err("candidate policy receipt does not bind the selected catalog metadata".into());
+    }
 
     let rsync_url = format!(
         "rsync://rsync.rfc-editor.org/rfcs-text-only/rfc{}.txt",
@@ -496,7 +524,12 @@ async fn record_edge(
     candidate.relation(relation, &[proof]).await
 }
 
-fn canonical(reader: &BlobReader, digest: BlobDigest, length: i64, cap: usize) -> Result<Vec<u8>> {
+pub(crate) fn canonical(
+    reader: &BlobReader,
+    digest: BlobDigest,
+    length: i64,
+    cap: usize,
+) -> Result<Vec<u8>> {
     let span = ByteRange::new(0, length).ok_or("invalid artifact length")?;
     let bytes = reader.read_range(digest, span, cap)?;
     if i64::try_from(reader.open_blob(digest)?.metadata()?.len())? != length

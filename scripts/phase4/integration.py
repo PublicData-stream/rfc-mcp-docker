@@ -51,6 +51,27 @@ class Project(phase3.Project):
             options += ("-v", f"{self.key_file}:/phase4/cursor-key:ro")
         return self.app(service, *options, args=args)
 
+    def reconcile_command(self, live, scope, settings=(), *, options=(), prelude=None):
+        assert not live and scope == "full" and not prelude
+        overrides = [item for value in settings for item in ("-e", value)]
+        return self.app("sync", "-T", *options, *overrides,
+                        "-v", f"{self.directory / 'search-policy.json'}:/phase5/fixture-policy.json:ro",
+                        "--entrypoint", "/phase2/fixture-driver", args=(scope, "--review-fixture"))
+
+    def policy_fixture(self):
+        digest = subprocess.run(self.operation("sync", "digest"), env=self.env, input=CONTENT,
+                                capture_output=True, check=True, timeout=20).stdout.decode().strip()
+        registry = json.loads((phase2.REPO / "crates/sync/src/policy.json").read_text())
+        registry["version"] = "phase4-synthetic"
+        registry["overrides"].append({
+            "rfc": 102, "digest": digest, "policy": "excerpt_allowed",
+            "review": "Private synthetic fixture only", "attribution": "Fixture Author",
+            "license": {"family": "test", "version": "1", "section": "fixture",
+                        "url": "https://example.invalid/fixture-license"},
+            "notices": [{"category": "copyright", "start_byte": 0, "end_byte": len(NOTICE)}],
+        })
+        (self.directory / "search-policy.json").write_text(json.dumps(registry))
+
 
 @contextmanager
 def search_session(project):
@@ -123,23 +144,9 @@ def upgrade(project):
     project.check("serve", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "\n".join(map(str, range(1, 12)))
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "\n".join(map(str, range(1, 13)))
     assert project.sql(row) == before
     project.denied_sql("DELETE FROM rfc.generation_documents", phase1.SERVE)
-
-
-def approve_synthetic_excerpt(project, generation):
-    # Only the isolated, synthetic RFC 102 gets an excerpt policy in this fixture.
-    version = f"(SELECT document_version FROM rfc.generation_documents WHERE generation_id={generation} AND rfc_id=102)"
-    project.sql("BEGIN; ALTER TABLE rfc.document_versions DISABLE TRIGGER seal_document; "
-                "ALTER TABLE rfc.notice_ranges DISABLE TRIGGER insert_notice; "
-                "UPDATE rfc.document_versions SET notice_policy='excerpt_allowed',notice_state='complete' "
-                f"WHERE identity={version}; "
-                f"DELETE FROM rfc.notice_ranges WHERE document_version={version}; "
-                "INSERT INTO rfc.notice_ranges SELECT identity,byte_length,0,'copyright',0,"
-                f"{len(NOTICE)},'complete','reviewed' FROM rfc.document_versions WHERE identity={version}; "
-                "ALTER TABLE rfc.notice_ranges ENABLE TRIGGER insert_notice; "
-                "ALTER TABLE rfc.document_versions ENABLE TRIGGER seal_document; COMMIT")
 
 
 def check_text_and_snippets(request):
@@ -292,12 +299,42 @@ OPERATORS = {
 INVERSES = ("referenced_by", "normative_referenced_by", "informative_referenced_by", "updated_by", "obsoleted_by")
 
 
+def graph_receipts(project, base, template, start, end):
+    sample = json.loads(project.sql(f"""
+        SELECT p.receipt FROM rfc.policy_receipts p JOIN rfc.document_versions d ON d.policy_receipt=p.identity
+        JOIN rfc.generation_documents m ON d.identity=m.document_version
+        WHERE m.generation_id={base} AND m.rfc_id={template}
+    """))
+    inventory = project.sql(f"""
+        SELECT p.receipt ->> 'inventory_digest' FROM rfc.policy_receipts p
+        JOIN rfc.generation_documents m ON p.rfc_id=m.rfc_id
+        JOIN rfc.document_versions d ON (d.identity,d.policy_receipt)=(m.document_version,p.identity)
+        WHERE m.generation_id={base} AND d.notice_policy='metadata_only' LIMIT 1
+    """)
+    assert inventory
+    receipts = [dict(sample, rfc=rfc, metadata_digest="00" * 32,
+                     rule_id="search-graph-fixture", approval_method="fallback",
+                     decision="metadata_only", inventory_digest=inventory, notices=[],
+                     review=None, license=None, attribution=None, template=None, reason=None)
+                for rfc in range(start, end + 1)]
+    payload = [json.dumps(receipt, ensure_ascii=True, separators=(",", ":")) for receipt in receipts]
+    digests = subprocess.run(project.operation("sync", "policy-receipt-digests"), env=project.env,
+                             text=True, input="\n".join(payload) + "\n", capture_output=True,
+                             check=True, timeout=30).stdout.splitlines()
+    registry, source = sample["registry_digest"], sample["source_digest"]
+    # Input contains known JSON values and identities generated by the fixture.
+    rows = "\n".join(f"{receipt['rfc']}\t{digest}\t{data}"
+                     for receipt, digest, data in zip(receipts, digests, payload, strict=True))
+    return registry, source, rows
+
+
 def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
     generation = int(project.sql("INSERT INTO rfc.generations (parser_version,index_version) "
                                  f"SELECT parser_version,index_version FROM rfc.generations WHERE id={base} RETURNING id"))
     copy_fields = ("rfc_id,document_version,metadata_identity,catalog_observation,txt_observation,"
                    "title,stream,publication_date,current_status,publication_month,rfcxml_observation")
     template = 105 if bulk else 102
+    registry, source_digest, receipts = graph_receipts(project, base, template, start, end)
     seed_edges = (
         f"SELECT {generation}, n, 'obsoletes', 10000+mod(n,12) FROM generate_series({start},{end}) n"
         if bulk else "VALUES " + ",".join(f"({generation},{a},'{kind}',{b})" for a, kind, b in edges)
@@ -307,8 +344,15 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
     covered = ("CASE WHEN family='obsoletes' THEN 'complete' ELSE 'unavailable' END" if bulk
                else "coalesce(s.state, 'unavailable')")
     coverage_join = ("" if bulk else f"LEFT JOIN ({assignments}) s(rfc_id, kind, state) ON (s.rfc_id,s.kind)=(n,family)")
-    project.sql(f"""
+    script = f"""
         BEGIN;
+        CREATE TEMP TABLE graph_receipts (rfc_id integer PRIMARY KEY, identity text, receipt jsonb);
+        COPY graph_receipts FROM STDIN;
+{receipts}
+\\.
+        INSERT INTO rfc.policy_receipts
+          SELECT decode(identity,'hex'),rfc_id,decode('{source_digest}','hex'),
+                 decode('{registry}','hex'),'metadata_only',receipt FROM graph_receipts;
         INSERT INTO rfc.rfc_identities SELECT n FROM generate_series({start},{end}) n;
         INSERT INTO rfc.source_observations (identity,kind,source_url,observed_at,fetched_at,raw_digest,https_verification,capture_only)
           SELECT sha256(convert_to('phase4-txt-'||n,'UTF8')), 'txt',
@@ -317,10 +361,10 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
           JOIN rfc.document_versions d ON d.identity=m.document_version
           WHERE m.generation_id={base} AND m.rfc_id={template};
         INSERT INTO rfc.document_versions (identity,rfc_id,txt_digest,byte_length,parser_version,index_version,encoding,
-                 indexing_state,notice_state,notice_policy,index_identity,section_state,line_starts)
+                 indexing_state,notice_state,notice_policy,index_identity,section_state,line_starts,policy_receipt)
           SELECT sha256(convert_to('phase4-doc-'||n,'UTF8')), n, d.txt_digest, d.byte_length, d.parser_version,
                  d.index_version, d.encoding, d.indexing_state, 'unavailable', 'metadata_only', d.index_identity,
-                 d.section_state, d.line_starts
+                 d.section_state, d.line_starts, decode((SELECT identity FROM graph_receipts WHERE rfc_id=n),'hex')
           FROM generate_series({start},{end}) n CROSS JOIN rfc.generation_documents m
           JOIN rfc.document_versions d ON d.identity=m.document_version
           WHERE m.generation_id={base} AND m.rfc_id={template};
@@ -333,6 +377,8 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
         INSERT INTO rfc.generation_ingestion
           SELECT {generation},scope,catalog_before,catalog_after,policy_registry,catalog_only
           FROM rfc.generation_ingestion WHERE generation_id={base};
+        INSERT INTO rfc.generation_policy
+          SELECT {generation},registry_digest,classifier,true FROM rfc.generation_policy WHERE generation_id={base};
         INSERT INTO rfc.generation_audit
           SELECT {generation},sha256(convert_to('phase4-selection-{generation}','UTF8')),inventory,policy,
                  array(SELECT rfc FROM (SELECT rfc_id::integer rfc FROM rfc.generation_documents
@@ -384,7 +430,8 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
           FROM generate_series({start},{end}) n CROSS JOIN unnest(ARRAY{list(FAMILIES)}) family
           {coverage_join};
         COMMIT;
-    """)
+    """
+    run(project.psql(), env=project.env, input=script, stdout=subprocess.DEVNULL)
     run(project.search_command("sync", str(generation)), env=project.env, timeout=35)
     project.activate(generation, sequence)
     return generation
@@ -543,6 +590,7 @@ def main():
             project.start()
             upgrade(project)
             check_text_search_limits(project)
+            project.policy_fixture()
             project.run("up", "-d", "--wait", "--wait-timeout", "30", "fixtures")
             with search_session(project) as request:
                 expect_error(request, "is::obsoleted:true", "corpus_not_ready")
@@ -550,7 +598,6 @@ def main():
                 first = int(report["generation_id"])
                 project.activate(first, 0)
                 assert project.read()["manifest"] == report["manifest_digest"]
-                approve_synthetic_excerpt(project, first)
                 check_text_and_snippets(request)
                 check_corrupt_original(project, request, first)
                 second = check_pagination(project, request, first)

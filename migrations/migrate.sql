@@ -76,4 +76,10 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 11) AS appl
 \ir 0011-https-publication.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (11);
 \endif
+SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 12) AS apply_v12
+\gset
+\if :apply_v12
+\ir 0012-source-policy.sql
+INSERT INTO rfc.schema_migrations (version) VALUES (12);
+\endif
 COMMIT;

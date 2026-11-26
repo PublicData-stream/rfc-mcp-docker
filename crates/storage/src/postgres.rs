@@ -22,7 +22,7 @@ pub use pool::{PoolClass, PoolConfig, PoolError, ReadOutcome, ServePool};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSIONS: [i32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const SCHEMA_VERSIONS: [i32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 const READ_DEADLINE: Duration = Duration::from_secs(15);
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",
@@ -44,6 +44,8 @@ const PUBLIC_READS: &[&str] = &[
     "generation_ingestion",
     "generation_audit",
     "generation_source_evidence",
+    "generation_policy",
+    "policy_receipts",
 ];
 
 /// Expected role for the executable opening a storage repository.
@@ -67,7 +69,17 @@ impl RuntimeRole {
             .map(|name| format!("{name}:SELECT"))
             .collect();
         match self {
-            Self::Serve => grants.push("pg_advisory_xact_lock_shared(bigint):EXECUTE".to_owned()),
+            Self::Serve => grants.extend(
+                [
+                    "pg_advisory_xact_lock_shared(bigint):EXECUTE",
+                    "policy_state.singleton:SELECT",
+                    "policy_state.rights_epoch:SELECT",
+                    "policy_restrictions.rfc_id:SELECT",
+                    "policy_restrictions.ceiling:SELECT",
+                    "policy_restrictions.epoch:SELECT",
+                ]
+                .map(str::to_owned),
+            ),
             Self::Sync => {
                 for name in [
                     "sync_jobs",
@@ -75,6 +87,8 @@ impl RuntimeRole {
                     "notification_outbox",
                     "blob_deletion_queue",
                     "ingestion_checkpoints",
+                    "policy_state",
+                    "policy_restrictions",
                 ] {
                     grants.push(format!("{name}:SELECT"));
                 }
@@ -93,6 +107,8 @@ impl RuntimeRole {
                     "generation_ingestion",
                     "generation_audit",
                     "generation_source_evidence",
+                    "generation_policy",
+                    "policy_receipts",
                 ] {
                     grants.push(format!("{name}:INSERT"));
                 }
@@ -101,7 +117,7 @@ impl RuntimeRole {
                     (
                         "document_versions",
                         "INSERT",
-                        "identity rfc_id txt_digest byte_length parser_version index_version encoding indexing_state notice_state notice_policy index_identity section_state line_starts",
+                        "identity rfc_id txt_digest byte_length parser_version index_version encoding indexing_state notice_state notice_policy index_identity section_state line_starts policy_receipt",
                     ),
                     ("document_versions", "UPDATE", "sealed"),
                     (
@@ -154,6 +170,8 @@ impl RuntimeRole {
                         "store_source_checkpoint(text,bytea,integer,text,bytea,text,bytea):EXECUTE",
                         "queue_orphan_blobs(bytea[]):EXECUTE",
                         "finish_blob_deletion(bytea):EXECUTE",
+                        "approve_policy(bytea,text,bytea,bytea,text):EXECUTE",
+                        "restrict_policy(integer,text,text,text,bigint):EXECUTE",
                     ]
                     .map(str::to_owned),
                 );
@@ -407,6 +425,22 @@ impl std::fmt::Display for GenerationUnavailable {
 
 impl std::error::Error for GenerationUnavailable {}
 
+tokio::task_local! {
+    static OBSERVED_RIGHTS: std::cell::Cell<Option<i64>>;
+}
+
+/// Capture the rights epoch of the generation read by a buffered MCP call.
+pub async fn observe_rights<T>(
+    operation: impl std::future::Future<Output = T>,
+) -> (T, Option<i64>) {
+    OBSERVED_RIGHTS
+        .scope(std::cell::Cell::new(None), async {
+            let result = operation.await;
+            (result, OBSERVED_RIGHTS.with(std::cell::Cell::get))
+        })
+        .await
+}
+
 /// Keeps both the database snapshot selection and the mirror fence alive.
 pub struct GenerationReadGuard<'a> {
     tx: Transaction<'a>,
@@ -414,6 +448,7 @@ pub struct GenerationReadGuard<'a> {
     _fence: File,
     generation: GenerationId,
     sequence: i64,
+    rights_epoch: i64,
 }
 
 /// An original file selected through generation membership. The mirror fence
@@ -456,6 +491,10 @@ impl GenerationReadGuard<'_> {
 
     pub fn publication_sequence(&self) -> i64 {
         self.sequence
+    }
+
+    pub fn rights_epoch(&self) -> i64 {
+        self.rights_epoch
     }
 
     /// Bind generation-scoped metadata queries to `generation()`.
@@ -663,8 +702,9 @@ async fn read_generation<T>(
         // generation was retired while the advisory lock was pending.
         let row = tx
             .query_opt(
-                "SELECT last_publication_sequence FROM rfc.generations
-         WHERE id = $1 AND state IN ('published', 'retained')",
+                "SELECT last_publication_sequence,
+                        (SELECT rights_epoch FROM rfc.policy_state WHERE singleton)
+                 FROM rfc.generations WHERE id = $1 AND state IN ('published', 'retained')",
                 &[&id],
             )
             .await?;
@@ -672,12 +712,15 @@ async fn read_generation<T>(
             let (mirror, fence) =
                 mirror.ok_or("readable generation is missing its mirror fence")?;
             let sequence = resolved_sequence.unwrap_or(row.try_get(0)?);
+            let rights_epoch = row.try_get(1)?;
+            let _ = OBSERVED_RIGHTS.try_with(|observed| observed.set(Some(rights_epoch)));
             let guard = GenerationReadGuard {
                 tx,
                 mirror: &mirror,
                 _fence: fence,
                 generation,
                 sequence,
+                rights_epoch,
             };
             return match operation(&guard).await? {
                 ReadOutcome::Complete(result) => {
@@ -798,6 +841,36 @@ pub async fn load_manifest(db: &impl GenericClient, generation: GenerationId) ->
     } else {
         None
     };
+    let policy = db
+        .query_opt(
+            "SELECT encode(registry_digest, 'hex'), classifier, fixture
+         FROM rfc.generation_policy WHERE generation_id = $1",
+            &[&id],
+        )
+        .await?
+        .map(|row| -> Result<_> { Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)) })
+        .transpose()?;
+    if let Some((registry, classifier, _)) = &policy {
+        for row in db.query(
+            "SELECT m.rfc_id::integer, d.txt_digest::bytea, d.notice_policy,
+                    d.policy_receipt::bytea, p.receipt::text
+             FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity = m.document_version
+             LEFT JOIN rfc.policy_receipts p ON p.identity = d.policy_receipt
+             WHERE m.generation_id = $1", &[&id],
+        ).await? {
+            let receipt: crate::policy::Receipt = serde_json::from_str(row.try_get::<_, &str>(4)?)?;
+            let original = BlobDigest::from_bytes(row.try_get::<_, &[u8]>(1)?.try_into()?);
+            if receipt.rfc != u32::try_from(row.try_get::<_, i32>(0)?)?
+                || receipt.source_digest != original.to_string()
+                || receipt.decision.name() != row.try_get::<_, &str>(2)?
+                || receipt.registry_digest != *registry || receipt.classifier != *classifier
+                || receipt.digest()?.as_bytes().as_slice() != row.try_get::<_, &[u8]>(3)?
+                || (receipt.decision == crate::policy::Policy::ExcerptAllowed && !receipt.eligible_for_excerpt())
+            {
+                return Err("generation contains invalid policy decision evidence".into());
+            }
+        }
+    }
     Ok(Manifest {
         parser_version: versions.try_get(0)?,
         index_version: versions.try_get(1)?,
@@ -806,6 +879,7 @@ pub async fn load_manifest(db: &impl GenericClient, generation: GenerationId) ->
         coverage,
         ingestion,
         audit,
+        policy,
     })
 }
 

@@ -8,6 +8,7 @@ use rfc_storage::{blob::BlobWriter, postgres::mirror_root};
 use std::{path::Path, process::ExitCode};
 
 const USAGE: &str = "rfc-mcp-docker-sync [status|watch|diagnose] [--json]\n\
+     Use policy --help for source-policy operations.\n\
      Run without arguments to start the daemon.\n\
      Use --check-config, --version, --phase1-check-storage, --phase2-reconcile (--full|--sample),\n\
      --phase3-(publish|rollback) GENERATION --expect-sequence SEQUENCE,\n\
@@ -48,6 +49,9 @@ async fn main() -> ExitCode {
 async fn run(args: &[String]) -> ProbeResult {
     match args {
         [] => run_daemon().await,
+        [command, args @ ..] if command == "policy" => {
+            rfc_mcp_docker_sync::policy_cli::run(args).await
+        }
         [option] if option == "--help" || option == "-h" => {
             println!("{USAGE}");
             Ok(())

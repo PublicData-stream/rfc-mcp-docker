@@ -873,7 +873,7 @@ def publication_contract(project, client, sources, first):
     initial = publication_snapshot(project)
     assert initial == "-1|0|0|0", initial
     generation = int(first["generation_id"])
-    assert project.sql(f"SELECT state,manifest_format FROM rfc.generations WHERE id={generation}") == "ready|3"
+    assert project.sql(f"SELECT state,manifest_format FROM rfc.generations WHERE id={generation}") == "ready|4"
     assert project.sql(f"""
         SELECT count(*), count(DISTINCT receipt), count(DISTINCT algorithm),
                bool_and(e.method='rsync_checksum_match' AND e.checksum_choice='auto'
@@ -1332,7 +1332,7 @@ def upgrade_publication(project, old_driver, sources, old_schema):
     project.ingestion_overlay = overlay
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "11"
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "12"
     assert history(project) == before
     client = project.start_mcp()
     phase6.wait(lambda: project.admin("/ready").returncode == 0)
@@ -1355,6 +1355,45 @@ def upgrade_publication(project, old_driver, sources, old_schema):
     publication_command(project, {"generation_id": str(first), "expected_publication_sequence": 3}, rollback=True)
     assert client.call("get", id=2119)[0]["original"]["source_verification"] == {"method": "rsync_integrity"}
     print(f"Populated schema {old_schema} upgraded twice and retained byte-exact rollback with original proof", flush=True)
+
+
+def upgrade_policy(project, old_driver, sources):
+    current = project.env["PHASE2_DRIVER"]
+    project.env["PHASE2_DRIVER"] = str(old_driver)
+    old = project.operation("sync", "full")
+    first, ready = None, None
+    for attempt in range(2):
+        report = json.loads(phase1.capture(old, env=project.env, timeout=100))
+        generation = int(report["generation_id"])
+        if attempt == 0:
+            first = generation
+            project.activate(first, 0)
+        else:
+            ready = generation
+    assert project.sql(f"SELECT manifest_format FROM rfc.generations WHERE id={first}") == "3"
+    before = history(project)
+    project.env["PHASE2_DRIVER"] = current
+    project.migrate()
+    project.migrate()
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "12"
+    assert history(project) == before
+    client = project.start_mcp()
+    phase6.wait(lambda: project.admin("/ready").returncode == 0)
+    load_mcp_schemas(client)
+    for id in (2119, 8174):
+        result = client.call("get", id=id)[0]
+        assert phase6.phase5.bytes_from(result["original"]) == sources[id]
+    publication_command(project, {"generation_id": str(ready), "expected_publication_sequence": 1},
+                        error="lacks source policy evidence")
+    replacement = manual(project)
+    new = int(replacement["generation_id"])
+    assert replacement["acquisition"]["txt_reused"] == len(sources)
+    assert project.sql(f"SELECT manifest_format FROM rfc.generations WHERE id={new}") == "4"
+    publication_command(project, replacement)
+    publication_command(project, {"generation_id": str(first), "expected_publication_sequence": 2}, rollback=True)
+    original = client.call("get", id=2119)[0]["original"]
+    assert phase6.phase5.bytes_from(original) == sources[2119]
+    print("Populated schema 11 upgraded twice, preserved the format-3 incumbent, and published format 4", flush=True)
 
 
 def exercise(project, work, spool, audit, incumbent_only, old_driver=None, scheduler_only=False, audit_only=False,
@@ -1386,7 +1425,10 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
     }}))
     project.ingestion_overlay = overlay
     if old_driver:
-        upgrade_publication(project, old_driver, sources, old_schema)
+        if old_schema == 11:
+            upgrade_policy(project, old_driver, sources)
+        else:
+            upgrade_publication(project, old_driver, sources, old_schema)
         return
     if incumbent_only:
         exercise_incumbent(project, sources, client)
@@ -1592,7 +1634,9 @@ def main():
     modes.add_argument("--upgrade-from-schema9", metavar="SCHEMA9_IMAGE_PREFIX",
                        help="seed a populated schema 9 store before running incumbent checks")
     modes.add_argument("--upgrade-from-schema10", metavar="SCHEMA10_IMAGE_PREFIX",
-                       help="qualify a populated schema 10 to 11 upgrade")
+                       help="qualify a populated schema 10 upgrade")
+    modes.add_argument("--upgrade-from-schema11", metavar="SCHEMA11_IMAGE_PREFIX",
+                       help="qualify a populated schema 11 to 12 upgrade")
     args = parser.parse_args()
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-https-discovery-", dir="/tmp") as directory:
@@ -1600,7 +1644,9 @@ def main():
         driver = work / "publication-driver"
         phase3.fixture_driver(docker, args.image_prefix, driver)
         old_driver = None
-        old_prefix = args.upgrade_from_schema10 or args.upgrade_from_schema9
+        old_prefix = args.upgrade_from_schema11 or args.upgrade_from_schema10 or args.upgrade_from_schema9
+        old_schema = next((version for version in (9, 10, 11)
+                           if getattr(args, f"upgrade_from_schema{version}")), None)
         if old_prefix:
             old_driver = work / "publication-driver-historical"
             phase3.fixture_driver(docker, old_prefix, old_driver)
@@ -1614,7 +1660,7 @@ def main():
                 exercise(project, work, spool, audit, args.incumbent_only or bool(old_driver), old_driver,
                          scheduler_only=args.scheduler_only, audit_only=args.audit_only,
                          publication_only=args.publication_only,
-                         old_schema=10 if args.upgrade_from_schema10 else 9 if args.upgrade_from_schema9 else None,
+                         old_schema=old_schema,
                          cold_daemon_only=args.cold_daemon_only, faults_only=args.faults_only)
             except Exception:
                 project.run("logs", "--no-color", "--tail", "15", "postgres", "sync", "fixtures", "feed",

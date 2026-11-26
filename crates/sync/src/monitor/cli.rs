@@ -84,6 +84,10 @@ impl Report {
                     db.publication_sequence
                 )?,
             }
+            writeln!(output, "Source rights epoch {}", db.rights_epoch)?;
+            for (decision, count) in &db.policy_documents {
+                writeln!(output, "Source policy {decision} {count} documents")?;
+            }
             for job in [&db.running_job, &db.pending_job, &db.last_terminal_job]
                 .into_iter()
                 .flatten()
