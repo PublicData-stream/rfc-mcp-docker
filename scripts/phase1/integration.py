@@ -360,7 +360,9 @@ def main():
             source.check("sync")
             source.check("serve")
             manifests = [line.split() for line in source.fixture("sync", "populate").splitlines()]
-            assert len(manifests) == 2 and manifests[0][1] == manifests[1][1]
+            assert len(manifests) == 2
+            (first_id, first_digest), (second_id, second_digest) = manifests
+            assert first_id != second_id and first_digest == second_digest
             print(f"Fixture manifest {manifests[0][1]} for two ready generations", flush=True)
             for generation, digest in manifests:
                 assert source.fixture("serve", "verify", generation) == f"verified {generation} {digest}"

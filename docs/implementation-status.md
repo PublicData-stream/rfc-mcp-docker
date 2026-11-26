@@ -84,6 +84,26 @@ Arm64 evidence covers registry manifests. Hosted CI, public deployment, and subs
 
 The Phase 1 gate covers the local rootless amd64 fixture profile and process interruption. Qualification on other hosts, physical power-loss behavior, live ingestion, publication recovery, and release restore of a serving corpus remain separate from this evidence.
 
+### Schema 12 fixture regression
+
+The amd64 Phase 1 CI job at `aefb82a` stopped at the ready transition
+because the storage fixture supplied format-3 inputs after migrating to
+schema 12. The fixture now records a synthetic policy bundle and two
+`metadata_only` receipts before sealing its private sample generations.
+[CI failure](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/45773566467/job/139757044871)
+
+On 2026-11-26, the offline Rust gate and the frozen all-feature Clippy
+and test commands passed with Rust 1.100.0. Fresh Linux amd64 images
+built and loaded through `scripts/ci/docker-e2e.py` with Docker 29.10.1
+and Compose v5.8.0. Phases 0, 1, and 8 passed through the same runner.
+Phase 1 applied the migrations twice, sealed distinct ready generations
+with equal format-4 manifest digests, and verified both policy receipts
+after PostgreSQL recreation and after restoring the database and all
+three blobs into a fresh project. The active generation stayed unset at
+sequence zero. Phase 8 verified 16 restored blobs, 773 indexed ranges
+and line starts, and three manifests. It preserved publication sequence
+2 and rights epoch 1.
+
 ## Phase 2
 
 **Verified locally on rootless Linux amd64 on 2026-11-22.** Runtime code at 60a9c38 passed the fixture gate and the bounded live-upstream smoke on Linux 7.0.0-44-generic, Docker Engine 29.10.0, Docker Compose v5.8.0, Rust 1.99.1, and the Phase 0 PostgreSQL 19.0 image pin. The lockfile selects roxmltree 0.21.2 and Rustls 0.23.46. Cargo artifacts used /tmp/rust/target. The disposable projects kept fixture inputs, test credentials, and volume backing directories under /tmp. [Ingestion commands and storage contracts](ingestion.md)
