@@ -13,7 +13,7 @@ use axum::{
     Extension, Router,
     body::{Body, to_bytes},
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, header, uri::Authority},
+    http::{StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -45,6 +45,11 @@ use tokio::{
     sync::Semaphore,
     time::{Instant, timeout, timeout_at},
 };
+
+#[path = "public/client_ip.rs"]
+mod client_ip;
+
+use client_ip::ClientIp;
 
 const RESPONSE_LIMIT: usize = 256 * 1024;
 const SEARCH_TAIL_RESERVE: usize = 4096;
@@ -295,7 +300,7 @@ struct Admission {
     rg: Arc<Rg>,
     in_flight: Semaphore,
     sources: Mutex<HashMap<IpAddr, Bucket>>,
-    proxies: Vec<IpAddr>,
+    client_ip: ClientIp,
     hosts: Vec<Authority>,
     origins: Vec<String>,
     requests: AtomicU64,
@@ -304,12 +309,12 @@ struct Admission {
 }
 
 impl Admission {
-    fn new(rg: Arc<Rg>, proxies: Vec<IpAddr>, hosts: Vec<Authority>, origins: Vec<String>) -> Self {
+    fn new(rg: Arc<Rg>, client_ip: ClientIp, hosts: Vec<Authority>, origins: Vec<String>) -> Self {
         Self {
             rg,
             in_flight: Semaphore::new(REQUESTS),
             sources: Mutex::default(),
-            proxies,
+            client_ip,
             hosts,
             origins,
             requests: AtomicU64::new(0),
@@ -350,21 +355,6 @@ impl Admission {
             return Ok(());
         }
         Err(StatusCode::FORBIDDEN)
-    }
-
-    fn source(&self, peer: IpAddr, headers: &HeaderMap) -> Result<IpAddr, StatusCode> {
-        if !self.proxies.contains(&peer) {
-            return Ok(peer);
-        }
-        let mut values = headers.get_all("x-real-ip").iter();
-        let source = values
-            .next()
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<IpAddr>().ok())
-            .map(|ip| ip.to_canonical());
-        source
-            .filter(|_| values.next().is_none())
-            .ok_or(StatusCode::BAD_REQUEST)
     }
 
     fn take(&self, source: IpAddr, now: Instant) -> bool {
@@ -410,7 +400,7 @@ async fn admit(
         .get::<Peer>()
         .expect("listener supplies peer")
         .0;
-    let source = match admission.source(peer, request.headers()) {
+    let source = match admission.client_ip.source(peer, request.headers()) {
         Ok(source) => source,
         Err(status) => return status.into_response(),
     };
@@ -558,6 +548,7 @@ pub async fn run() -> ProbeResult {
                 .map_err(|_| invalid("RFC_MCP_TRUSTED_PROXIES"))
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let client_ip = ClientIp::load(proxies)?;
     let key_path = setting("RFC_MCP_CURSOR_KEY_FILE", "/run/secrets/rfc_cursor_key")?;
     let key: [u8; 48] = fs::read(key_path)
         .map_err(|_| invalid("RFC_MCP_CURSOR_KEY_FILE"))?
@@ -566,7 +557,7 @@ pub async fn run() -> ProbeResult {
     let rg = Arc::new(Rg::initialize().await);
     let admission = Arc::new(Admission::new(
         rg.clone(),
-        proxies,
+        client_ip,
         allowed,
         origins.clone(),
     ));

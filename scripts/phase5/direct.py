@@ -29,10 +29,15 @@ def headers(method, source):
     return fields
 
 
-def request(source, path="/mcp"):
-    with_socket = http.client.HTTPConnection("serve", 8780, timeout=3)
+def request(source, path="/mcp", *, header="X-Real-IP", host="serve"):
+    fields = headers("server/discover", source)
+    if header != "X-Real-IP":
+        fields["X-Real-IP"] = "192.0.2.254"
+        if source is not None:
+            fields[header] = source
+    with_socket = http.client.HTTPConnection(host, 8780, timeout=3)
     try:
-        with_socket.request("POST", path, discovery(), headers("server/discover", source))
+        with_socket.request("POST", path, discovery(), fields)
         response = with_socket.getresponse()
         response.read()
         return response.status
@@ -48,11 +53,36 @@ def start(fields, body, length):
     return sock
 
 
-if sys.argv[1] == "untrusted":
-    assert request("192.0.2.1", "/metrics") == 404
-    statuses = [request(f"192.0.2.{number}") for number in range(1, 16)]
+def untrusted(header, host):
+    assert request("192.0.2.1", "/metrics", header=header, host=host) == 404
+    statuses = [request(f"192.0.2.{number}", header=header, host=host) for number in range(1, 16)]
     assert statuses[:10] == [200] * 10 and 429 in statuses[10:], statuses
-    print("Untrusted X-Real-IP did not bypass the socket-peer rate limit")
+    print(f"Socket-peer rate limit verified for an untrusted sender of {header}")
+
+
+def chain(host):
+    header = "X-Forwarded-For"
+    request_args = {"header": header, "host": host}
+    assert request(None, **request_args) == 400
+    assert request("192.0.2.1, , 203.0.113.3", **request_args) == 400
+    assert request("203.0.113.3", **request_args) == 400
+    # A changing prefix must resolve to the same address behind the trusted hop.
+    statuses = [request(f"192.0.2.{number}, 2001:db8::9, 203.0.113.3", **request_args)
+                for number in range(1, 16)]
+    assert statuses[:10] == [200] * 10 and 429 in statuses[10:], statuses
+    # A different resolved address gets its own bucket even with the same legacy header.
+    statuses = [request(f"192.0.2.1, 198.51.100.{number}, 203.0.113.3", **request_args)
+                for number in range(1, 16)]
+    assert statuses == [200] * 15, statuses
+    print("Alternate header chain selection, rejection, and rate limits verified")
+
+
+if sys.argv[1] == "untrusted":
+    untrusted("X-Real-IP", "serve")
+elif sys.argv[1] == "untrusted-chain":
+    untrusted("X-Forwarded-For", sys.argv[2] if len(sys.argv) > 2 else "serve")
+elif sys.argv[1] == "chain":
+    chain(sys.argv[2] if len(sys.argv) > 2 else "serve")
 elif sys.argv[1] == "trusted":
     assert [request(f"192.0.2.{number}") for number in range(1, 16)] == [200] * 15
     connection = http.client.HTTPConnection("serve", 8780, timeout=3)

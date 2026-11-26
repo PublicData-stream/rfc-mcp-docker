@@ -166,7 +166,41 @@ service. [Schema 9 deployment instructions](https://github.com/PublicData-stream
 
 ## Proxy and network boundaries
 
-Route HTTPS `/mcp` to the serve ingress address on port 8780. Preserve the external Host, Origin, relevant MCP request headers, content type, and Accept. Strip client-supplied forwarding headers and set `X-Real-IP` from the validated client address at the configured trusted proxy. Keep the request body limit at 64 KiB and the backend response timeout above the server's 15-second deadline. Bound headers and configure header and body read timeouts. Health and metrics use serve loopback. The two control listeners use dedicated private addresses.
+Route HTTPS `/mcp` to the serve ingress address on port 8780. Preserve the external Host, Origin, relevant MCP request headers, content type, and Accept. Keep the request body limit at 64 KiB and the backend response timeout above the server's 15-second deadline. Bound headers and configure header and body read timeouts. Health and metrics use serve loopback. The two control listeners use dedicated private addresses.
+
+At the edge proxy, strip client-supplied forwarding headers, including the
+selected client IP header, and write that header with the observed client
+IP. Serve defaults to `X-Real-IP` and one bare IP address. To select a
+different header, set `RFC_MCP_CLIENT_IP_HEADER` in the Compose environment
+file. In a multi-proxy deployment, set `RFC_MCP_CLIENT_IP_HEADER_MODE=chain`
+and have each subsequent trusted proxy append its observed peer to the
+same comma-separated field. For example, the header name can be
+`X-Forwarded-For`. Set `RFC_MCP_TRUSTED_PROXIES` to the IPs of the immediate
+ingress proxy and each trusted hop whose address can occur in the field.
+When omitted, Compose trusts the address in `RFC_INGRESS_PROXY_IP`. Each
+address on the list can also supply client identity if it reaches Serve
+directly. Keep Serve reachable only on the private ingress route.
+
+For TOML, copy the [Serve example](../deploy/serve.toml.example) to the
+regular file named by `RFC_SERVE_CONFIG_HOST_FILE`. Give the Serve container
+read access and include the [Serve overlay](../deploy/compose.serve-config.yml)
+after the base file in every Compose command. Omit the equivalent
+environment keys to use the TOML values. Serve reads the UTF-8 file on
+startup and rejects unknown keys or files over 16 KiB.
+
+```sh
+docker compose -f compose.yml -f deploy/compose.serve-config.yml --env-file "$RFC_ENV_FILE" config --quiet
+```
+
+To move between header names, first configure the proxy to emit both names
+with the values required by the old and new modes. Strip incoming copies
+of both at the edge. Apply the new Serve settings and run
+`compose up -d --no-deps --force-recreate rfc-mcp-docker-serve` using the
+same Compose files. Verify MCP requests through the proxy, then remove the
+old header. For rollback, restore emission of the previous header and
+mode before recreating Serve with its previous settings. If the name
+stays the same and the modes require different field values, coordinate
+the proxy and Serve changes in a maintenance window.
 
 Verify the proxy and backend paths after container recreation. Sync owns upstream egress. Feed uses only the internal control network. Configure the host firewall for Docker forwarding and applicable IPv6 routes. Treat external proxy exposure, registry publication, and live upstream verification as separate operations.
 
@@ -225,7 +259,7 @@ docker compose --env-file "$RFC_ENV_FILE" exec -T postgres psql -X -U postgres -
 
 Compare the publication sequence and most recent successful sync job with the expected reconciliation window. Verify a recent RFC over the public MCP route after proxy or container changes. A healthy container with a stale publication warrants checking sync and feed logs, queued jobs, and the upstream response before retrying. An outbox delay can coexist with a current MCP result because serve resolves the committed active pointer. [Control plane](control.md)
 
-HTTP 429 carries `Retry-After: 1`. Reduce client burst and concurrency, and verify that the proxy sets `X-Real-IP` from the actual client address. For a tool deadline, budget error, or partial scan, narrow the query or continue with a valid cursor. Check in-flight requests, admission rejections, database readers, and ripgrep availability before adjusting limits. Keep the sandbox and its failure checks enabled. [MCP tools and budgets](mcp.md)
+HTTP 429 carries `Retry-After: 1`. Reduce client burst and concurrency, and verify that the proxy sets the selected client IP header and that Serve trusts the intended proxy addresses. For a tool deadline, budget error, or partial scan, narrow the query or continue with a valid cursor. Check in-flight requests, admission rejections, database readers, and ripgrep availability before adjusting limits. Keep the sandbox and its failure checks enabled. [MCP tools and budgets](mcp.md)
 
 Use the receiver-first procedure for each [HMAC key rotation](control.md#clock-and-key-rotation). Drain and back up before an upgrade, validate the new Compose configuration and pinned image identities, then apply migrations with the local PostgreSQL administrator. Check the schema version, TLS, roles, storage, readiness, proxy path, and a pinned MCP read before reopening ingress. Use the [publication runbook](publication.md) for GC, sequence-bound rollback, backup, restore, and corruption. Schema rollback requires a compatible backup and fresh-volume restore when the previous binary cannot read the upgraded schema.
 

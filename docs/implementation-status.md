@@ -1764,3 +1764,32 @@ Both passed. The config probe also verified that `--check-config`
 returns valid JSON for the default and mounted configurations.
 
 [Sync monitoring commands and log levels](ingestion.md#monitor-sync)
+
+## Serve client IP header configuration
+
+Local verification on 2026-11-26 used Rust 1.100.0, rootless Docker
+29.10.1 and Compose 5.8.0 on Linux amd64.
+
+- The offline Rust gate, frozen all-feature Clippy and tests, and Phase 8
+  HTTP smoke passed. Focused tests covered header selection, address
+  normalization, and validation of trusted chains. The real Serve process
+  rejected 11 invalid startup configurations before binding, including
+  malformed and oversized TOML.
+- Phase 0 Compose passed against rebuilt service images. Compose rendering
+  verified the default proxy address, environment overrides, and the
+  optional read-only TOML mount scoped to Serve.
+- Phase 5 Compose passed with the default TLS proxy and after recreating
+  Serve with `X-Forwarded-For` in chain mode. Requests from the trusted
+  proxy with changing chain prefixes shared the resolved client's bucket.
+  Distinct clients received separate buckets. Direct callers remained
+  limited by their socket peer.
+- Rootless Minikube 1.39.0 with Kubernetes 1.37.0 loaded the same Serve
+  image and a TOML ConfigMap. Separate trusted and untrusted client pods
+  verified acceptance of valid chains, HTTP 400 for invalid requests from
+  the trusted peer, per-client buckets, and socket-peer limits for
+  untrusted peers. The first run passed its wire assertions and timed out
+  waiting for namespace deletion. The rerun passed and removed the
+  disposable profile and namespace together.
+
+[Client IP settings](mcp.md#serving-in-docker-compose) ·
+[Proxy configuration and rollout](deployment.md#proxy-and-network-boundaries)

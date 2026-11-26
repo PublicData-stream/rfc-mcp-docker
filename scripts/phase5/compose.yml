@@ -5,6 +5,8 @@ services:
       RFC_MCP_HOSTS: rfc.test
       RFC_MCP_ORIGINS: https://rfc.test
       RFC_MCP_TRUSTED_PROXIES: ${PHASE5_PROXY_IP:-}
+      RFC_MCP_CLIENT_IP_HEADER: ${PHASE5_CLIENT_IP_HEADER:-X-Real-IP}
+      RFC_MCP_CLIENT_IP_HEADER_MODE: ${PHASE5_CLIENT_IP_HEADER_MODE:-single}
     volumes:
       - ${PHASE5_DIR}/cursor-key:/run/secrets/rfc_cursor_key:ro
     networks:

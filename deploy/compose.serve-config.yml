@@ -1,0 +1,11 @@
+services:
+  rfc-mcp-docker-serve:
+    environment:
+      RFC_SERVE_CONFIG_FILE: /etc/rfc-mcp/serve.toml
+    volumes:
+      - type: bind
+        source: ${RFC_SERVE_CONFIG_HOST_FILE:?Set RFC_SERVE_CONFIG_HOST_FILE}
+        target: /etc/rfc-mcp/serve.toml
+        read_only: true
+        bind:
+          create_host_path: false

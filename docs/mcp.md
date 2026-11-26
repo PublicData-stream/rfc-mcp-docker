@@ -59,10 +59,20 @@ Start `rfc-mcp-docker-serve` with its default entry point. Configure its existin
 | `RFC_MCP_ADMIN_BIND` | Loopback bind for GET `/live`, `/ready`, and `/metrics`. Default `127.0.0.1:8781`. |
 | `RFC_MCP_HOSTS` | Required comma-separated allowed Host authorities. A listed port must match. |
 | `RFC_MCP_ORIGINS` | Comma-separated canonical allowed origins, such as `https://rfc.example`. Requests without Origin are accepted. |
-| `RFC_MCP_TRUSTED_PROXIES` | Comma-separated trusted socket peer IPs. Each trusted peer must overwrite `X-Real-IP` with one IP. Direct callers are limited by their socket peer. |
+| `RFC_MCP_TRUSTED_PROXIES` | Comma-separated trusted proxy IPs. Serve uses the list to check the socket peer and to recognize trusted hops in chain mode. Direct callers are limited by their socket peer. |
+| `RFC_MCP_CLIENT_IP_HEADER` | Case-insensitive name of the client IP header. Default `X-Real-IP`. |
+| `RFC_MCP_CLIENT_IP_HEADER_MODE` | `single` accepts one bare IP address. `chain` accepts comma-separated bare IP addresses in client-to-Serve order. Default `single`. |
+| `RFC_SERVE_CONFIG_FILE` | Optional path to a UTF-8 TOML file with top-level `client_ip_header` and `client_ip_header_mode` keys. Environment settings take precedence per key. Explicit values in each source must be valid. |
 | `RFC_MCP_CURSOR_KEY_FILE` | Cursor key mount path. Default `/run/secrets/rfc_cursor_key`. |
 
 Terminate HTTPS at the ingress proxy and preserve the validated Host and MCP headers. Keep the database and admin listener on private routes. The server bounds request bodies to 64 KiB, reads headers within five seconds, and allows 15 seconds for a request after its headers arrive. Initial admission limits are 16 simultaneous requests and five requests per second per source with a burst of ten. Shared network egress shares a bucket. Liveness indicates the process is running. Readiness returns HTTP 200 only when an active generation is readable and the ripgrep sandbox is available. The loopback metrics report `rfc_mcp_rg_available`.
+
+For a trusted socket peer, Serve requires exactly one instance of the
+selected header. In chain mode it scans from the right, skips trusted
+proxy addresses, and limits requests by the first untrusted address. It
+returns HTTP 400 for missing or repeated fields, malformed values, or a
+chain containing only trusted addresses. Both modes accept IPv4 and IPv6
+and normalize IPv4-mapped IPv6 addresses. [Configure the ingress proxy](deployment.md#proxy-and-network-boundaries)
 
 Propagate downstream disconnects from the proxy. Serve closes the dedicated database socket when a read is cancelled. PostgreSQL checks that socket every 100 ms during queries so it can release a blocked read promptly. [PostgreSQL TCP settings](https://www.postgresql.org/docs/19/runtime-config-connection.html#GUC-CLIENT-CONNECTION-CHECK-INTERVAL)
 

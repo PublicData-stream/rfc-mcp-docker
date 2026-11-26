@@ -537,6 +537,20 @@ def main():
             project.run("exec", "-T", "proxy", "python3", "-B", "/phase5/direct.py", "trusted")
             cancellation(project, client)
             publication(project, client, first, cursor, rg_page)
+            project.env.update(
+                PHASE5_CLIENT_IP_HEADER="X-Forwarded-For",
+                PHASE5_CLIENT_IP_HEADER_MODE="chain",
+                PHASE5_PROXY_IP=project.env["PHASE5_PROXY_IP"] + ",203.0.113.3",
+            )
+            project.run("up", "-d", "--no-deps", "--force-recreate", "serve")
+            for _ in range(25):
+                if project.admin("/live").returncode == 0:
+                    break
+                time.sleep(0.2)
+            assert project.admin("/live").returncode == 0
+            project.run("exec", "-T", "proxy", "python3", "-B", "/phase5/direct.py", "chain")
+            project.run("run", "--rm", "--no-deps", "-T", "--entrypoint", "python3", "proxy",
+                        "-B", "/phase5/direct.py", "untrusted-chain")
         except Exception:
             subprocess.run(project.command("logs", "--tail", "30", "serve", "proxy"),
                            env=project.env, timeout=15, check=False)
