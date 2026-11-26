@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_postgres::{
     Client, Connection, GenericClient, IsolationLevel, Socket, Transaction, config::SslMode,
 };
@@ -23,6 +23,8 @@ pub use pool::{PoolClass, PoolConfig, PoolError, ReadOutcome, ServePool};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const SCHEMA_VERSIONS: [i32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+/// The latest migration required by this build.
+pub const STORAGE_SCHEMA_VERSION: i32 = SCHEMA_VERSIONS[SCHEMA_VERSIONS.len() - 1];
 const READ_DEADLINE: Duration = Duration::from_secs(15);
 const PUBLIC_READS: &[&str] = &[
     "schema_migrations",
@@ -187,10 +189,14 @@ pub async fn connect(role: RuntimeRole) -> Result<Client> {
 }
 
 async fn open_session(role: RuntimeRole) -> Result<(Client, tokio::task::JoinHandle<()>)> {
-    timeout(Duration::from_secs(10), connect_and_verify(role)).await?
+    let deadline = Instant::now() + Duration::from_secs(10);
+    timeout_at(deadline, connect_and_verify(role, deadline)).await?
 }
 
-async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::JoinHandle<()>)> {
+async fn connect_and_verify(
+    role: RuntimeRole,
+    deadline: Instant,
+) -> Result<(Client, tokio::task::JoinHandle<()>)> {
     let (client, connection) = connect_transport(role, DatabaseFiles::read()?).await?;
     struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
     impl Drop for AbortOnDrop {
@@ -203,8 +209,38 @@ async fn connect_and_verify(role: RuntimeRole) -> Result<(Client, tokio::task::J
     let mut driver = AbortOnDrop(Some(tokio::spawn(async move {
         let _ = connection.await;
     })));
-    verify(&client, role).await?;
+    if let Err(error) = verify(&client, role).await {
+        drop(client);
+        let connection = driver.0.as_mut().expect("driver is present");
+        if timeout_at(deadline, connection).await.is_ok() {
+            driver.0.take();
+        }
+        return Err(error);
+    }
     Ok((client, driver.0.take().expect("driver is present")))
+}
+
+/// Check storage as the runtime role without opening the mirror or starting services.
+pub async fn check_storage_schema(role: RuntimeRole) -> Result<()> {
+    let (client, mut driver) = open_session(role).await.map_err(|error| {
+        format!(
+            "{} database preflight failed: {error}. Verify the image and database, then follow the initialization or upgrade procedure in docs/deployment.md.",
+            role.name()
+        )
+    })?;
+    drop(client);
+    match timeout(Duration::from_secs(1), &mut driver).await {
+        Ok(result) => result?,
+        Err(_) => {
+            driver.abort();
+            return Err("database preflight connection did not close".into());
+        }
+    }
+    println!(
+        "{} storage schema {STORAGE_SCHEMA_VERSION} verified",
+        role.name()
+    );
+    Ok(())
 }
 
 struct DatabaseFiles {
@@ -337,7 +373,13 @@ async fn verify(client: &impl GenericClient, role: RuntimeRole) -> Result<()> {
         .map(|row| row.get(0))
         .collect();
     if versions != SCHEMA_VERSIONS {
-        return Err("unsupported storage schema version".into());
+        return Err(format!(
+            "unsupported storage schema version for {}: expected {:?}, observed {:?}",
+            role.name(),
+            SCHEMA_VERSIONS,
+            versions
+        )
+        .into());
     }
     let differences = client.query(PRIVILEGE_CHECK, &[&role.privileges()]).await?;
     if !differences.is_empty() {

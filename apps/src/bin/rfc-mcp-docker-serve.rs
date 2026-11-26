@@ -7,7 +7,10 @@ mod public;
 use rfc_mcp_docker::ProbeResult;
 use rfc_storage::{
     blob::BlobReader,
-    postgres::{GenerationSelection, Reader, mirror_root},
+    postgres::{
+        GenerationSelection, Reader, RuntimeRole, STORAGE_SCHEMA_VERSION, check_storage_schema,
+        mirror_root,
+    },
 };
 
 fn main() -> ProbeResult {
@@ -46,6 +49,13 @@ fn main() -> ProbeResult {
 async fn run(args: &[String]) -> ProbeResult {
     match args {
         [] => public::run().await,
+        [option] if option == "--storage-schema-version" => {
+            println!("{STORAGE_SCHEMA_VERSION}");
+            Ok(())
+        }
+        [option] if option == "--check-storage-schema" => {
+            check_storage_schema(RuntimeRole::Serve).await
+        }
         [option] if option == "--version" => {
             println!("rfc-mcp-docker-serve {}", env!("CARGO_PKG_VERSION"));
             Ok(())

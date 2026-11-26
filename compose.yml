@@ -15,7 +15,39 @@ x-db-client: &db-client
   RFC_DB_CA_FILE: /run/secrets/db_ca
   RFC_DB_PASSWORD_FILE: /run/secrets/db_password
 
+x-db-preflight: &db-preflight
+  <<: *runtime
+  command: [--check-storage-schema]
+  restart: "no"
+  depends_on:
+    postgres: {condition: service_healthy}
+
+x-db-verified: &db-verified
+  postgres: {condition: service_healthy}
+  serve-db-preflight: {condition: service_completed_successfully}
+  sync-db-preflight: {condition: service_completed_successfully}
+
 services:
+  serve-db-preflight:
+    <<: *db-preflight
+    image: ${RFC_SERVE_IMAGE:?Set RFC_SERVE_IMAGE}
+    user: "10001:10001"
+    environment: *db-client
+    secrets:
+      - {source: db_ca, target: db_ca}
+      - {source: serve_database_password, target: db_password}
+    networks: [db_read]
+
+  sync-db-preflight:
+    <<: *db-preflight
+    image: ${RFC_SYNC_IMAGE:?Set RFC_SYNC_IMAGE}
+    user: "10002:10002"
+    environment: *db-client
+    secrets:
+      - {source: db_ca, target: db_ca}
+      - {source: sync_database_password, target: db_password}
+    networks: [db_write]
+
   rfc-mcp-docker-serve:
     <<: *runtime
     image: ${RFC_SERVE_IMAGE:?Set RFC_SERVE_IMAGE}
@@ -23,8 +55,7 @@ services:
     cpus: 2.0
     mem_limit: 768m
     stop_grace_period: 25s
-    depends_on:
-      postgres: {condition: service_healthy}
+    depends_on: *db-verified
     environment:
       <<: *db-client
       RFC_MCP_BIND: ${RFC_INGRESS_SERVE_IP:?Set RFC_INGRESS_SERVE_IP}:8780
@@ -69,8 +100,7 @@ services:
     mem_limit: 2g
     tmpfs:
       - /tmp:size=512m,mode=1777,nosuid,nodev,noexec
-    depends_on:
-      postgres: {condition: service_healthy}
+    depends_on: *db-verified
     environment:
       <<: *db-client
       RFC_SYNC_CONFIG_FILE: /etc/rfc-mcp/ingestion.toml

@@ -112,6 +112,18 @@ impl fmt::Display for PoolError {
 
 impl std::error::Error for PoolError {}
 
+fn verification_error(error: Option<&tokio_postgres::Error>) -> PoolError {
+    use tokio_postgres::error::SqlState;
+    match error.and_then(tokio_postgres::Error::code) {
+        Some(code)
+            if *code == SqlState::QUERY_CANCELED || *code == SqlState::LOCK_NOT_AVAILABLE =>
+        {
+            PoolError::Deadline
+        }
+        _ => PoolError::Unavailable,
+    }
+}
+
 /// Explicit transaction disposition. An interrupted page is already buffered and
 /// can be returned even though the session must be discarded.
 pub enum ReadOutcome<T> {
@@ -255,6 +267,10 @@ impl Session {
     }
 
     fn retire(mut self, deadline: Instant) {
+        self.begin_retirement(deadline);
+    }
+
+    fn begin_retirement(&mut self, deadline: Instant) {
         if let Some(sender) = self.retire.take() {
             let _ = sender.send(Retirement {
                 deadline,
@@ -686,29 +702,30 @@ impl ServePool {
         let client = session.client.as_mut().expect("session client");
         let result = timeout_at(deadline, async {
             let tx = client.build_transaction().read_only(true).start().await?;
-            verify(&tx, RuntimeRole::Serve).await?;
-            tx.commit().await?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            match verify(&tx, RuntimeRole::Serve).await {
+                Ok(()) => {
+                    tx.commit().await?;
+                    Ok::<_, tokio_postgres::Error>(None)
+                }
+                Err(error) => {
+                    tx.rollback().await?;
+                    Ok(Some(error))
+                }
+            }
         })
         .await;
-        if matches!(result, Ok(Ok(()))) && session.healthy() {
+        if matches!(result, Ok(Ok(None))) && session.healthy() {
             return Ok(());
         }
         self.0.metrics.verification_failures.fetch_add(1, Relaxed);
         match result {
             Err(_) => Err(PoolError::Deadline),
-            Ok(Err(error))
-                if error
-                    .downcast_ref::<tokio_postgres::Error>()
-                    .and_then(tokio_postgres::Error::code)
-                    .is_some_and(|code| {
-                        use tokio_postgres::error::SqlState;
-                        *code == SqlState::QUERY_CANCELED || *code == SqlState::LOCK_NOT_AVAILABLE
-                    }) =>
-            {
-                Err(PoolError::Deadline)
+            Ok(Ok(rejection)) => {
+                let rejected = rejection.as_deref().and_then(|error| error.downcast_ref());
+                session.begin_retirement(deadline);
+                Err(verification_error(rejected))
             }
-            Ok(_) => Err(PoolError::Unavailable),
+            Ok(Err(error)) => Err(verification_error(Some(&error))),
         }
     }
 
