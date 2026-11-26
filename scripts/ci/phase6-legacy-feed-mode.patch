@@ -1,0 +1,22 @@
+--- a/scripts/phase6/integration.py
++++ b/scripts/phase6/integration.py
+@@ -524,5 +524,12 @@
+     initial = int(project.sql("SELECT count(*) FROM rfc.control_events"))
+-    project.run("up", "-d", "--no-deps", "feed")
++    def set_feed_mode(scenario):
++        # The HTTP fixture reads this file while Feed polls.
++        pending_mode = project.source / "feed-mode.next"
++        pending_mode.write_text(scenario)
++        pending_mode.replace(project.source / "feed-mode")
++
+     for scenario in ("malformed", "oversized", "rate-limited"):
+-        (project.source / "feed-mode").write_text(scenario)
++        set_feed_mode(scenario)
++        if scenario == "malformed":
++            project.run("up", "-d", "--no-deps", "feed")
+         wait(lambda: f"feed scenario={scenario} at=" in project.capture("logs", "fixtures"))
+@@ -536,3 +543,3 @@
+     assert timestamps[1] - timestamps[0] >= 4
+-    (project.source / "feed-mode").write_text("ok")
++    set_feed_mode("ok")
+     wait(lambda: int(project.sql("SELECT count(*) FROM rfc.control_events")) == initial + 2)

@@ -441,6 +441,35 @@ to `scripts/ci/docker-e2e.py build` with `--builder` and
   originals with five HTTPS starts. Cleanup removed the disposable
   builders, image tags, profile, and both ext4 mounts.
 
+### Legacy Phase 6 Feed fixture
+
+The amd64 `phase6-legacy` probe failed its control-event count check
+after starting Feed and rewriting `feed-mode` in place. The fixture
+read the empty file between truncate and write and served valid Atom
+data during the malformed-feed check. The CI runner applies a fixture
+patch to the disposable schema 10 checkout for this case. The patch
+selects `malformed` before starting Feed and switches modes by atomic
+file replacement. [Failing GitHub Actions job](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/45776980589/job/139770845501)
+
+On 2026-11-26, both Docker engines verified the amd64 image bundle from
+the failed run, including the pinned schema 10 revision, archive checksum,
+and loaded image IDs. Holding the old mode file empty in a disposable
+checkout let Feed queue an event and reproduced the original assertion
+failure.
+
+- On Docker Engine 29.10.1 and Compose 5.8.0, the patched `phase6-legacy`
+  case passed twice on rootful Docker and once on rootless Docker. The
+  Feed fault scenarios left the event count unchanged, and valid Atom
+  polling added exactly two events. Conditional polling, duplicate
+  suppression, crash recovery, and key rotation also passed. One rootful
+  attempt timed out waiting for scheduled catalog publication before the
+  Feed checks. The retry passed.
+- The pinned `phase2` and `bootstrap-quick` controls and the current
+  `phase6` Compose control passed on rootful Docker. The current `phase0`
+  Compose probe passed on rootless Docker after a rootful container-start
+  timeout. The offline Phase 0 Rust gate and workflow lint passed.
+  Cleanup removed the replay image tags and the disposable Compose resources.
+
 ### Phase 3 checkpoint fixture
 
 The amd64 `phase3` check failed while removing `rfc102.xml`. The synthetic

@@ -165,6 +165,9 @@ def run_case(args, docker):
     args.evidence.mkdir(parents=True)
     legacy = args.case in LEGACY_CASES
     with (historical_checkout() if legacy else nullcontext(ROOT)) as checkout:
+        if args.case == "phase6-legacy":
+            patch = ROOT / "scripts" / "ci" / "phase6-legacy-feed-mode.patch"
+            run(["git", "-C", str(checkout), "apply", str(patch)])
         run_probe(args, docker, checkout, f"{args.image_prefix}-schema10" if legacy else args.image_prefix)
 
 
