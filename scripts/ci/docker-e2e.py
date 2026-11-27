@@ -39,6 +39,7 @@ CASE_FIXTURES = {
     "bootstrap-quick": ("publication-fixture", "control-fixture"),
     "https-publication": ("publication-fixture", "control-fixture"),
     "https-faults": ("publication-fixture", "control-fixture"),
+    "auto-upgrade": ("publication-fixture",),
 }
 ARCH_NAMES = {"x86_64": "amd64", "aarch64": "arm64", "amd64": "amd64", "arm64": "arm64"}
 
@@ -63,6 +64,8 @@ def image_targets(prefix, cases):
     if not cases:
         return {}
     targets = dict(APP_TARGETS)
+    if any(case in ("phase7", "phase8", "auto-upgrade") for case in cases):
+        targets["maintenance"] = "maintenance"
     for case in cases:
         for fixture in CASE_FIXTURES[case]:
             targets[fixture] = FIXTURE_TARGETS[fixture]
@@ -178,6 +181,8 @@ def run_probe(args, docker, checkout, image_prefix):
         case = "https-discovery"
     script = (scripts / "bootstrap" / "baseline.py" if args.case == "bootstrap-quick"
               else scripts / case / "integration.py")
+    if args.case == "auto-upgrade":
+        script = scripts / "https-discovery" / "automatic_upgrade.py"
     prefix_option = "--project" if args.case == "phase0" else "--image-prefix"
     command = [sys.executable, "-B", str(script), "--context", args.context, prefix_option, image_prefix]
     if args.case == "phase8":

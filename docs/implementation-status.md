@@ -2168,3 +2168,61 @@ The local deployment checks use disposable fixtures.
   confinement, native worker offsets, two-worker saturation, cancellation,
   reaping, and generation fence release. The private readiness and
   publication routes stayed responsive with the public pool saturated.
+
+## Automatic database migration at startup
+
+Production Compose preflights the target images and Sync configuration,
+prepares the database offline, and checks both runtime roles and source
+rights before admitting the applications. Populated upgrades make and
+rehearse an independent backup before SQL or PostgreSQL cutover. The host
+deploy command uses the same jobs and checks the serving path before
+resuming Sync and Feed. [Startup and recovery](deployment.md#initialize-or-upgrade)
+
+- Native Linux AMD64 passed the frozen Rust gate, all-feature Clippy and
+  tests, and rootless Phase 0. Compose configuration rendering and
+  workflow lint passed.
+- Rootless Compose initialized an empty PostgreSQL data directory and
+  mirror through ordinary startup. It upgraded PostgreSQL 19 application
+  schemas 9–12 to 13 and reused the running instance without another
+  backup on a second startup. The schema 12 case verified read-only
+  preflight, apply without application startup, and recovery after a
+  PostgreSQL kill.
+- The schema 11 case blocked a running database, an incompatible image,
+  malformed history, an altered canonical blob, and a backup filesystem
+  with exhausted inodes. An injected SQL error rolled back the migration.
+  A retry preserved the catalog and publication inventory.
+- The populated PostgreSQL 18 fixture migrated to 19 from both
+  `18/docker` and a configured relative directory. Plain Compose and
+  the host deploy path preserved sequence 2, the active and retained
+  generations, and rights epoch 1. The host path verified a byte-exact
+  MCP read before resuming Sync and Feed. Both stacks published after
+  cutover and kept their PostgreSQL 18 source. The restore comparison
+  verified the stored search text and the generated PostgreSQL 19 vectors.
+  The fixture discarded interrupted staging, read retained originals
+  byte-for-byte, and held a corpus lock to block a required rights
+  refresh. A retry rebuilt the missing rights before Serve started,
+  preserving the publication sequence and verified backup.
+- Phase 7 passed Compose startup, forced recreation, runtime confinement,
+  worker cancellation and reaping, and authenticated notification under
+  public pool saturation. A notification probe timed out during a
+  concurrent run. The serial rerun passed.
+- Phase 8 independently restored 17 canonical blobs, 814 ranges, and
+  three manifests. It kept the active pointer at generation 2, sequence
+  2, and reproduced the rights restriction through MCP.
+- Disposable rootless Minikube on Kubernetes 1.37.0 migrated schema 12 to
+  13, verified the backup restore, and restarted with the same catalog
+  and backup. The first pod attempt stopped during setup because its
+  service account projection conflicted with the read-only root. The
+  retry disabled that mount and passed.
+
+The migration release probe runs on AMD64 and ARM64. These local results
+use disposable fixtures on AMD64. Hosted release and production upgrade
+qualification are pending.
+
+Reproduce the Compose matrix with the matching test image prefix and
+temporary filesystems under `/tmp`.
+
+~~~sh
+python3 -B scripts/https-discovery/automatic_upgrade.py --image-prefix "$prefix"
+python3 -B scripts/https-discovery/minikube_upgrade.py --profile "$profile" --image "$prefix-maintenance"
+~~~

@@ -22,6 +22,10 @@ An occupied path is reusable after length and digest verification. A suspect ent
 
 ## Provision PostgreSQL 19
 
+Production Compose provisions and migrates the catalog during startup.
+The peer-socket commands below apply to manual recovery and standalone
+storage fixtures. [Compose deployment](deployment.md#initialize-or-upgrade)
+
 1. Initialize the dedicated `rfc` database with the pinned PostgreSQL image and a separate persistent data volume. Use UTF-8, ICU `und`, and SCRAM password encryption. Use a PostgreSQL TLS certificate with a SAN matching the hostname shared on the private Compose database networks. The [Compose test stack](../scripts/phase1/compose.yml) shows the image digest, volume layout, socket permissions, and initialization arguments.
 2. As the database administrator on a local connection, run the commands below from the repository or an equivalent read-only migration mount. Enter independent role passwords at the `psql` prompts and make them available to the matching service through secret files. The `rfc_owner` role is NOLOGIN. Migration objects and their default privileges belong to that role.
 
@@ -34,7 +38,7 @@ An occupied path is reusable after length and digest verification. A suspect ent
    ```
 
 3. Set `pg_hba.conf` to admit the two runtime roles only to `rfc`, over TLS with `scram-sha-256`, from the private database networks. Reserve local administrative access for provisioning and upgrades. Keep the database port private. Give serve and sync their own `RFC_DB_PASSWORD_FILE` mount and configure `RFC_DB_HOST` and `RFC_DB_CA_FILE`. The database port defaults to 5432 and the mirror root to `/mirror`. Each runtime defaults to its designated login and validates both session and effective role.
-4. Run sync's `--phase1-check-storage` first to verify its grants and prepare the mirror, then serve's equivalent check. The commands exit after checking runtime privileges and mount properties. Serve starts PostgreSQL transactions read-only by default and relies on database grants for authorization. The owner-run migration command applies and records versions 1 through 9 transactionally and can be rerun. When upgrading from version 1, rerun `bootstrap.sql` as an administrator before migrating to grant the sync role its session advisory lock.
+4. Run sync's `--phase1-check-storage` first to verify its grants and prepare the mirror, then serve's equivalent check. The commands exit after checking runtime privileges and mount properties. Serve starts PostgreSQL transactions read-only by default and relies on database grants for authorization. The owner-run migration command applies and records the bundled versions transactionally and can be rerun. When upgrading from version 1, rerun `bootstrap.sql` as an administrator before migrating to grant the sync role its session advisory lock.
 
 Schema 7 records source transport and supports rsync-only TXT observations without changing historical observation identities. A null fetch time on an rsync observation records a successful checksum check of an existing staged file. Existing HTTPS observations retain their fetch times and verification status. [TXT provenance and reuse](ingestion.md#txt-provenance-and-reuse)
 

@@ -69,11 +69,13 @@ copy before resuming Sync and Feed. Save the version and image
 references used for the snapshot. Back up private quarantine
 separately when it is needed for incident review.
 
-For a [Compose schema upgrade](deployment.md#upgrade-existing-volumes),
-keep the application services stopped through verification and migration.
-Provide the independent backup directory with the dump, inventories, and
-canonical blob tree. Take the dump in the same maintenance window using
-the PostgreSQL container that the upgrade will use for verification.
+[Automatic Compose upgrades](deployment.md#upgrade-existing-volumes) create
+this archive and inventory layout in a new private directory on
+`RFC_DB_BACKUP_HOST_DIR`. The maintenance job validates the mirror copies,
+restores the archive in an isolated PostgreSQL cluster, and publishes a
+receipt only after the restored data matches the source. The previous
+supplied-backup command remains available for manual recovery on a
+quiescent deployment.
 
 Restore into fresh volumes with the proxy route closed and all three application processes stopped. Provision PostgreSQL and the scoped roles as in the [deployment guide](deployment.md). Provision fresh secrets for the restored instance, or securely supply the prior cursor key when outstanding cursors must survive.
 

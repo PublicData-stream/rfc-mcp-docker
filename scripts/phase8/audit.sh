@@ -55,7 +55,7 @@ scan fs --scanners vuln --skip-db-update --format json \
 scan fs --scanners secret --format json --output "$work/source-secrets.json" "$work/source"
 python3 -B scripts/phase8/secret-summary.py "$work/source-secrets.json" > "$out/source-secrets.json"
 
-for role in serve sync feed postgres; do
+for role in serve sync feed maintenance postgres; do
     image=$prefix-$role
     if [[ $role == postgres ]]; then
         image=$postgres

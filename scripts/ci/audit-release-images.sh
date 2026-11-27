@@ -45,7 +45,7 @@ for package in application ripgrep; do
     scan fs --scanners vuln --skip-db-update --format json --output "$report" "$evidence/rust/$package"
     reports+=("$report")
 done
-for role in serve sync feed; do
+for role in serve sync feed maintenance; do
     id=$(jq -er --arg role "$role" '.images[$role].image_id' "$evidence/image-identities.json")
     scan image --image-src docker --skip-db-update --format cyclonedx --output "$evidence/$role.cdx.json" "$id"
     report=$evidence/$role-advisories.json

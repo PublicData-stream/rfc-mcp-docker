@@ -33,12 +33,14 @@ check test-all cargo test --workspace --all-features --frozen
 check fuzz-http python3 -B scripts/phase8/http-smoke.py
 check workflows actionlint
 check compose docker --context "$context" compose --env-file deploy/compose.env.example config --quiet
+check maintenance-image docker --context "$context" build --target maintenance -t "$prefix-maintenance" .
 check phase0 python3 -B scripts/phase0/integration.py --context "$context" --project "$prefix"
 
 for phase in 1 2 3 4 5 6 7; do
     check "phase$phase" python3 -B "scripts/phase$phase/integration.py" \
         --context "$context" --image-prefix "$prefix"
 done
+check auto-upgrade python3 -B scripts/https-discovery/automatic_upgrade.py --context "$context" --image-prefix "$prefix"
 check recovery python3 -B scripts/phase8/integration.py --context "$context" \
     --image-prefix "$prefix" --evidence "$evidence"
 check capacity python3 -B scripts/phase8/capacity.py --context "$context" \

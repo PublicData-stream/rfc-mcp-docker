@@ -126,7 +126,7 @@ def prepare(project, *, include_nul=False):
 
 
 @contextmanager
-def capped_stage(project, *, mebibytes=64, inodes=512, label="rsync"):
+def capped_stage(project, *, mebibytes=64, inodes=512, label="rsync", owner=10002):
     image = project.directory / f"{label}.ext4"
     mountpoint = project.directory / f"{label}-mount"
     mountpoint.mkdir()
@@ -143,9 +143,9 @@ def capped_stage(project, *, mebibytes=64, inodes=512, label="rsync"):
         def host_id(mapping):
             for line in mapping.strip().splitlines():
                 internal, external, count = map(int, line.split())
-                if internal <= 10002 < internal + count:
-                    return external + 10002 - internal
-            raise AssertionError("Sync UID or GID is outside the Docker namespace mapping")
+                if internal <= owner < internal + count:
+                    return external + owner - internal
+            raise AssertionError("requested owner is outside the Docker namespace mapping")
         uid, gid = map(host_id, maps.split(":"))
         run(["sudo", "-n", "chown", f"{uid}:{gid}", str(mountpoint)])
         run(["sudo", "-n", "chmod", "0700", str(mountpoint)])

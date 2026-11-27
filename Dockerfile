@@ -131,3 +131,16 @@ RUN --network=none \
 
 FROM runtime AS phase6-fixture
 COPY --from=phase6-build /out/rfc-phase6-sync /out/rfc-phase6-feed /
+
+FROM docker.io/library/postgres:18.7-alpine3.24@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71 AS postgres18
+
+FROM docker.io/library/postgres:19.0-alpine3.24@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188 AS maintenance
+ARG RFC_MAINTENANCE_VERSION=0.0.0
+ENV RFC_MAINTENANCE_VERSION=$RFC_MAINTENANCE_VERSION
+RUN apk add --no-cache python3=3.14.10-r2 b3sum=1.8.5-r0
+COPY --from=postgres18 /usr/local/ /opt/postgresql18/
+RUN /opt/postgresql18/bin/postgres --version
+COPY migrations /migrations
+COPY scripts/deploy/maintain.py /usr/local/libexec/rfc-maintain.py
+USER 70:70
+ENTRYPOINT ["python3", "-B", "/usr/local/libexec/rfc-maintain.py"]

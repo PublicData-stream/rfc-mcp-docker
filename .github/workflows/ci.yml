@@ -58,10 +58,10 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-26.04
-            cases: '["phase0","phase1","phase2","phase3","phase4","phase5","phase6","phase6-legacy","phase7","phase8","bootstrap-quick","https-publication","https-faults"]'
+            cases: '["phase0","phase1","phase2","phase3","phase4","phase5","phase6","phase6-legacy","phase7","phase8","bootstrap-quick","https-publication","https-faults","auto-upgrade"]'
           - arch: arm64
             runner: ubuntu-26.04-arm
-            cases: '["phase0","phase5","phase7","https-faults"]'
+            cases: '["phase0","phase5","phase7","https-faults","auto-upgrade"]'
     uses: ./.github/workflows/docker-e2e.yml
     with:
       arch: ${{ matrix.arch }}

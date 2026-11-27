@@ -39,9 +39,10 @@ def rejected(command, env, message):
 def application_gate(stack, message, *, force=True):
     flags = ["--force-recreate"] if force else []
     rejected(stack.command("up", "-d", *flags, "--wait", "--wait-timeout", "30",
-                           SERVE, SYNC, FEED), stack.env, "preflight")
+                           SERVE, SYNC, FEED), stack.env, "service")
     assert not stack.capture("ps", "-q", SERVE, SYNC, FEED)
-    logs = stack.capture("logs", "--no-log-prefix", "serve-db-preflight", "sync-db-preflight")
+    logs = stack.capture("logs", "--no-log-prefix", "serve-db-preflight", "sync-db-preflight",
+                         "db-maintenance", "serve-schema-preflight", "sync-config-preflight")
     assert message in logs, logs
 
 
@@ -164,7 +165,7 @@ def qualify(project, source_schema, originals, driver, mixed_sync=None):
             shutil.copyfile(original, path)
             blobs.append(path)
         dump(stack.command, stack.env, backup / "corpus.dump")
-        application_gate(stack, "unsupported storage schema version")
+        application_gate(stack, "running PostgreSQL requires maintenance", force=False)
         if source_schema == 11:
             verify_session_cleanup(stack, command)
             backup_faults(stack, backup, command, files, blobs)
@@ -200,7 +201,7 @@ def qualify(project, source_schema, originals, driver, mixed_sync=None):
             # A successful preflight from an earlier up must be checked again.
             stack.sql("-c", "UPDATE rfc.schema_migrations SET version = 99 WHERE version = 13")
             try:
-                application_gate(stack, "99]", force=False)
+                application_gate(stack, "running PostgreSQL requires maintenance", force=False)
             finally:
                 stack.sql("-c", "UPDATE rfc.schema_migrations SET version = 13 WHERE version = 99")
         for generation in files["readable"].splitlines():

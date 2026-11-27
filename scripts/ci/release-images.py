@@ -17,7 +17,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = "https://github.com/PublicData-stream/rfc-mcp-docker"
-ROLES = ("serve", "sync", "feed")
+ROLES = ("serve", "sync", "feed", "maintenance")
 PLATFORMS = {
     "amd64v3": {"os": "linux", "architecture": "amd64", "variant": "v3"},
     "arm64": {"os": "linux", "architecture": "arm64"},
@@ -166,7 +166,8 @@ def build(args):
             archive = args.artifacts / f"{role}.tar"
             metadata = source / "build-metadata.json"
             label_args = [arg for key, value in labels(args).items() for arg in ("--label", f"{key}={value}")]
-            run(*buildx, "--target", role, "--tag", image, *label_args, "--metadata-file", str(metadata),
+            role_args = ("--build-arg", f"RFC_MAINTENANCE_VERSION={args.version}") if role == "maintenance" else ()
+            run(*buildx, "--target", role, "--tag", image, *role_args, *label_args, "--metadata-file", str(metadata),
                 "--output", f"type=docker,oci-mediatypes=true,compression=gzip,force-compression=true,"
                             f"rewrite-timestamp=true,dest={archive}", str(source))
             descriptor, config = image_archive(archive, target, labels(args))
@@ -185,6 +186,9 @@ def build(args):
         run(*buildx, "--target", "phase0-fixtures", "--tag", f"{prefix}-fixtures", "--load", str(source))
         run(sys.executable, "-B", str(ROOT / "scripts/ci/docker-e2e.py"), "--context", args.context,
             "--image-prefix", prefix, "run", "phase0", str(args.evidence / "phase0"))
+        run(*buildx, "--target", "phase3-fixture", "--tag", f"{prefix}-publication-fixture", "--load", str(source))
+        run(sys.executable, "-B", str(ROOT / "scripts/ci/docker-e2e.py"), "--context", args.context,
+            "--image-prefix", prefix, "run", "auto-upgrade", str(args.evidence / "auto-upgrade"))
         inputs = args.evidence / "rust"
         run(*buildx, "--target", "audit-inputs", "--output", f"type=local,dest={inputs}", str(source))
         run("bash", str(ROOT / "scripts/ci/audit-release-images.sh"), args.context, args.kind,

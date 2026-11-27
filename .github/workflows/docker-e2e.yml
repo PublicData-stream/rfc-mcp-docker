@@ -92,7 +92,7 @@ jobs:
           python3 -B scripts/ci/docker-e2e.py --image-prefix "$RFC_E2E_IMAGE_PREFIX" \
             load "$RFC_E2E_BUNDLE_DIR" --arch "$RFC_E2E_ARCH" --cases "$RFC_E2E_CASES"
       - name: Provide the MCP schema validator
-        if: ${{ contains(fromJSON('["phase5","phase6","phase6-legacy","phase7","phase8","bootstrap-quick","https-publication","https-faults"]'), matrix.phase) }}
+        if: ${{ contains(fromJSON('["phase5","phase6","phase6-legacy","phase7","phase8","bootstrap-quick","https-publication","https-faults","auto-upgrade"]'), matrix.phase) }}
         run: |
           if ! /usr/bin/python3 -B -c 'from jsonschema import Draft202012Validator'; then
             sudo apt-get update

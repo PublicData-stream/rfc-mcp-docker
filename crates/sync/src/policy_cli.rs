@@ -63,7 +63,12 @@ pub async fn run(args: &[String]) -> Result<()> {
     let generation = flags.remove("--generation").map(str::parse).transpose()?;
     let id = flags.remove("--rfc").map(str::parse).transpose()?;
     match command {
-        "refresh" if flags.is_empty() && generation.is_none() && id.is_none() => refresh().await?,
+        "refresh" if flags.is_empty() && generation.is_none() && id.is_none() => {
+            refresh(false).await?
+        }
+        "refresh-startup" if flags.is_empty() && generation.is_none() && id.is_none() => {
+            refresh(true).await?;
+        }
         "explain" if flags.is_empty() && id.is_some() => {
             println!(
                 "{}",
@@ -195,8 +200,26 @@ async fn fence(db: &impl GenericClient) -> Result<()> {
     Ok(())
 }
 
-async fn refresh() -> Result<()> {
+async fn refresh(only_if_missing: bool) -> Result<()> {
     let mut writer = Writer::connect().await?;
+    if only_if_missing
+        && !writer
+            .client
+            .query_one(
+                "SELECT EXISTS (
+                   SELECT FROM rfc.generation_documents d
+                   JOIN rfc.generations g ON g.id = d.generation_id
+                   LEFT JOIN rfc.source_rights r ON (r.generation_id, r.rfc_id) = (d.generation_id, d.rfc_id)
+                   WHERE g.state IN ('published', 'retained') AND r.generation_id IS NULL
+                 )",
+                &[],
+            )
+            .await?
+            .try_get::<_, bool>(0)?
+    {
+        println!("Source rights already cover the readable generations");
+        return Ok(());
+    }
     let _coordinator = writer.acquire_coordinator().await?;
     let reader = BlobReader::open(&mirror_root(), false)?;
     let tx = writer.client.transaction().await?;

@@ -15,9 +15,28 @@ x-db-client: &db-client
   RFC_DB_CA_FILE: /run/secrets/db_ca
   RFC_DB_PASSWORD_FILE: /run/secrets/db_password
 
+x-schema-target: &schema-target
+  RFC_STORAGE_SCHEMA_TARGET: "13"
+
+x-sync-staging: &sync-staging
+  volumes:
+    - type: bind
+      source: ${RFC_SYNC_CONFIG_HOST_FILE:?Set RFC_SYNC_CONFIG_HOST_FILE}
+      target: /etc/rfc-mcp/ingestion.toml
+      read_only: true
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${RFC_SYNC_SPOOL_HOST_DIR:?Provision a private disk-backed HTTPS spool}
+      target: /rfc-https-spool
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${RFC_SYNC_AUDIT_HOST_DIR:?Provision a private disk-backed rsync audit volume}
+      target: /rfc-rsync-audit
+      bind: {create_host_path: false}
+
 x-db-preflight: &db-preflight
   <<: *runtime
-  command: [--check-storage-schema]
+  command: [--phase1-check-storage]
   restart: "no"
   depends_on:
     postgres: {condition: service_healthy}
@@ -26,16 +45,80 @@ x-db-verified: &db-verified
   postgres: {condition: service_healthy}
   serve-db-preflight: {condition: service_completed_successfully}
   sync-db-preflight: {condition: service_completed_successfully}
+  sync-rights-preflight: {condition: service_completed_successfully}
 
 services:
+  serve-schema-preflight:
+    <<: *runtime
+    image: ${RFC_SERVE_IMAGE:?Set RFC_SERVE_IMAGE}
+    user: "10001:10001"
+    environment: *schema-target
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        actual=$$(rfc-mcp-docker-serve --storage-schema-version)
+        test "$$actual" = "$$RFC_STORAGE_SCHEMA_TARGET" ||
+          { echo "Serve image schema $$actual differs from target $$RFC_STORAGE_SCHEMA_TARGET" >&2; exit 1; }
+    network_mode: none
+    restart: "no"
+
+  sync-config-preflight:
+    <<: [*runtime, *sync-staging]
+    image: ${RFC_SYNC_IMAGE:?Set RFC_SYNC_IMAGE}
+    user: "10002:10002"
+    mem_limit: 2g
+    tmpfs:
+      - /tmp:size=512m,mode=1777,nosuid,nodev,noexec
+    environment:
+      <<: *schema-target
+      RFC_SYNC_CONFIG_FILE: /etc/rfc-mcp/ingestion.toml
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        actual=$$(rfc-mcp-docker-sync --storage-schema-version)
+        test "$$actual" = "$$RFC_STORAGE_SCHEMA_TARGET" ||
+          { echo "Sync image schema $$actual differs from target $$RFC_STORAGE_SCHEMA_TARGET" >&2; exit 1; }
+        exec rfc-mcp-docker-sync --check-config
+    network_mode: none
+    restart: "no"
+
+  db-maintenance:
+    <<: *runtime
+    image: ${RFC_MAINTENANCE_IMAGE:?Set RFC_MAINTENANCE_IMAGE}
+    user: "70:70"
+    mem_limit: 2g
+    pids_limit: 128
+    shm_size: 128m
+    stop_grace_period: 75s
+    restart: "no"
+    network_mode: none
+    environment:
+      <<: *schema-target
+      RFC_POSTGRES18_DATA_DIR: ${RFC_POSTGRES18_DATA_DIR:-}
+    depends_on:
+      serve-schema-preflight: {condition: service_completed_successfully}
+      sync-config-preflight: {condition: service_completed_successfully}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - mirror:/mirror:ro
+      - db_backups:/backups
+    secrets:
+      - {source: postgres_password, target: postgres}
+      - {source: bootstrap_serve_password, target: rfc_serve}
+      - {source: bootstrap_sync_password, target: rfc_sync}
+
   serve-db-preflight:
     <<: *db-preflight
+    depends_on:
+      postgres: {condition: service_healthy}
+      sync-db-preflight: {condition: service_completed_successfully}
     image: ${RFC_SERVE_IMAGE:?Set RFC_SERVE_IMAGE}
     user: "10001:10001"
     environment: *db-client
     secrets:
       - {source: db_ca, target: db_ca}
       - {source: serve_database_password, target: db_password}
+    volumes: [mirror:/mirror:ro]
     networks: [db_read]
 
   sync-db-preflight:
@@ -46,6 +129,24 @@ services:
     secrets:
       - {source: db_ca, target: db_ca}
       - {source: sync_database_password, target: db_password}
+    volumes: [mirror:/mirror:rw]
+    networks: [db_write]
+
+  sync-rights-preflight:
+    <<: *db-preflight
+    image: ${RFC_SYNC_IMAGE:?Set RFC_SYNC_IMAGE}
+    user: "10002:10002"
+    mem_limit: 2g
+    command: [policy, refresh-startup]
+    depends_on:
+      postgres: {condition: service_healthy}
+      sync-db-preflight: {condition: service_completed_successfully}
+    environment: *db-client
+    secrets:
+      - {source: db_ca, target: db_ca}
+      - {source: sync_database_password, target: db_password}
+    # Rights refresh acquires the same mirror coordinator as Sync.
+    volumes: [mirror:/mirror:rw]
     networks: [db_write]
 
   rfc-mcp-docker-serve:
@@ -172,16 +273,9 @@ services:
       POSTGRES_DB: rfc
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C --locale-provider=icu --icu-locale=und --auth-host=scram-sha-256 --auth-local=peer
-    entrypoint:
-      - /bin/sh
-      - -ec
-      - |
-        umask 077
-        cp /run/secrets/postgres_key /run/postgresql/server.key
-        exec docker-entrypoint.sh postgres -c ssl=on \
-          -c ssl_cert_file=/run/secrets/postgres_cert \
-          -c ssl_key_file=/run/postgresql/server.key \
-          -c hba_file=/etc/rfc-pg-hba.conf
+    entrypoint: [/bin/sh, /etc/rfc-postgres-start.sh]
+    depends_on:
+      db-maintenance: {condition: service_completed_successfully}
     tmpfs:
       - /tmp:size=16m,mode=1777,nosuid,nodev,noexec
       - /run/postgresql:size=2m,uid=70,gid=70,mode=0770,nosuid,nodev,noexec
@@ -190,6 +284,7 @@ services:
       - ./migrations:/migrations:ro
     configs:
       - {source: pg_hba, target: /etc/rfc-pg-hba.conf}
+      - {source: postgres_start, target: /etc/rfc-postgres-start.sh}
     secrets:
       - postgres_password
       - postgres_cert
@@ -251,11 +346,21 @@ volumes:
     driver: local
     driver_opts: {type: none, o: bind, device: "${RFC_PGDATA_DIR:?Set RFC_PGDATA_DIR}"}
 
+  db_backups:
+    driver: local
+    driver_opts: {type: none, o: bind, device: "${RFC_DB_BACKUP_HOST_DIR:?Provision a private backup filesystem}"}
+
 configs:
+  postgres_start:
+    file: ./deploy/postgres-start.sh
   pg_hba:
     file: ${RFC_PG_HBA:?Set RFC_PG_HBA}
 
 secrets:
+  bootstrap_serve_password:
+    file: ${RFC_BOOTSTRAP_SERVE_DB_PASSWORD:?Set the PostgreSQL-owned copy of the Serve database password}
+  bootstrap_sync_password:
+    file: ${RFC_BOOTSTRAP_SYNC_DB_PASSWORD:?Set the PostgreSQL-owned copy of the Sync database password}
   db_ca:
     file: ${RFC_DB_CA:?Set RFC_DB_CA}
   postgres_cert:

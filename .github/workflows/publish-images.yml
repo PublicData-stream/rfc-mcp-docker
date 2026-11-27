@@ -100,7 +100,7 @@ jobs:
           retention-days: 14
 
   publish:
-    name: Publish the three tested OCI indexes
+    name: Publish the four tested OCI indexes
     needs: [source, build]
     runs-on: ubuntu-26.04
     timeout-minutes: 25

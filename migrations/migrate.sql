@@ -11,6 +11,11 @@ CREATE TABLE IF NOT EXISTS rfc.schema_migrations (
     applied_at timestamptz NOT NULL DEFAULT now()
 );
 \if :{?upgrade_from}
+SELECT encode(sha256(convert_to(coalesce(
+    string_agg(encode(digest, 'hex') || ':' || byte_length, ',' ORDER BY digest), ''), 'UTF8')), 'hex')
+    AS upgrade_blob_inventory
+FROM rfc.blobs
+\gset
 SELECT ARRAY(SELECT version FROM rfc.schema_migrations ORDER BY version) =
        ARRAY(SELECT generate_series(1, :upgrade_from)) AS source_matches
 \gset
@@ -104,11 +109,14 @@ SELECT ARRAY(SELECT version FROM rfc.schema_migrations ORDER BY version) =
         FROM rfc.active_generation) IS NOT DISTINCT FROM :'upgrade_pointer'
    AND (SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '')
         FROM rfc.generations WHERE state IN ('published','retained')) = :'upgrade_readable'
+   AND (SELECT encode(sha256(convert_to(coalesce(
+            string_agg(encode(digest, 'hex') || ':' || byte_length, ',' ORDER BY digest), ''), 'UTF8')), 'hex')
+        FROM rfc.blobs) = :'upgrade_blob_inventory'
    AS target_matches
 \gset
 \if :target_matches
 \else
-DO $$ BEGIN RAISE EXCEPTION 'upgrade changed the expected migration history or readable generations'; END $$;
+DO $$ BEGIN RAISE EXCEPTION 'upgrade changed the expected history, publication, or blob inventory'; END $$;
 \endif
 \endif
 COMMIT;

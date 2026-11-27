@@ -4,10 +4,10 @@ The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It
 
 ## Provision
 
-1. Use the three qualified service image references in a private copy of [the environment example](../deploy/compose.env.example). For a registry release, use the three published index digests and verify the host's CPU baseline. For a local build, build the `serve`, `sync`, and `feed` Dockerfile targets and set their tags in that file. [GHCR release and digest verification](ghcr-release.md)
-2. Create the mirror and PostgreSQL backing directories. Choose nonoverlapping IPv4 subnets. Put only serve and the existing proxy on the dedicated ingress bridge. Give the proxy a separate frontend network and assign the fixed backend addresses from the environment file.
+1. Use the four qualified image references in a private copy of [the environment example](../deploy/compose.env.example). For a registry release, use the four published index digests and verify the host's CPU baseline. For a local build, build the `serve`, `sync`, `feed`, and `maintenance` Dockerfile targets and set their tags in that file. [GHCR release and digest verification](ghcr-release.md)
+2. Create the mirror and PostgreSQL backing directories. Provision a separate private backup filesystem at `RFC_DB_BACKUP_HOST_DIR`, owned by PostgreSQL UID/GID 70 with mode 0700 as seen inside Docker. Choose nonoverlapping IPv4 subnets. Put only serve and the existing proxy on the dedicated ingress bridge. Give the proxy a separate frontend network and assign the fixed backend addresses from the environment file.
 3. Copy [the PostgreSQL access policy](../deploy/pg_hba.conf.example) and update its two private subnets if needed. Supply a database certificate with DNS SAN `postgres`, its private key, and the issuing CA. Use independent passwords for PostgreSQL bootstrap, `rfc_serve`, and `rfc_sync`.
-4. Generate three distinct 48-byte raw keys under a private umask. Make separate per-service copies of each pairwise key. Set the cursor and notification keys for serve to UID 10001, the sync copies to UID 10002, and the feed copy to UID 10003. PostgreSQL private material belongs to UID 70. Set secret files to mode 0400 and give the designated container UID access using the host’s actual UID mapping. Verify ownership inside the containers because Compose mounts the backing files directly.
+4. Generate three distinct 48-byte raw keys under a private umask. Make separate per-service copies of each pairwise key. Set the cursor and notification keys for serve to UID 10001, the sync copies to UID 10002, and the feed copy to UID 10003. PostgreSQL private material belongs to UID 70. Give that UID independent mode-0400 copies of both runtime database passwords at `RFC_BOOTSTRAP_SERVE_DB_PASSWORD` and `RFC_BOOTSTRAP_SYNC_DB_PASSWORD` for fresh initialization. Set secret files to mode 0400 and give the designated container UID access using the host’s actual UID mapping. Verify ownership inside the containers because Compose mounts the backing files directly.
 5. Copy the [v2 ingestion example](../deploy/ingestion.toml.example) to
    the regular file named by `RFC_SYNC_CONFIG_HOST_FILE`. Mode `0444` is
    suitable for this nonsecret file. Compose mounts it read-only for Sync.
@@ -66,34 +66,42 @@ compose run --rm --no-deps rfc-mcp-docker-sync --check-config
 
 ## Initialize or upgrade
 
-During `compose up`, Compose checks the database using the Serve and Sync
-images and their runtime roles before starting either application. If a
-preflight fails, inspect `compose logs serve-db-preflight sync-db-preflight`
-for the expected and observed history. PostgreSQL can start by itself for
-maintenance. Use the same release image set and checkout for each step.
+During `compose up`, the maintenance job checks both application image
+schema targets and Sync configuration before opening the database volume.
+After maintenance, PostgreSQL listens on its private networks. Serve and
+Sync start after their role-specific storage checks and the local rights
+refresh. Inspect the job logs when startup fails.
+
+~~~sh
+compose logs serve-schema-preflight sync-config-preflight db-maintenance \
+  serve-db-preflight sync-db-preflight sync-rights-preflight
+~~~
+
+Run the explicit preflight to inspect the installed image set and current
+database state. A stopped database reports its major version and layout.
+The maintenance job reads the SQL migration history when it opens the
+stopped database.
+
+~~~sh
+export RFC_ENV_FILE=/path/to/private/rfc.env RFC_PROJECT=rfc-mcp-docker
+compose() { docker compose --env-file "$RFC_ENV_FILE" --project-name "$RFC_PROJECT" "$@"; }
+python3 -B scripts/deploy/upgrade.py preflight --env-file "$RFC_ENV_FILE" \
+  --project-name "$RFC_PROJECT"
+~~~
 
 ### Initialize fresh volumes
 
-Use the same project and environment file throughout. Begin the cold-start clock immediately before `volume-admin`. It adjusts only the backing directory roots. PostgreSQL owns `/var/lib/postgresql` and initializes data in `/var/lib/postgresql/19/docker`. The role-and-subnet HBA rules require TLS and SCRAM for runtime connections.
+Provision the backing paths, keys, certificate, and private networks first.
+Begin the cold-start clock immediately before `volume-admin`. It adjusts
+the backing directory roots. Compose then initializes PostgreSQL 19 in
+`/var/lib/postgresql/19/docker`, creates the scoped roles and schema, and
+starts the requested services. Start Serve alone if the first publication
+will be operator-controlled.
 
-Run the database setup over the PostgreSQL container's local peer-authenticated socket. At each `\password` prompt, enter the password provisioned for that runtime role. The PostgreSQL bootstrap credentials stay with PostgreSQL.
-
-```sh
-export RFC_ENV_FILE=/path/to/rfc.env
-compose() { docker compose --env-file "$RFC_ENV_FILE" "$@"; }
+~~~sh
 compose --profile tools run --rm --no-deps volume-admin
-compose up -d --wait postgres
-compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -c 'SHOW data_directory'
-compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/roles.sql
-compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -c '\password rfc_serve'
-compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -c '\password rfc_sync'
-compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/bootstrap.sql
-compose exec postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/migrate.sql
-compose run --rm --no-deps rfc-mcp-docker-sync --phase1-check-storage
-compose run --rm --no-deps rfc-mcp-docker-serve --phase1-check-storage
-compose run --rm --no-deps rfc-mcp-docker-sync --check-config
 compose up -d --wait rfc-mcp-docker-serve
-```
+~~~
 
 ### First publication
 
@@ -115,63 +123,62 @@ Use the [operating checks](#operate-and-recover) to match the active PostgreSQL 
 
 ### Upgrade existing volumes
 
-The upgrade uses matching schema 13 images. Follow this maintenance
-procedure for a populated schema 9, 10, 11, or 12 deployment.
+Use the matching schema 13 release. Prepare the current ingestion TOML,
+private spool and audit filesystems, and the independent backup storage.
+Preserve the leases and cooldown recorded in the old spool. Remove legacy
+bulk and HTTPS shadow overrides from the target command.
 
-1. Close public ingress. In the previous checkout, stop Feed, allow the
-   running job to settle, stop Sync, and stop Serve. Save the previous
-   image references and TOML. Verify a matched PostgreSQL and mirror
-   backup including the incumbent sequence and retained generations.
-   Keep the existing database roles and role passwords.
-   [Backup and restore](publication.md#backup-and-restore)
-2. Provision the private staging filesystems and translate the TOML.
-   Use base Compose and remove any legacy bulk or HTTPS shadow overlay
-   from the command. Use the same project and database and mirror backing
-   directories. Preserve the shadow spool if it recorded a live upstream
-   cooldown. Wait for known cooldown before switching upstream ownership.
-3. Use the current checkout and environment file to apply and verify the migration.
-   Run from the repository root. The host needs Python 3.11 or newer and `b3sum`.
-   Use the same Compose project name, environment file, Docker context,
-   and overlays throughout. Keep other Compose operations and database
-   maintenance paused while the upgrade runs. Pull the qualified digest
-   references before starting the procedure if using registry images.
+- For a running deployment, close the external ingress route and run the host deploy command. It stops Feed, gracefully stops Sync and Serve, stops PostgreSQL when required, runs the maintenance checks, and verifies Serve through MCP before it starts Sync and Feed.
+- For a stopped deployment, use `compose up -d --wait` with the same project and backing volumes. To apply maintenance and check storage while keeping applications stopped, use the second command below.
 
-   ~~~sh
-   export RFC_ENV_FILE=/path/to/private/rfc.env RFC_PROJECT=rfc-mcp-docker
-   compose() { docker compose --env-file "$RFC_ENV_FILE" --project-name "$RFC_PROJECT" "$@"; }
-   compose config --quiet
-   compose up -d --wait postgres
-   python3 -B scripts/deploy/upgrade.py --env-file "$RFC_ENV_FILE" \
-     --project-name "$RFC_PROJECT" --backup-dir "$BACKUP_DIR"
-   compose up -d --wait rfc-mcp-docker-serve
-   ~~~
+~~~sh
+python3 -B scripts/deploy/upgrade.py deploy --env-file "$RFC_ENV_FILE" \
+  --project-name "$RFC_PROJECT"
 
-   If using a nondefault Docker context, pass `--context` to the upgrade
-   command and use the same context in the Compose wrapper. Pass each
-   overlay with `-f` in both commands. Set `RFC_PROJECT` to the existing
-   Compose project name. The command checks the target images and Sync
-   configuration, verifies the independently stored PostgreSQL archive and
-   mirror against the quiescent deployment, and applies the migrations in
-   one transaction. It then runs `policy refresh` against the verified local
-   active and retained generations. This step can be retried with ingress
-   closed and the application services stopped. Capture the dump with the
-   same PostgreSQL tooling during this maintenance window. A different
-   archive or mirror copy stops the upgrade before SQL runs. The command
-   leaves applications stopped, including when postflight fails. If schema
-   13 is already present, it reruns the rights refresh and storage checks
-   and reuses valid rights records. Resolve any reported postflight failure
-   before starting Serve.
+python3 -B scripts/deploy/upgrade.py preflight --apply --env-file "$RFC_ENV_FILE" \
+  --project-name "$RFC_PROJECT"
+~~~
 
-4. Confirm schema 13 and the backed-up sequence. Check `/ready` and an
-   exact-byte MCP `get` for the incumbent. Confirm the result's generation
-   and sequence against the saved pointer. Pre-upgrade cursors expire.
-   Verify the retained manifests and originals through the private storage checks in the
-   [restore rehearsal](release-readiness.md#restore-and-client-results).
-   Reopen ingress after verifying the serving path. Run
-   `compose up -d rfc-mcp-docker-sync` and verify a full audited
-   publication and its delivered outbox event. Then run
-   `compose up -d rfc-mcp-docker-feed` and confirm authenticated hint
-   delivery.
+Use the same Compose project, Docker context, environment file, and overlays
+throughout the operation. Pass `--context` and repeated `-f` options to the
+host command when the deployment uses them. The host commands require
+Python 3.11 or later. Pull the qualified digest references before running
+the host command.
+
+The runner supports complete application schema histories 9 through 13. It
+also imports a dedicated RFC PostgreSQL 18 cluster from `18/docker` or
+`RFC_POSTGRES18_DATA_DIR`, a relative path beneath the PostgreSQL backing
+volume. Use a cleanly stopped source and keep its directory for recovery.
+The PostgreSQL 19 target uses a staged logical restore and rebuilds its
+derived full-text index from the stored search text. Shared clusters,
+external tablespaces, and ambiguous data directories require manual
+handling.
+
+A populated upgrade creates an archive and a complete verified mirror copy
+on the independent filesystem before applying SQL. Budget space for the
+archive and mirror on that filesystem and for the restore rehearsal in
+the PostgreSQL backing filesystem. A PostgreSQL 18 import also needs space
+for a private copy of the old cluster. Keep completed backups according
+to the deployment's retention policy. [Backup and restore](publication.md#backup-and-restore)
+
+On failure, leave ingress closed and check the maintenance and postflight
+job logs. A retry verifies the current state and resumes from the failed
+stage. A completed SQL change or PostgreSQL cutover remains in place while
+postflight is repaired. Use a matched backup, the earlier image set, and
+fresh volumes for rollback across schemas or PostgreSQL majors. Confirm
+the active and retained generations, Serve readiness, audited publication,
+and authenticated hint delivery before reopening public ingress.
+
+For manual peer-socket recovery of an existing PostgreSQL 19 volume, keep
+the application services stopped and start PostgreSQL with
+`compose up -d --no-deps postgres`. The supplied-backup command uses the
+same project and checks the archive against the stopped deployment. It
+uses `b3sum` installed on the host.
+
+~~~sh
+python3 -B scripts/deploy/upgrade.py --env-file "$RFC_ENV_FILE" \
+  --project-name "$RFC_PROJECT" --backup-dir "$BACKUP_DIR"
+~~~
 
 ### Recover a schema mismatch after Compose recreation
 
@@ -394,13 +401,14 @@ Compare the publication sequence and most recent successful sync job with the ex
 
 HTTP 429 carries `Retry-After: 1`. Reduce client burst and concurrency, and verify that the proxy sets the selected client IP header and that Serve trusts the intended proxy addresses. For a tool deadline, budget error, or partial scan, narrow the query or continue with a valid cursor. Check in-flight requests, admission rejections, database readers, and ripgrep availability before adjusting limits. Keep the sandbox and its failure checks enabled. [MCP tools and budgets](mcp.md)
 
-Use the receiver-first procedure for each [HMAC key rotation](control.md#clock-and-key-rotation). Drain and back up before an upgrade, validate the new Compose configuration and pinned image identities, then apply migrations with the local PostgreSQL administrator. Check the schema version, TLS, roles, storage, readiness, proxy path, and a pinned MCP read before reopening ingress. Use the [publication runbook](publication.md) for GC, sequence-bound rollback, backup, restore, and corruption. Schema rollback requires a compatible backup and fresh-volume restore when the previous binary cannot read the upgraded schema.
+Use the receiver-first procedure for each [HMAC key rotation](control.md#clock-and-key-rotation). Use the automatic database upgrade procedure with the new Compose configuration and the pinned image set. Check the schema version, TLS, roles, storage, readiness, proxy path, and a pinned MCP read before reopening ingress. Use the [publication runbook](publication.md) for GC, sequence-bound rollback, backup, restore, and corruption. Schema rollback requires a compatible backup and fresh-volume restore when the previous binary cannot read the upgraded schema.
 
 For a planned shutdown, close the proxy route first. Stop Feed, let running Sync work settle, then stop Sync and Serve before PostgreSQL. If Sync must interrupt a job, use `compose stop -t 60 rfc-mcp-docker-sync` to allow cooperative cancellation. Start PostgreSQL and Serve, then Sync and Feed. Check unfinished jobs, publication sequence, and pending notifications after restart. Keep the independent backup available.
 
 ## Repeat the local qualification
 
 ```sh
+docker --context rootless build --target maintenance -t rfc-phase7-qualified-maintenance .
 python3 -B scripts/phase0/integration.py --context rootless --project rfc-phase7-qualified
 python3 -B scripts/phase7/integration.py --context rootless --image-prefix rfc-phase7-qualified
 python3 -B scripts/phase6/integration.py --context rootless --image-prefix rfc-phase7-qualified

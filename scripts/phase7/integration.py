@@ -30,7 +30,7 @@ INGESTION_PATH = "/etc/rfc-mcp/ingestion.toml"
 
 
 class Deployment:
-    def __init__(self, work, seed, prefix, spool, audit):
+    def __init__(self, work, seed, prefix, spool, audit, backup):
         self.work, self.docker = work, seed.docker
         self.ca = seed.directory / "certs/ca.crt"
         self.name = work.name + "-prod"
@@ -38,6 +38,7 @@ class Deployment:
         self.prefix = prefix
         self.spool = spool
         self.audit = audit
+        self.backup = backup
         self.passwords = seed.passwords
         self.pgdata = work / "production-pgdata"
         self.pgdata.mkdir()
@@ -55,7 +56,7 @@ class Deployment:
             if line and not line.startswith("#"):
                 key, value = line.split("=", 1)
                 self.env[key] = value.replace("172.30.70.", self.net + ".")
-        for role in ("serve", "sync", "feed"):
+        for role in ("serve", "sync", "feed", "maintenance"):
             self.env[f"RFC_{role.upper()}_IMAGE"] = f"{prefix}-{role}"
         self.ingestion = work / "ingestion.toml"
         self.ingestion.write_bytes((ROOT / "deploy/ingestion.toml.example").read_bytes())
@@ -67,6 +68,7 @@ class Deployment:
                         RFC_SYNC_AUDIT_HOST_DIR=str(audit),
                         RFC_MIRROR_DIR=str(seed.directory / "mirror"),
                         RFC_PGDATA_DIR=str(self.pgdata),
+                        RFC_DB_BACKUP_HOST_DIR=str(backup),
                         RFC_DB_CA=str(seed.directory / "certs/ca.crt"),
                         RFC_POSTGRES_CERT=str(seed.directory / "postgres/postgres.crt"))
         hba = work / "pg_hba.conf"
@@ -80,6 +82,8 @@ class Deployment:
         files = {
             "POSTGRES_KEY": (70, (seed.directory / "postgres/postgres.key").read_bytes()),
             "POSTGRES_PASSWORD": (70, seed.passwords["postgres"].encode()),
+            "BOOTSTRAP_SERVE_DB_PASSWORD": (70, seed.passwords[phase1.SERVE].encode()),
+            "BOOTSTRAP_SYNC_DB_PASSWORD": (70, seed.passwords[phase1.SYNC].encode()),
             "SERVE_DB_PASSWORD": (10001, seed.passwords[phase1.SERVE].encode()),
             "SYNC_DB_PASSWORD": (10002, seed.passwords[phase1.SYNC].encode()),
             "SERVE_CURSOR_KEY": (10001, seed.key),
@@ -137,7 +141,7 @@ class Deployment:
             path = (spec.get("environment") or {}).get("RFC_SYNC_CONFIG_FILE")
             spool = [volume for volume in spec.get("volumes", []) if volume["target"] == "/rfc-https-spool"]
             audit = [volume for volume in spec.get("volumes", []) if volume["target"] == "/rfc-rsync-audit"]
-            if service == SYNC:
+            if service in (SYNC, "sync-config-preflight"):
                 mount, = mounts
                 assert mount["type"] == "bind" and mount["source"] == str(self.ingestion)
                 assert mount["read_only"] and not mount["bind"]["create_host_path"]
@@ -151,11 +155,25 @@ class Deployment:
             else:
                 assert not mounts and not spool and not audit and path is None
         assert set(project["services"][FEED]["networks"]) == {"feed_control"}
+        maintenance = project["services"]["db-maintenance"]
+        assert maintenance["network_mode"] == "none" and not maintenance.get("ports")
+        assert {mount["source"] for mount in maintenance["volumes"]} == {"pgdata", "mirror", "db_backups"}
+        assert next(mount for mount in maintenance["volumes"] if mount["source"] == "mirror")["read_only"]
+        for service, spec in project["services"].items():
+            if service != "db-maintenance":
+                assert all(mount["source"] != "db_backups" for mount in spec.get("volumes", []))
+        rights = project["services"]["sync-rights-preflight"]
+        assert set(rights["networks"]) == {"db_write"}
+        assert {secret["source"] for secret in rights["secrets"]} == {"db_ca", "sync_database_password"}
+        mirror, = rights["volumes"]
+        assert mirror["source"] == "mirror" and not mirror.get("read_only")
         for role, network, service in (("serve", "db_read", SERVE), ("sync", "db_write", SYNC)):
             preflight = project["services"][f"{role}-db-preflight"]
             assert set(preflight["networks"]) == {network}
             assert preflight["image"] == project["services"][service]["image"]
-            assert not preflight.get("volumes") and not preflight.get("ports")
+            volume, = preflight["volumes"]
+            assert volume["source"] == "mirror" and bool(volume.get("read_only")) == (role == "serve")
+            assert not preflight.get("ports")
             assert {secret["source"] for secret in preflight["secrets"]} == {
                 "db_ca", f"{role}_database_password"
             }
@@ -187,18 +205,26 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
     def provision(self, *, migrate=True):
         self.check_config_mount()
         self.run("--profile", "tools", "run", "--rm", "--no-deps", "volume-admin")
-        self.run("up", "-d", "--wait", "postgres", timeout=90)
-        assert self.sql("-c", "SHOW data_directory") == "/var/lib/postgresql/19/docker"
-        self.sql("-f", "/migrations/roles.sql")
-        password_sql = "".join(
-            f"ALTER ROLE {role} PASSWORD '{self.passwords[role]}';\n"
-            for role in (phase1.SERVE, phase1.SYNC))
-        self.capture("exec", "-T", "postgres", *phase1.SQL_OPTIONS, "-U", "postgres",
-                     "-d", "rfc", input=password_sql)
-        self.sql("-f", "/migrations/bootstrap.sql")
         if migrate:
-            self.sql("-f", "/migrations/migrate.sql")
+            self.run("up", "-d", "--wait", "postgres", timeout=180)
             assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "13"
+        else:
+            # Seed a pre-automation cluster for the manual recovery rehearsal.
+            self.run("run", "--rm", "--no-deps", "--entrypoint", "initdb", "db-maintenance",
+                     "-D", "/var/lib/postgresql/19/docker", "--encoding=UTF8", "--locale=C",
+                     "--locale-provider=icu", "--icu-locale=und", "--auth-local=peer",
+                     "--auth-host=scram-sha-256", "-U", "postgres", timeout=90)
+            self.run("up", "-d", "--no-deps", "--wait", "postgres", timeout=90)
+            self.capture("exec", "-T", "postgres", *phase1.SQL_OPTIONS, "-U", "postgres",
+                         "-d", "postgres", "-c", "CREATE DATABASE rfc")
+            self.sql("-f", "/migrations/roles.sql")
+            password_sql = "".join(
+                f"ALTER ROLE {role} PASSWORD '{self.passwords[role]}';\n"
+                for role in (phase1.SERVE, phase1.SYNC))
+            self.capture("exec", "-T", "postgres", *phase1.SQL_OPTIONS, "-U", "postgres",
+                         "-d", "rfc", input=password_sql)
+            self.sql("-f", "/migrations/bootstrap.sql")
+        assert self.sql("-c", "SHOW data_directory") == "/var/lib/postgresql/19/docker"
         assert self.sql("-c", "SELECT current_setting('server_encoding') || ':' || datlocale || ':' "
                         "|| datlocprovider::text FROM pg_database WHERE datname = current_database()") == "UTF8:und:i"
         if migrate:
@@ -551,10 +577,17 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
 @contextmanager
 def deployment(work, seed, prefix, *, label_prefix=""):
     with (phase5.phase2.capped_stage(seed, mebibytes=5120, inodes=65536, label=label_prefix + "rsync") as spool,
-          phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label=label_prefix + "audit") as audit):
-        stack = Deployment(work, seed, prefix, spool, audit)
+          phase5.phase2.capped_stage(seed, mebibytes=1024, inodes=4096, label=label_prefix + "audit") as audit,
+          phase5.phase2.capped_stage(seed, mebibytes=128, inodes=2048,
+                                   label=label_prefix + "backup", owner=70) as backup):
+        stack = Deployment(work, seed, prefix, spool, audit, backup)
         try:
             yield stack
+        except Exception:
+            subprocess.run(stack.command("logs", "--no-color", "--tail", "25", "db-maintenance",
+                                         "serve-db-preflight", "sync-db-preflight", "sync-rights-preflight"),
+                           env=stack.env, check=False, timeout=35)
+            raise
         finally:
             stack.close()
 

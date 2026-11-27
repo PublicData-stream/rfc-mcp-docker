@@ -8,3 +8,8 @@
 !crates/**
 !fixtures/
 !fixtures/**
+!migrations/
+!migrations/*.sql
+!scripts/
+!scripts/deploy/
+!scripts/deploy/maintain.py
