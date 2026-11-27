@@ -841,32 +841,34 @@ evidence for every required TXT. The new ADR records how to handle old
 proofs, checkpoints, configuration and schema rollback.
 [HTTPS-first decision](decisions/0010-https-first-rfc-synchronization.md)
 
-### Current execution paths
+<a id="current-execution-paths"></a>
+
+### Baseline execution paths
 
 | Area | Baseline behavior and source |
 | --- | --- |
-| Entry points and coordination | Sync without arguments loads config once, takes scheduler leadership (advisory lock `-3`), and queues startup work. The daemon schedules a daily full reconcile and an hourly catalog change check. One-shot `--phase2-reconcile --full\|--sample` calls the same collector. The daemon, manual execution, promotion and recovery share the corpus coordinator lock (`-1`). [CLI](../crates/sync/src/main.rs) · [Daemon](../crates/sync/src/daemon.rs) · [Coordinator](../crates/sync/src/lib.rs) |
-| Feed hints and notifications | Feed polls RSS or Atom with conditional validators and a nominal 900 s interval, using its own HTTPS client and backoff. Private HMAC control messages carry stable event identity, observation digest, time and reason. Sync records event IDs and coalesces jobs under the queue transaction lock (`-4`). Serve receives generation, sequence and manifest hints via a separate authenticated link. [Feed](../apps/src/feed.rs) · [Schemas](../apps/src/control/mod.rs) · [Wire and authentication](../apps/src/control/wire.rs) |
-| Selection and acquisition | Sync selects from its starting HTTPS catalog, stages TXT through rsync, and starts bounded RFCXML lookahead. Config v1 selects batched or persistent staging and eligible TXT proof. The Sync start gate covers catalog, TXT, RFCXML and retries. Parse and durable installation precede TXT sealing, and classified RFCXML is joined by RFC identity for membership. [Config](../crates/sync/src/config.rs) · [Upstream](../crates/sync/src/upstream.rs) · [Bulk](../crates/sync/src/bulk.rs) · [Pipeline](../crates/sync/src/pipeline.rs) · [Ingest](../crates/sync/src/ingest.rs) |
-| Bytes, checkpoints and recovery | TXT parsing preserves original bytes and indexes byte ranges, including bytes mode for NUL-bearing originals. Catalog and RFCXML parsing apply separate outcome and coverage rules. Bounded restart checkpoints pin original observations and bind to catalog digest, scope, policy, sequence and parser, index and registry versions. Recovery reclaims abandoned candidate work and honors retained readers. [TXT](../crates/sync/src/text.rs) · [XML](../crates/sync/src/xml.rs) · [Checkpoints](../crates/sync/src/checkpoint.rs) · [Recovery](../crates/sync/src/recovery.rs) |
-| Readiness and publication | Ending catalog equality and candidate validation precede manifest freeze. Manual full reconcile stops at `ready`. Explicit publish or daemon promotion verifies the sequence and commits the active pointer and outbox together. Serve checks the active generation on `/ready` and reads through generation guards. [Publication](../crates/sync/src/publication.rs) · [Serve routes](../apps/src/public.rs) |
+| Entry points and coordination | Sync without arguments loads config once, takes scheduler leadership (advisory lock `-3`), and queues startup work. The daemon schedules a daily full reconcile and an hourly catalog change check. One-shot `--phase2-reconcile --full\|--sample` calls the same collector. The daemon, manual execution, promotion and recovery share the corpus coordinator lock (`-1`). [CLI](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/main.rs) · [Daemon](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/daemon.rs) · [Coordinator](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/lib.rs) |
+| Feed hints and notifications | Feed polls RSS or Atom with conditional validators and a nominal 900 s interval, using its own HTTPS client and backoff. Private HMAC control messages carry stable event identity, observation digest, time and reason. Sync records event IDs and coalesces jobs under the queue transaction lock (`-4`). Serve receives generation, sequence and manifest hints via a separate authenticated link. [Feed](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/apps/src/feed.rs) · [Schemas](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/apps/src/control/mod.rs) · [Wire and authentication](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/apps/src/control/wire.rs) |
+| Selection and acquisition | Sync selects from its starting HTTPS catalog, stages TXT through rsync, and starts bounded RFCXML lookahead. Config v1 selects batched or persistent staging and eligible TXT proof. The Sync start gate covers catalog, TXT, RFCXML and retries. Parse and durable installation precede TXT sealing, and classified RFCXML is joined by RFC identity for membership. [Config](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/config.rs) · [Upstream](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/upstream.rs) · [Bulk](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/bulk.rs) · [Pipeline](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/pipeline.rs) · [Ingest](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/ingest.rs) |
+| Bytes, checkpoints and recovery | TXT parsing preserves original bytes and indexes byte ranges, including bytes mode for NUL-bearing originals. Catalog and RFCXML parsing apply separate outcome and coverage rules. Bounded restart checkpoints pin original observations and bind to catalog digest, scope, policy, sequence and parser, index and registry versions. Recovery reclaims abandoned candidate work and honors retained readers. [TXT](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/text.rs) · [XML](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/xml.rs) · [Checkpoints](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/checkpoint.rs) · [Recovery](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/recovery.rs) |
+| Readiness and publication | Ending catalog equality and candidate validation precede manifest freeze. Manual full reconcile stops at `ready`. Explicit publish or daemon promotion verifies the sequence and commits the active pointer and outbox together. Serve checks the active generation on `/ready` and reads through generation guards. [Publication](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/sync/src/publication.rs) · [Serve routes](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/apps/src/public.rs) |
 
-The [migration runner](../migrations/migrate.sql) holds advisory lock
+The [migration runner](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/migrations/migrate.sql) holds advisory lock
 `-2` and executes as the schema owner. Migrations 0001–0006 cover storage,
 ingestion, publication, search, reviewed pagination and control. Migration
 0007 records rsync provenance and guards promotion of rsync-only proofs.
 Migration 0008 guards the pairing of byte-matched HTTPS and rsync
 observations. Migration 0009 adds bounded ingestion checkpoints and their
-blob references. [Migration inventory](../migrations/) ·
-[Storage schema check](../crates/storage/src/postgres.rs)
+blob references. [Migration inventory](https://github.com/PublicData-stream/rfc-mcp-docker/tree/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/migrations) ·
+[Storage schema check](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/crates/storage/src/postgres.rs)
 
-[Production Compose](../compose.yml) requires a read-only Sync config file
+[Production Compose](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/compose.yml) requires a read-only Sync config file
 mount. The [schema 9 bulk overlay](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/deploy/compose.bulk-rsync.yml) adds a private
-writable staging bind to Sync. The [runtime image targets](../Dockerfile)
+writable staging bind to Sync. The [runtime image targets](https://github.com/PublicData-stream/rfc-mcp-docker/blob/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/Dockerfile)
 use the default Rust features. The `phase6-fixture` target builds separate
 Sync and Feed binaries with fixture features. Sync's fixture features
 include the private origin and pacing controls used by the benchmark.
-The [deployment examples](../deploy/) describe the current v1 config and
+The [deployment examples](https://github.com/PublicData-stream/rfc-mcp-docker/tree/376fdc65c37c331ea433ebdb57ef70e7afbfdfbe/deploy) describe the baseline v1 config and
 service-scoped secrets.
 
 ### Paced private baseline on 2026-11-24
@@ -2226,3 +2228,58 @@ temporary filesystems under `/tmp`.
 python3 -B scripts/https-discovery/automatic_upgrade.py --image-prefix "$prefix"
 python3 -B scripts/https-discovery/minikube_upgrade.py --profile "$profile" --image "$prefix-maintenance"
 ~~~
+
+## Code and documentation consistency review
+
+The 2026-11-27 review used runtime revision `a69e967` on Linux
+`7.0.0-44-generic` amd64 with Rust 1.100.0, Docker Engine 29.10.1, and
+Compose 5.8.0. It compared the maintained guides and examples with the MCP
+schemas, configuration and CLI validation, Compose dependencies, migration
+and rights checks, and release workflows.
+
+- The frozen Rust gate, all-feature Clippy and tests, and the seeded HTTP
+  smoke passed. The base Compose profile and Serve TOML overlay rendered
+  with the documented project selection.
+- The Markdown link check passed on the repository and on fixtures for
+  valid links, historical anchors, missing targets, and code examples.
+  The canonical CI summary accepted a successful docs check and rejected
+  failed or cancelled checks. Workflow lint and operator shell syntax
+  checks passed. The historical source targets resolved at `376fdc65`.
+- The rootless Phase 0 probe passed with disposable bind mounts directly
+  beneath `/tmp`. Nesting its temporary directory under a private parent
+  prevented mapped container users from opening fixture files on the first
+  attempt. Phase 5 matched the five live MCP tools against the exported
+  schemas and verified byte ranges, rights coverage, and cursor behavior.
+- Disposable rootless Minikube v1.39.0 with Kubernetes v1.37.0 passed the
+  schema 12 to 13 migration. The probe verified the backup restore and
+  preserved the catalog and single backup on repeat startup. The
+  namespace and cluster were removed afterward.
+- Rootless Compose passed fresh startup and migration from schema 9 with
+  backup reuse on restart. The rootless schema 10 and restore attempts
+  stopped while waiting for Docker fixture commands. The Phase 7 attempt
+  passed confinement and recreation, then timed out in its one-shot
+  notification command. The fixture now starts the notification peer
+  before timing the authenticated exchanges.
+- The local release-audit runner consumed the four service image tags
+  produced by the corresponding build targets and the pinned PostgreSQL
+  image. It generated Cargo dependency inventories and Trivy image reports
+  for review. This run checked the build and scanner handoff.
+- The rootful Phase 8 replay passed using the verified image set. The
+  independent restore verified 17 blobs, 814 ranges, and three manifests,
+  preserved publication pointer `2|2` and rights epoch 1, and replayed all
+  five MCP tools. The first rootful attempt ended during setup because the
+  wrapper's umask made synthetic bind-mounted files inaccessible. The
+  successful replay used the fixture's expected file modes inside the
+  private test directories.
+- The rootful Phase 7 replay passed the authenticated notification check
+  during public pool saturation. It also passed the production confinement,
+  container recreation, worker cancellation and reaping, and fail-closed
+  checks.
+- The rootful migration replay passed schemas 10–12 to 13, including the
+  schema 11 failure and recovery cases and schema 12 preflight and crash
+  recovery. PostgreSQL 18 to 19 passed for both the standard and
+  configured relative data directories. The host deploy path verified
+  an original byte-for-byte through MCP before resuming Sync and Feed.
+- The Feed scheduler probe passed backpressure, daemon attachment, hint
+  coalescing, and catalog and inventory convergence. Its paced fixture
+  recorded a minimum HTTPS start spacing of 1,000,521 µs.

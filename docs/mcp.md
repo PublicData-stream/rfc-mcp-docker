@@ -47,10 +47,14 @@ per RFC per page holds source attribution and the applicable conditions for
 the excerpts included. The richer match schema is returned by default,
 including for existing calls. Strict clients should load the current schema.
 
-`scan_complete` means the selected scope was searched through the current
-page. Metadata-only hits count toward coverage. `omitted` reports originals
-that could not be scanned. `source_bytes_charged` includes inputs to the
-worker, including interrupted scans. Follow `next_cursor` after a budget stop.
+`scan_complete` is true when the scan reaches the end of the selected scope
+with complete coverage. Metadata-only hits count toward coverage.
+The `omitted` array identifies originals the scan skipped on this page.
+An omission keeps coverage incomplete across continuation pages. An
+incomplete scan can end with `truncation_reason: "source_coverage"` and a null
+`next_cursor`. Follow `next_cursor` when present to continue a scan stopped by
+a page limit or budget. Each page evaluates up to 128 originals and charges
+up to 32 MiB toward `source_bytes_charged`, including scans that stop early.
 A failed worker confinement check yields `sandbox_unavailable`.
 
 ## Original bytes and notices

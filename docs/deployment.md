@@ -16,9 +16,15 @@ The production profile runs one serve, one sync, one feed, and PostgreSQL 19. It
    or starting the stack. [Staging setup](#private-sync-staging)
 
 ```sh
+export RFC_ENV_FILE=/path/to/private/rfc.env COMPOSE_PROJECT_NAME=rfc-mcp-docker
+compose() { docker compose --env-file "$RFC_ENV_FILE" "$@"; }
 docker network create --internal --subnet 172.30.70.0/28 rfc-public-ingress
-docker compose --env-file /path/to/rfc.env config --quiet
+compose config --quiet
 ```
+
+Set `COMPOSE_PROJECT_NAME` to the existing project when upgrading or
+recovering a deployment. Keep the same Docker context and Compose overlays
+on every command, including in the `compose` function.
 
 Set `RFC_NOTIFY_DYNAMIC_RANGE` and `RFC_CONTROL_DYNAMIC_RANGE` to ranges within their corresponding private subnets and outside the fixed listener addresses. This reserves the listener addresses during concurrent startup and recreation. An omitted range uses the full subnet for compatibility with existing environment files. For a qualified upgrade, add the ranges to the private environment file and recreate the affected Compose networks after draining the application services. Preserve the bind-backed mirror and database directories.
 
@@ -58,8 +64,6 @@ reserves room for a 256 MiB batch and one repair pair. Verify that the chosen
 filesystems enforce the intended caps.
 
 ~~~sh
-export RFC_ENV_FILE=/path/to/private/rfc.env
-compose() { docker compose --env-file "$RFC_ENV_FILE" "$@"; }
 compose config --quiet
 compose run --rm --no-deps rfc-mcp-docker-sync --check-config
 ~~~
@@ -83,10 +87,8 @@ The maintenance job reads the SQL migration history when it opens the
 stopped database.
 
 ~~~sh
-export RFC_ENV_FILE=/path/to/private/rfc.env RFC_PROJECT=rfc-mcp-docker
-compose() { docker compose --env-file "$RFC_ENV_FILE" --project-name "$RFC_PROJECT" "$@"; }
 python3 -B scripts/deploy/upgrade.py preflight --env-file "$RFC_ENV_FILE" \
-  --project-name "$RFC_PROJECT"
+  --project-name "$COMPOSE_PROJECT_NAME"
 ~~~
 
 ### Initialize fresh volumes
@@ -133,10 +135,10 @@ bulk and HTTPS shadow overrides from the target command.
 
 ~~~sh
 python3 -B scripts/deploy/upgrade.py deploy --env-file "$RFC_ENV_FILE" \
-  --project-name "$RFC_PROJECT"
+  --project-name "$COMPOSE_PROJECT_NAME"
 
 python3 -B scripts/deploy/upgrade.py preflight --apply --env-file "$RFC_ENV_FILE" \
-  --project-name "$RFC_PROJECT"
+  --project-name "$COMPOSE_PROJECT_NAME"
 ~~~
 
 Use the same Compose project, Docker context, environment file, and overlays
@@ -144,6 +146,13 @@ throughout the operation. Pass `--context` and repeated `-f` options to the
 host command when the deployment uses them. The host commands require
 Python 3.11 or later. Pull the qualified digest references before running
 the host command.
+
+The deploy command checks discovery and expects HTTP 503 from readiness
+when the active pointer is empty. With an active generation it requires
+readiness and checks the MCP listing against the stored generation and
+publication sequence. If it finds an eligible whole-file read, it also
+reassembles the returned bytes and verifies their length and BLAKE3 digest.
+Verify the external HTTPS proxy path separately before reopening ingress.
 
 The runner supports complete application schema histories 9 through 13. It
 also imports a dedicated RFC PostgreSQL 18 cluster from `18/docker` or
@@ -172,12 +181,12 @@ and authenticated hint delivery before reopening public ingress.
 For manual peer-socket recovery of an existing PostgreSQL 19 volume, keep
 the application services stopped and start PostgreSQL with
 `compose up -d --no-deps postgres`. The supplied-backup command uses the
-same project and checks the archive against the stopped deployment. It
+same project and checks the archive against the quiescent database. It
 uses `b3sum` installed on the host.
 
 ~~~sh
 python3 -B scripts/deploy/upgrade.py --env-file "$RFC_ENV_FILE" \
-  --project-name "$RFC_PROJECT" --backup-dir "$BACKUP_DIR"
+  --project-name "$COMPOSE_PROJECT_NAME" --backup-dir "$BACKUP_DIR"
 ~~~
 
 ### Recover a schema mismatch after Compose recreation
@@ -348,8 +357,8 @@ the rollback and use the existing PostgreSQL data and mirror.
 
 ## Operate and recover
 
-Use the same Compose project and private environment file for every command.
-Set `RFC_ENV_FILE` to its path.
+Use the Compose project and private environment file set during
+[provisioning](#provision), along with any required context and overlays.
 
 Run Sync monitoring commands inside the Sync container as UID 10002.
 Use `kubectl exec` against the Sync container when running the private

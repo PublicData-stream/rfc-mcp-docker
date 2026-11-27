@@ -45,7 +45,9 @@ Sync runs recovery before each reconciliation and sweeps abandoned spool and CAS
 
 Stop feed and wait for running sync work to finish. Then stop sync and keep all one-shot sync commands, including GC, paused until the dump and copy have been verified. From the PostgreSQL peer socket, check that `SELECT pg_try_advisory_lock(-1)` returns true in a one-shot session. Serve can continue reading.
 
-With a dedicated private `BACKUP_DIR` on separate storage and `RFC_ENV_FILE` set to the stack configuration, run:
+Set `BACKUP_DIR` to a private directory on separate storage. Use the stack's
+`RFC_ENV_FILE`, `COMPOSE_PROJECT_NAME`, and any required context and overlays
+for the backup commands.
 
 ```sh
 umask 077

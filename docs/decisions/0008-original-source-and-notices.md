@@ -1,5 +1,8 @@
 # 0008 — Original sources and notices
 
+The current rules for unresolved rights are defined by
+[the license-based redistribution decision](0012-license-based-redistribution.md).
+
 Serve complete official TXT or exact slices. Keep original attribution, legal and authorship notices in whole documents and attach reviewed notice ranges separately to excerpt-bearing responses. Keep notice extraction completeness and redistribution review separate from text availability. For an unresolved document, apply the metadata-only or reviewed whole-document policy.
 
 The checked-in RFC fixtures are whole documents with their original notices and a per-file provenance receipt. Their third-party terms are distinct from the application's MIT license.

@@ -22,11 +22,19 @@ Choose a new key ID and generate a fresh key. Install it as the active key on th
 
 ## Reconciliation and publication
 
-Feed polls the official publication feed every 15 minutes plus jitter. Conditional validators advance only after its hints are acknowledged. The RFC publication identifier determines the observation fingerprint and event ID, so a replay, a switch between feed formats, or a restart can repeat the same hint safely. A feed hint acknowledges durable acceptance, which can refer to an existing job. The Sync CLI's `status` command shows job and retry state, and `diagnose` explains the latest stored reason. The event's job ID is available in `rfc.control_events.job_id`. A failed job is terminal after two retries. Later scheduled work can still reconcile independently. [Sync monitoring commands](ingestion.md#monitor-sync)
+Feed requests a poll every 15 minutes plus jitter. It advances its
+acknowledged snapshot after all hints from the poll succeed. The RFC
+publication identifier determines the observation fingerprint and event
+ID, so a replay, format switch, or restart can repeat the same hint
+safely. A hint acknowledgment records durable acceptance, which can refer
+to an existing job. The event's job ID is available in
+`rfc.control_events.job_id`. A failed job is terminal after two retries.
+Later scheduled work can still reconcile independently. [Sync monitoring commands](ingestion.md#monitor-sync)
 
-Feed requests a poll through Sync's private control listener. Sync owns the
-upstream validators and schedules the fetch in the same HTTPS budget as
-catalog, TXT, RFCXML, and repair. Feed uses the internal control network.
+Feed requests a poll through Sync's private control listener. Sync updates
+its upstream validators when it successfully parses a new feed snapshot.
+It schedules the fetch in the same HTTPS budget as catalog, TXT, RFCXML,
+and repair. Feed uses the internal control network.
 
 Startup and scheduled work queue full reconciliation. Sync also probes the
 catalog digest hourly while idle. A changed catalog or an accepted Feed hint

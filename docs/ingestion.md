@@ -70,6 +70,7 @@ Keep the v1 file and its matched images for schema rollback.
 ## Run acquisition
 
 Use a disposable project with a private upstream fixture for qualification.
+Set `RFC_ENV_FILE` and `COMPOSE_PROJECT_NAME` for the intended stack.
 The existing manual command takes `--full` or `--sample`. The sample
 selects RFCs 2119, 8174, and 9110. In the Compose project, an invocation
 while the daemon runs uses its private Sync-UID socket. A matching request

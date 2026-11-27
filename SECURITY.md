@@ -3,7 +3,8 @@
 ## System and Scope
 
 This policy covers RFC MCP Docker source, configuration and deployment
-guidance, release workflows, and official serve, sync, and feed images.
+guidance, release workflows, and official Serve, Sync, Feed, and Maintenance
+images.
 Use the exact revision or image digest to identify the affected build.
 [Official image repositories and digests](docs/ghcr-release.md)
 
@@ -37,6 +38,10 @@ report.
 - Keep the serve mirror read-only and its database grants scoped to reads.
   Scope writes to sync and keep feed off the mirror and database. Validate
   database TLS and keep credentials and pairwise keys scoped to their roles.
+- Run database maintenance without network access, with a read-only mirror
+  and private backup storage. Verify the archive and mirror copy before a
+  populated upgrade, and require the role-specific storage and rights
+  checks before starting the applications. [Startup and recovery](docs/deployment.md#initialize-or-upgrade)
 - Authenticate private requests and acknowledgements. Preserve caller and
   audience binding, replay checks, and the separation of cursor and control
   keys. Fail closed when authentication or the expected state cannot be
