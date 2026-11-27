@@ -35,7 +35,7 @@ pub(crate) struct Selection<'a> {
     pub inventory: &'a str,
     pub sequence: i64,
     pub catalog: &'a xml::Catalog,
-    pub registry_digest: BlobDigest,
+    pub fixture_rules: Option<Arc<crate::policy::FixtureRules>>,
     pub fixture: bool,
     pub before: &'a Capture,
     pub after: &'a Capture,
@@ -117,28 +117,14 @@ async fn build(
         .tx
         .execute(
             "INSERT INTO rfc.generation_ingestion
-           (generation_id, scope, catalog_before, catalog_after, policy_registry, catalog_only)
-         VALUES ($1, $2, $3::bytea, $4::bytea, $5, $6::text::jsonb)",
+           (generation_id, scope, catalog_before, catalog_after, catalog_only)
+         VALUES ($1, $2, $3::bytea, $4::bytea, $5::text::jsonb)",
             &[
                 &candidate.generation(),
                 &selection.scope.as_str(),
                 &bytes(&before),
                 &bytes(&after),
-                &selection.registry_digest.to_string(),
                 &serde_json::to_string(&catalog_only)?,
-            ],
-        )
-        .await?;
-    candidate
-        .tx
-        .execute(
-            "INSERT INTO rfc.generation_policy (generation_id,registry_digest,classifier,fixture)
-         VALUES ($1,$2::bytea,$3,$4)",
-            &[
-                &candidate.generation(),
-                &bytes(&selection.registry_digest),
-                &rfc_storage::policy::CLASSIFIER,
-                &selection.fixture,
             ],
         )
         .await?;
@@ -146,10 +132,10 @@ async fn build(
     let inventory = digest(selection.inventory)?;
     candidate.tx.execute(
         "INSERT INTO rfc.generation_audit
-           (generation_id, selection, inventory, policy, expected_rfc_ids, expected_sequence, started_us, expires_us)
-         VALUES ($1, $2::bytea, $3::bytea, $4, $5, $6, $7, $8)",
+           (generation_id, selection, inventory, policy, expected_rfc_ids, expected_sequence, started_us, expires_us, fixture)
+         VALUES ($1, $2::bytea, $3::bytea, $4, $5, $6, $7, $8, $9)",
         &[&candidate.generation(), &bytes(&selection.context.key), &bytes(&inventory), &POLICY,
-          &expected, &selection.sequence, &started, &expires],
+          &expected, &selection.sequence, &started, &expires, &selection.fixture],
     ).await?;
     candidate.commit().await?;
 
@@ -234,7 +220,12 @@ async fn build(
                 &catalog.entries[&id],
                 before,
                 pair,
-                (selection.context.key, audit),
+                (
+                    selection.context.key,
+                    audit,
+                    selection.fixture,
+                    selection.fixture_rules.clone(),
+                ),
                 shutdown,
             )
             .await?;
@@ -298,7 +289,12 @@ async fn store_document(
     entry: &xml::Entry,
     catalog: BlobDigest,
     pair: Pair,
-    (selection, audit): (BlobDigest, &Completion),
+    (selection, audit, fixture, fixture_rules): (
+        BlobDigest,
+        &Completion,
+        bool,
+        Option<Arc<crate::policy::FixtureRules>>,
+    ),
     shutdown: &Shutdown,
 ) -> Result<(Coverage, Coverage)> {
     let txt = pair.txt.ok_or("missing joined TXT")?;
@@ -313,21 +309,6 @@ async fn store_document(
     let observation = digest(&input.observation)?;
     let version = digest(&txt.version.ok_or("missing TXT document version")?)?;
     let xml_observation = xml.observation.as_deref().map(digest).transpose()?;
-    let metadata = crate::policy::metadata_digest(entry)?.to_string();
-    let bound = candidate
-        .tx
-        .query_one(
-            "SELECT EXISTS (SELECT FROM rfc.document_versions d
-         JOIN rfc.policy_receipts p ON p.identity = d.policy_receipt
-         WHERE d.identity = $1::bytea AND p.receipt ->> 'metadata_digest' = $2)",
-            &[&bytes(&version), &metadata],
-        )
-        .await?
-        .try_get::<_, bool>(0)?;
-    if !bound {
-        return Err("candidate policy receipt does not bind the selected catalog metadata".into());
-    }
-
     let rsync_url = format!(
         "rsync://rsync.rfc-editor.org/rfcs-text-only/rfc{}.txt",
         id.get()
@@ -407,7 +388,7 @@ async fn store_document(
             ],
         )
         .await?;
-    candidate
+    let metadata = candidate
         .member_with_sources(
             &Membership {
                 rfc: id,
@@ -428,7 +409,8 @@ async fn store_document(
     let xml_raw = xml.original.as_deref().map(digest).transpose()?;
     let stop = shutdown.clone();
     let txt_length = i64::try_from(input.length)?;
-    let (coverage, xml_edges, txt_edges) = tokio::task::spawn_blocking(move || {
+    let entry = entry.clone();
+    let (coverage, xml_edges, txt_edges, rights) = tokio::task::spawn_blocking(move || {
         let budget = Budget {
             bytes: DOCUMENT_BYTES,
             shutdown: &stop,
@@ -447,9 +429,19 @@ async fn store_document(
             coverage = Some((parsed.all, parsed.classified));
             xml_edges = parsed.edges;
         }
+        let bytes = canonical(&reader, raw, txt_length, TXT_LIMIT)?;
+        let mut rights = crate::policy::classify(
+            id,
+            raw,
+            metadata,
+            Some(&entry),
+            &bytes,
+            !fixture,
+            fixture_rules.as_deref(),
+        );
+        rights.search |= fixture;
         let mut txt_edges = Vec::new();
         if !coverage.is_some_and(|(all, _)| all == Coverage::Complete) {
-            let bytes = canonical(&reader, raw, txt_length, TXT_LIMIT)?;
             let parsed = crate::text::index_with_budget(&bytes, &budget)?;
             txt_edges = parsed.references;
             if coverage.is_none() {
@@ -467,9 +459,11 @@ async fn store_document(
             coverage.ok_or("document lacks reference coverage")?,
             xml_edges,
             txt_edges,
+            rights,
         ))
     })
     .await??;
+    crate::policy::store(&candidate.tx, candidate.generation(), &rights).await?;
     for edge in xml_edges {
         record_edge(
             candidate,

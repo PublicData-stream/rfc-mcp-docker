@@ -20,7 +20,7 @@ pub(crate) struct Catalog {
     pub incomplete: BTreeSet<(RfcNumber, &'static str)>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub(crate) struct Entry {
     pub title: String,
     pub stream: Option<String>,

@@ -7,6 +7,7 @@ pub const FORMAT_VERSION: i32 = 1;
 pub const INGESTION_FORMAT_VERSION: i32 = 2;
 pub const AUDIT_FORMAT_VERSION: i32 = 3;
 pub const POLICY_FORMAT_VERSION: i32 = 4;
+pub const SOURCE_FORMAT_VERSION: i32 = 5;
 
 /// RFC number, TXT digest, document-version identity, catalog metadata identity.
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -26,7 +27,7 @@ pub struct Ingestion(
     pub String,
     pub String,
     pub String,
-    pub String,
+    pub Option<String>,
     pub serde_json::Value,
 );
 
@@ -51,7 +52,15 @@ impl Manifest {
         if self.policy.is_some() {
             POLICY_FORMAT_VERSION
         } else if self.audit.is_some() {
-            AUDIT_FORMAT_VERSION
+            if self
+                .ingestion
+                .as_ref()
+                .is_some_and(|ingestion| ingestion.3.is_none())
+            {
+                SOURCE_FORMAT_VERSION
+            } else {
+                AUDIT_FORMAT_VERSION
+            }
         } else if self.ingestion.is_some() {
             INGESTION_FORMAT_VERSION
         } else {
@@ -67,6 +76,7 @@ impl Manifest {
         self.members.sort_unstable();
         self.edges.sort_unstable();
         self.coverage.sort_unstable();
+        let format = self.version();
         let inputs = (
             self.parser_version,
             self.index_version,
@@ -87,14 +97,7 @@ impl Manifest {
                 policy,
             )),
             (Some(ingestion), Some(audit), None) => serde_json::to_vec(&(
-                AUDIT_FORMAT_VERSION,
-                inputs.0,
-                inputs.1,
-                inputs.2,
-                inputs.3,
-                inputs.4,
-                ingestion,
-                audit,
+                format, inputs.0, inputs.1, inputs.2, inputs.3, inputs.4, ingestion, audit,
             )),
             (Some(ingestion), None, None) => serde_json::to_vec(&(
                 INGESTION_FORMAT_VERSION,
@@ -181,7 +184,7 @@ mod tests {
                 scope.into(),
                 "before".into(),
                 "after".into(),
-                "policy-1".into(),
+                Some("policy-1".into()),
                 serde_json::json!([[8, {"title": "PDF-only"}]]),
             ));
             assert_eq!(manifest.version(), INGESTION_FORMAT_VERSION);

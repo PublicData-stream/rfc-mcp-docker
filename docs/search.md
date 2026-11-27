@@ -61,9 +61,12 @@ The engine accepts up to 8 KiB of query text, 4 KiB per decoded literal, 128 syn
 
 Set `include_snippets` to request original-byte excerpts from positive full-text evidence. Each excerpt carries original byte coordinates and refers to the document's complete notice group. The engine returns at most eight excerpts per document and groups excerpts for at most ten documents. Token excerpts require an exact round trip through PostgreSQL's token highlighting on up to 256 KiB of original UTF-8. Where policy, byte verification, notices, or the 256 KiB serialized search payload budget prevent excerpts, the confirmed hit remains available as metadata.
 
-## Source policy and original matches
+## Source rights and original matches
 
-Metadata remains available for restricted documents. Original snippets and
-regex excerpts require a qualifying receipt and complete notice inventory.
-Regex scanning excludes restricted RFCs and reports them through omissions
-and coverage. Rights restrictions also apply to pinned generations.
+Catalog metadata and structural information remain available where text
+redistribution is restricted. Full-text predicates use internally authorized
+originals and can report metadata-only matches. Excerpts require a grant
+covering the actual returned bytes and their required notices. Ripgrep scans
+the verified whole original when internal search is authorized. A hit with
+unresolved excerpt rights reports coordinates and the official URL.
+[Source policy](source-policy.md)

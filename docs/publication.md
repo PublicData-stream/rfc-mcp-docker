@@ -6,7 +6,7 @@ The PostgreSQL `rfc.active_generation` row identifies the active generation and 
 
 Run these commands with Sync's database credentials, writable mirror, and private staging mounts. Stop Feed and Sync before independently preparing and promoting a candidate. A manual request that attaches to a daemon run receives that run's result.
 
-Sync on schema 12 seals each full candidate with a
+Sync on schema 13 seals each full candidate with a
 sealed selection, audited HTTPS TXT, and a classified RFCXML outcome for
 every RFC. Reconciliation and promotion share the existing corpus lock.
 [Acquisition and rollout](ingestion.md#run-acquisition)
@@ -85,12 +85,10 @@ For a corrupt canonical original, close the proxy route, quiesce the stack, and 
 
 ## Rights changes and rollback
 
-Format-4 candidates bind source policy alongside HTTPS and rsync evidence.
-Promotion checks the matching approval pin for automatic grants. An operator
-must record a cross-generation restriction before publishing a rights
-downgrade that would leave revoked permissions available on a retained
-generation. Rollback checks the target against current restrictions.
+Format-5 candidates bind HTTPS and rsync acquisition evidence. Serve applies
+the current emergency restriction ledger to published and retained originals.
+Rollback preserves those restrictions.
 
 Keep the rights ledger independently of generation backups. Restore the
-latest verified ledger and confirm its epoch and the approved pin before
-reopening ingress. [Restriction procedure](source-policy.md#restrict-an-rfc)
+latest verified ledger and confirm its epoch before reopening ingress.
+[Restriction procedure](source-policy.md#restrict-an-operation-or-recover-the-ledger)

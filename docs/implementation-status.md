@@ -2114,3 +2114,57 @@ for schema in 9 10 11; do
     "--upgrade-from-schema$schema" "$historical_prefix$schema"
 done
 ~~~
+
+## License-based redistribution and whole-corpus regex
+
+Schema 13 separates source rights from the publication audit and stores
+rights against the sealed catalog member. Format 5 preserves HTTPS and
+rsync acquisition evidence. Serve applies the same emergency ledger to
+current and retained generations.
+
+The frozen Rust gate, all-feature Clippy and tests, and Phase 8 HTTP
+smoke passed on native Linux amd64 on 2026-11-27. The HTTP smoke exercised 258
+mutations. Rights tests covered inherited material, modification legends,
+ordinary body text, scoped code, and TLP transition dates. Worker tests
+checked original bytes and per-submatch line numbers in a multiline frame.
+
+A bounded, paced HTTPS sample used the official RFC Index and exact TXT
+alongside the two checked-in official originals. The classifier permitted
+internal search and complete reproduction for all 12 examples. It identified
+attributed quotation grants for RFCs 6749, 8174, 8446, 9110, 8720, 8726,
+and 8763. The standard Pre-5378 legends on RFCs 8446 and 9110 were recorded
+in diagnostics. General quotation remained unresolved for RFCs 2119,
+5743, 5744, 5745, and 9920. The official sample was a classifier check.
+The local deployment checks use disposable fixtures.
+[Source policy](source-policy.md) · [MCP API](mcp.md)
+
+- Phase 0 passed on rootless Compose, including the MCP wire contract,
+  PostgreSQL roles and TLS, and worker confinement. A retry after a Docker
+  startup timeout completed and removed the disposable stack.
+- The Phase 4 search fixture compared 124 queries with an independent graph
+  evaluator and checked index plans and bounded body search on the seeded
+  graph.
+- The Phase 5 MCP fixture verified exact whole and ranged reads, the
+  metadata-only match schema, multiline matches against the pinned native
+  binary, mixed quoted and metadata-only hits in one RFC, and cursor
+  progress after a dense worker frame exceeded the existing output limit.
+  It also checked the final rights fence for buffered responses, cursor
+  expiry, and separate excerpt and internal-search denials after rollback.
+- The disposable rootless Minikube profile passed manual and Feed-triggered
+  publication, exact MCP reads, and emergency restrictions on two Serve
+  replicas. Metadata-only regex matches remained available after public
+  bytes were restricted. The denied read persisted through pod replacement.
+- The backup-verified Compose upgrade preserved the schema 12 incumbent
+  through the schema 13 cutover. The new services read the same active and
+  retained originals after local reclassification. A second migration
+  left the historical manifests intact. Rights refresh refused a held
+  authorization fence, rolled back an injected mid-write failure, and
+  was idempotent after a successful retry. Sync published a format-5
+  replacement and rolled back to the retained format-4 generation.
+- The Phase 8 restore rehearsal revalidated 17 blobs, 814 persisted
+  byte coordinates, and three manifests. It restored the rights ledger
+  and confirmed the restriction through MCP on the fresh stack.
+- The Phase 7 deployment probe with the final images passed production
+  confinement, native worker offsets, two-worker saturation, cancellation,
+  reaping, and generation fence release. The private readiness and
+  publication routes stayed responsive with the public pool saturated.

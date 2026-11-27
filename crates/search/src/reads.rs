@@ -1,10 +1,7 @@
 use std::ops::Range;
 
 use rfc_core::{BlobDigest, ByteRange, GenerationId, RfcNumber};
-use rfc_storage::{
-    policy::Policy,
-    postgres::{GenerationReadGuard, GenerationSelection},
-};
+use rfc_storage::postgres::{GenerationReadGuard, GenerationSelection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
@@ -25,12 +22,12 @@ const MAX_HEADING: usize = 4096;
 const DOCUMENT: &str = "SELECT m.rfc_id::integer,m.title,m.stream,d.txt_digest::bytea,
     d.byte_length::bigint,d.encoding,d.notice_policy,d.notice_state::text,
     o.source_url,d.identity::bytea,coalesce(d.section_state::text,'unavailable'),
-    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm, d.policy_receipt::bytea AS policy_identity,
-    receipt.receipt::text AS policy_evidence,
-    (SELECT cap.ceiling FROM rfc.policy_restrictions cap WHERE cap.rfc_id = m.rfc_id
-      ORDER BY cap.epoch DESC LIMIT 1) AS policy_ceiling
+    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm, sr.identity::bytea AS policy_identity,
+    sr.evidence::text AS policy_evidence, m.metadata_identity::bytea AS policy_metadata,
+    coalesce(cap.denied, 0) AS policy_denied
     FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity=m.document_version
-    LEFT JOIN rfc.policy_receipts receipt ON receipt.identity = d.policy_receipt
+    LEFT JOIN rfc.source_rights sr ON (sr.generation_id,sr.rfc_id) = (m.generation_id,m.rfc_id)
+    LEFT JOIN rfc.source_restrictions cap ON cap.rfc_id=m.rfc_id
     JOIN rfc.source_observations o ON o.identity=m.txt_observation
     LEFT JOIN rfc.generation_source_evidence p ON (p.generation_id,p.rfc_id) = (m.generation_id,m.rfc_id)
     WHERE m.generation_id=$1 AND m.rfc_id=$2::integer";
@@ -166,7 +163,10 @@ impl<'a> PageContext<'a> {
             .map(|value| key.open::<PageCursor>(value))
             .transpose()?;
         if let Some(cursor) = &cursor {
-            if cursor.v != 1 || cursor.tool != tool || cursor.after < 0 {
+            if cursor.v == 1 {
+                return Err(SearchError::CursorExpired);
+            }
+            if cursor.v != 2 || cursor.tool != tool || cursor.after < 0 {
                 return Err(SearchError::CursorInvalid);
             }
             validate_context(cursor.generation, cursor.sequence, cursor.expiry, now)?;
@@ -240,7 +240,7 @@ impl<'a> PageContext<'a> {
             return Err(SearchError::CursorExpired);
         }
         self.key.seal(&PageCursor {
-            v: 1,
+            v: 2,
             tool: self.tool.into(),
             args: args.into(),
             generation: generation(guard)?,
@@ -376,17 +376,27 @@ impl Search {
                     AND ($3::integer IS NULL OR depth<=$3) ORDER BY ordinal LIMIT $4",
                 &[&source.version, &after, &request.max_depth, &(limit + 1)],
             ).await?;
-            let mut group = None;
-            let mut original = None;
-            if !rows.is_empty() && source.permits_excerpt() && source.length <= MAX_SOURCE_BYTES
-                && let Some(bytes) = self.read_original(guard, source.rfc, source.length, |bytes| bytes).await?
-                && let Some(notices) = snippets::notices(guard.transaction(), &source, &bytes, false).await?
-            {
-                group = Some(source.notice_group(notices, false));
-                original = Some(bytes);
-            }
-            let entries = rows.iter().map(|row| table_entry(row, original.as_deref(), group.as_ref().map(|g| g.id.as_str()))).collect();
-            let headings_included = group.is_some();
+            let original = if !rows.is_empty() && source.permits_excerpt() && source.length <= MAX_SOURCE_BYTES {
+                self.read_original(guard, source.rfc, source.length, |bytes| bytes).await?
+            } else { None };
+            let mut grants = Vec::new();
+            let group_id = format!("rfc-{}-notices", source.rfc.get());
+            let notices = original.as_ref().and_then(|bytes| source.notices(bytes, &[]));
+            let entries = rows.iter().take(limit as usize + 1).map(|row| {
+                let range = row.get::<_, i64>(8) as usize..row.get::<_, i64>(9) as usize;
+                if notices.is_some() && let Some(covered) = source.cover(&range) {
+                    let prior = grants.len();
+                    grants.extend(covered);
+                    if source.notices(original.as_deref().expect("verified original"), &grants).is_none() {
+                        grants.truncate(prior);
+                        return table_entry(row, None, None);
+                    }
+                    return table_entry(row, original.as_deref(), Some(&group_id));
+                }
+                table_entry(row, None, None)
+            }).collect();
+            let headings_included = !grants.is_empty();
+            let group = if headings_included { original.as_ref().and_then(|bytes| source.notices(bytes, &grants)).map(|notices| source.notice_group(notices, &grants, None)) } else { None };
             let mut extra = json!({
                 "id":request.id, "source_url":source.url, "digest":source.digest.to_string(),
                 "notice_groups":group.into_iter().collect::<Vec<_>>(),
@@ -479,13 +489,20 @@ impl Search {
                         )
                     };
 
-                let whole_only = selection_is_whole && source.policy == Policy::WholeOnly;
-                let reviewed_pages = selection_is_whole
-                    && source.policy == Policy::WholePaginated
-                    && source.notice_state == "complete";
-                if (whole_only && position != 0)
-                    || (!whole_only && !reviewed_pages && !source.permits_excerpt())
-                {
+                let whole_paging = if selection_is_whole {
+                    Some(source.whole().ok_or(SearchError::SourcePolicyRestricted)?)
+                } else {
+                    None
+                };
+                let whole_only = whole_paging == Some(false);
+                let grants = if selection_is_whole {
+                    Vec::new()
+                } else {
+                    source
+                        .cover(&(scope.start..scope.end))
+                        .ok_or(SearchError::SourcePolicyRestricted)?
+                };
+                if whole_only && position != 0 {
                     return Err(SearchError::SourcePolicyRestricted.into());
                 }
                 if scope.format == Format::Text && source.encoding != "utf8" {
@@ -498,15 +515,14 @@ impl Search {
                     .read_original(guard, source.rfc, source.length, |bytes| bytes)
                     .await?
                     .ok_or(SearchError::SourceUnavailable)?;
-                let notices =
-                    match snippets::notices(guard.transaction(), &source, &bytes, reviewed_pages)
-                        .await?
-                    {
-                        Some(notices) if source.notice_state == "complete" => notices,
-                        _ if whole_only => Vec::new(),
-                        _ => return Err(SearchError::SourcePolicyRestricted.into()),
-                    };
-                let group = source.notice_group(notices, whole_only);
+                let notices = if whole_only {
+                    Vec::new()
+                } else {
+                    source
+                        .notices(&bytes, &grants)
+                        .ok_or(SearchError::SourcePolicyRestricted)?
+                };
+                let group = source.notice_group(notices, &grants, whole_paging.map(|pages| !pages));
                 let text = if scope.format == Format::Text {
                     let text =
                         std::str::from_utf8(&bytes).map_err(|_| SearchError::SourceUnavailable)?;
@@ -683,6 +699,17 @@ fn build_items(
                 .map(|(_, value)| value.clone())
                 .collect(),
         );
+        if page.field == "sections" {
+            let headings = page
+                .entries
+                .iter()
+                .take(count)
+                .any(|(_, entry)| entry.get("original_heading").is_some());
+            result["coverage"]["headings_included"] = json!(headings);
+            if !headings {
+                result["notice_groups"] = json!([]);
+            }
+        }
         if fits(&result) {
             return Ok(result);
         }

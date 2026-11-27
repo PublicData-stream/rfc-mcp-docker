@@ -164,6 +164,12 @@ print(response.read().decode())
             result = self.mcp(target, "get", id=2119)
             assert result["isError"] and result["structuredContent"]["code"] == "source_policy_restricted", result
 
+        for target in ("serve", replica):
+            searched = self.mcp(target, "rg", pattern="key words", mode="literal", case_sensitive=False, ids=[2119])
+            assert not searched["isError"], searched
+            page = searched["structuredContent"]
+            assert page["scan_complete"] and page["matches"], page
+            assert all(hit["content_omitted_reason"] == "source_policy_restricted" for hit in page["matches"])
         denied("serve")
         denied(replica)
         resumed = self.mcp(replica, "list", limit=1, cursor=cursor)

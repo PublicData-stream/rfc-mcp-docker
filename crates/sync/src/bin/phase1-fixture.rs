@@ -140,7 +140,6 @@ async fn populate() -> Result<()> {
                     },
                     std::str::from_utf8(bytes)?,
                     txt,
-                    observation,
                 )
                 .await?;
             candidate
@@ -213,18 +212,17 @@ async fn verify(id: GenerationId) -> Result<()> {
             "SELECT g.manifest_format, p.fixture, ARRAY(
                 SELECT m.rfc_id::integer FROM rfc.generation_documents m
                 JOIN rfc.document_versions d ON d.identity = m.document_version
-                JOIN rfc.policy_receipts r ON r.identity = d.policy_receipt
-                WHERE m.generation_id = g.id AND r.decision = 'metadata_only'
+                WHERE m.generation_id = g.id AND d.notice_policy = 'metadata_only'
                 ORDER BY m.rfc_id
              )
-             FROM rfc.generations g JOIN rfc.generation_policy p ON p.generation_id = g.id
+             FROM rfc.generations g JOIN rfc.generation_audit p ON p.generation_id = g.id
              JOIN rfc.generation_ingestion i ON i.generation_id = g.id
              WHERE g.id = $1 AND i.scope = 'sample'
-               AND i.policy_registry = encode(p.registry_digest, 'hex')",
+               AND i.policy_registry IS NULL",
             &[&generation],
         )
         .await?;
-    assert_eq!(policy.try_get::<_, i32>(0)?, 4);
+    assert_eq!(policy.try_get::<_, i32>(0)?, 5);
     assert!(policy.try_get::<_, bool>(1)?);
     assert_eq!(
         policy.try_get::<_, Vec<i32>>(2)?,

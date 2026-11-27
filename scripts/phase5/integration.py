@@ -48,6 +48,14 @@ LARGE_NOTICE = b"\x01" * 25_000
 RG_ORIGINAL = (b"\xef\xbb\xbf\r\n\r\n" + EXCERPT.replace(b"Comments: 102", b"Comments: 108")
                .replace(b"TLS, exact bytes", b"TLS TLS, exact bytes") + "ÿ tls --version\r\n".encode())
 RG_DENSE = EXCERPT.replace(b"Comments: 102", b"Comments: 109") + b"z" * 65536 + b"\r\n"
+RG_SCOPED = (
+    b"Request for Comments: 110\n\nCopyright Notice\n\n"
+    b"   Copyright (c) 2026 IETF Trust.\n\n"
+    b"   Legal Provisions Relating to IETF Documents (https://trustee.ietf.org/license-info).\n\n"
+    b"1. Sources\n\nPublic marker\n"
+    b"<BEGIN THIRD-PARTY MATERIAL>\nPrivate marker\n<END THIRD-PARTY MATERIAL>\n"
+)
+
 
 
 class Project(phase3.Project):
@@ -70,20 +78,20 @@ class Project(phase3.Project):
             107: (b"1. Root\n\n3.2. Orphaned heading\n\nBody\n", "Partial section hierarchy"),
             108: (RG_ORIGINAL, "Raw ripgrep fixture"),
             109: (RG_DENSE, "Dense ripgrep output fixture"),
+            110: (RG_SCOPED, "Scoped ripgrep fixture"),
         }
         catalog = self.source / "catalog.xml"
-        entries = "".join(phase2.catalog_entry(rfc, title) for rfc, (_, title) in additions.items())
-        old = phase2.catalog_entry(8174, "RFC 8174", "<updates><doc-id>RFC2119</doc-id></updates>")
-        verified = old.replace("<date>", "<author><name>B. Leiba</name></author><date>")
-        verified = verified.replace("<year>2026</year>", "<year>2017</year>").replace("<stream>IRTF", "<stream>IETF")
-        index = catalog.read_text()
-        assert old in index
-        catalog.write_text(index.replace(old, verified).replace("</rfc-index>", entries + "</rfc-index>"))
+        entries = "".join(
+            phase2.catalog_entry(rfc, title).replace("<stream>IRTF", "<stream>IETF")
+            if rfc == 110 else phase2.catalog_entry(rfc, title)
+            for rfc, (_, title) in additions.items()
+        )
+        catalog.write_text(catalog.read_text().replace("</rfc-index>", entries + "</rfc-index>"))
         for rfc, payload in [(101, BINARY), *((rfc, pair[0]) for rfc, pair in additions.items())]:
             sources[rfc] = payload
             for transport in ("https", "rsync"):
                 (self.source / transport / f"rfc{rfc}.txt").write_bytes(payload)
-        registry = json.loads((phase2.REPO / "crates" / "sync" / "src" / "policy.json").read_text())
+        registry = {"overrides": []}
         registry["version"] = "phase5-synthetic"
         self.digests = {rfc: self.digest(sources[rfc]) for rfc in (101, 102, 105, 106, 108, 109)}
         for rfc, notice in [(101, BINARY_NOTICE), (102, None), (105, NOTICE),
@@ -300,8 +308,11 @@ def read_tests(client, project, sources):
         assert bytes_from(document["original"]) == sources[rfc] and document["next_cursor"] is None
         original_digest = json.loads((phase2.REPO / "fixtures/rfc/provenance.json").read_text())
         assert document["original"]["digest"] == original_digest[f"rfc{rfc}.txt"]["blake3"]
-        client.call("get", id=rfc, range={"start_byte": 0, "end_byte": 10}, _error="source_policy_restricted")
-        client.call("get", id=rfc, max_bytes=100, _error="resource_limit_exceeded")
+        if rfc == 2119:
+            client.call("get", id=rfc, range={"start_byte": 0, "end_byte": 10}, _error="source_policy_restricted")
+        else:
+            assert bytes_from(client.call("get", id=rfc, range={"start_byte": 0, "end_byte": 10})[0]["original"]) == sources[rfc][:10]
+        assert client.call("get", id=rfc, max_bytes=100)[0]["next_cursor"]
     binary, _ = reassemble(client, project, 101, max_bytes=8)
     text, cursor = reassemble(client, project, 105)
     assert binary == BINARY and text == TEXT
@@ -358,7 +369,7 @@ def read_tests(client, project, sources):
     return cursor
 
 
-def rg_tests(client):
+def rg_tests(client, project):
     arguments = dict(pattern="tls", mode="literal", case_sensitive=False,
                      ids=[108, 108], context_lines=1, limit=1)
     first = client.call("rg", **arguments)[0]
@@ -397,17 +408,56 @@ def rg_tests(client):
     client.call("rg", pattern="[", ids=[108], _error="invalid_regex")
     client.call("rg", pattern="(?=TLS)", ids=[108], _error="invalid_regex")
     client.call("rg", pattern="one\ntwo", mode="literal", _error="invalid_arguments")
-    restricted = client.call("rg", pattern="TLS", ids=[101])[0]
-    assert not restricted["scan_complete"] and not restricted["matches"] and not restricted["next_cursor"]
-    assert restricted["omitted"][0]["code"] == "source_policy_restricted"
+    restricted = client.call("rg", pattern="Original RFC bytes", ids=[101])[0]
+    assert restricted["scan_complete"] and not restricted["omitted"] and not restricted["next_cursor"]
+    hit = restricted["matches"][0]
+    assert hit["filename"] == "rfc101.txt" and hit["line_number"] == hit["end_line_number"] == 2
+    assert hit["content_omitted_reason"] == "source_policy_restricted", hit
+    assert not {"content", "content_base64", "encoding"} & hit.keys(), hit
+    assert not restricted["notice_groups"][0]["notices"], restricted
+    multi = client.call("rg", pattern=r"exact bytes\r\n\r\n", multiline=True, ids=[108])[0]
+    hit = multi["matches"][0]
+    start, end = hit["match_range"]
+    assert RG_ORIGINAL[start:end] == b"exact bytes\r\n\r\n"
+    assert hit["line_number"] < hit["end_line_number"]
+    assert bytes_from(hit) == RG_ORIGINAL[hit["start_byte"]:hit["end_byte"]]
+    for pattern, multiline in [(r"TLS", False), (r"exact bytes\r\n\r\n|Descendant", True),
+                               (r"(?m)^", True)]:
+        command = project.command("exec", "-T", "serve", "/usr/local/bin/rg", "--json", "--no-config",
+                                  "--encoding", "none", "--text", "--engine", "default")
+        if multiline:
+            command.append("--multiline")
+        output = subprocess.check_output([*command, "-e", pattern, "--", "-"],
+                                         env=project.env, input=RG_ORIGINAL, timeout=20)
+        events = [json.loads(line) for line in output.splitlines()]
+        expected = []
+        for event in events:
+            if event["type"] != "match":
+                continue
+            data = event["data"]
+            for match in data["submatches"]:
+                start = data["absolute_offset"] + match["start"]
+                end = data["absolute_offset"] + match["end"]
+                expected.append(([start, end], 1 + RG_ORIGINAL[:start].count(b"\n"),
+                                 1 + RG_ORIGINAL[:max(start, end - 1)].count(b"\n")))
+        result = client.call("rg", pattern=pattern, multiline=multiline, ids=[108], limit=100)[0]
+        actual = [(hit["match_range"], hit["line_number"], hit["end_line_number"]) for hit in result["matches"]]
+        assert actual == expected and len(result["notice_groups"]) == 1, (pattern, actual, expected)
+    scoped = client.call("rg", pattern="marker", ids=[110], context_lines=5)[0]
+    public, private = scoped["matches"]
+    assert scoped["scan_complete"] and not scoped["omitted"] and len(scoped["notice_groups"]) == 1
+    assert b"Public marker" in bytes_from(public) and b"Private marker" not in bytes_from(public)
+    assert private["content_omitted_reason"] == "source_policy_restricted"
+    assert public["notice_group_id"] == private["notice_group_id"]
     empty = client.call("rg", pattern="absent", ids=[108])[0]
     assert empty["scan_complete"] and empty["matches"] == [] and empty["next_cursor"] is None
-    client.call("rg", pattern="z", mode="literal", ids=[109], _error="resource_limit_exceeded")
+    dense = client.call("rg", pattern="z", mode="literal", ids=[109])[0]
+    assert dense["omitted"][0]["code"] == "resource_limit_exceeded" and dense["next_cursor"]
     partial = client.call("rg", pattern="z", mode="literal", ids=[108, 109])[0]
     assert not partial["scan_complete"] and not partial["matches"]
     assert partial["truncation_reason"] == "worker_budget" and partial["next_cursor"]
-    client.call("rg", pattern="z", mode="literal", ids=[108, 109], cursor=partial["next_cursor"],
-                _error="resource_limit_exceeded")
+    dense = client.call("rg", pattern="z", mode="literal", ids=[108, 109], cursor=partial["next_cursor"])[0]
+    assert dense["omitted"][0]["id"] == 109 and not dense["scan_complete"], dense
     print("Ripgrep exact bytes, signed pagination, option-like patterns, and coverage passed", flush=True)
     return arguments, cursor
 
@@ -514,40 +564,21 @@ def publication(project, client, first, get_cursor, rg_page):
 def policy_revocation(project, client, retained):
     audit = project.app("sync", "-T", args=("policy", "audit", "--format", "json"))
     report = json.loads(subprocess.check_output(audit, env=project.env, timeout=40))
-    assert report["complete"] and report["full"] and report["fixture"], report
-    assert report["total_documents"] == len(report["rows"]), report
-    proposed = next(row for row in report["rows"] if row["rfc"] == 8174)
-    assert proposed["current"] == "whole_only" and proposed["proposed"] == "excerpt_allowed", proposed
-    path = Path(project.env["PHASE5_DIR"]) / "candidate-audit.json"
-    path.write_text(json.dumps(report))
-    approve = project.app("sync", "-T", "-v", f"{path}:/phase5/candidate-audit.json:ro",
-                          args=("policy", "approve", "--registry", report["registry_digest"], "--audit-report",
-                                "/phase5/candidate-audit.json", "--review-ref", "private test report"))
-    attempt = subprocess.run(approve, env=project.env, capture_output=True, text=True, timeout=40)
-    assert attempt.returncode and "official-corpus report" in attempt.stderr, attempt
-    assert project.sql("SELECT registry_digest IS NULL FROM rfc.policy_state") == "t"
+    assert report["documents"] == len(report["rows"]), report
+    evidence = next(row["rights"] for row in report["rows"] if row["rfc"] == 8174)
+    assert evidence["search"] and evidence["quotes"], evidence
+    assert project.sql("SELECT to_regclass('rfc.policy_approvals') IS NULL") == "t"
     explain = project.app("sync", "-T", args=("policy", "explain", "--rfc", "102"))
-    receipt = json.loads(subprocess.check_output(explain, env=project.env, timeout=40))
-    assert receipt["current_receipt"]["decision"] == "excerpt_allowed", receipt
-    assert receipt["proposed_receipt"]["decision"] == "metadata_only", receipt
-    client.call("get", id=8174, range={"start_byte": 0, "end_byte": 32}, _error="source_policy_restricted")
-
-    # A local fixture pin exercises automatic promotion. The production CLI
-    # rejects the same fixture audit above.
-    project.sql("""
-        SELECT rfc.approve_policy(p.registry_digest,p.classifier,g.manifest_digest,g.manifest_digest,
-                                  'isolated fixture only')
-        FROM rfc.active_generation a JOIN rfc.generation_policy p ON p.generation_id=a.generation_id
-        JOIN rfc.generations g ON g.id=a.generation_id
-    """)
+    evidence = json.loads(subprocess.check_output(explain, env=project.env, timeout=40))
+    assert evidence["rows"][0]["rights"]["quotes"], evidence
     third = int(project.reconcile()["generation_id"])
     project.activate(third, 4)
     result = client.call("get", id=8174, range={"start_byte": 0, "end_byte": 32})[0]
     original = (phase2.REPO / "fixtures/rfc/rfc8174.txt").read_bytes()
     assert bytes_from(result["original"]) == original[:32]
     group = result["notice_groups"][0]
-    assert group["policy"] == {"decision": "excerpt_allowed", "approval_method": "automatic", "rule_id": "ietf-tlp-5"}
-    assert group["attribution"] == "IETF, RFC 8174, Barry Leiba"
+    assert group["policy"] == {"decision": "excerpt_allowed", "approval_method": "automatic", "rule_id": "rfc-redistribution-1"}
+    assert group["attribution"].startswith("rfc8174.txt, IETF, ")
     assert group["license"]["section"] == "3.c(iii)"
     for notice in group["notices"]:
         assert bytes_from(notice) == original[notice["start_byte"]:notice["end_byte"]]
@@ -586,10 +617,23 @@ def policy_revocation(project, client, retained):
     client.call("get", id=105, cursor=cursor, _error="cursor_expired")
     client.call("get", id=105, _error="source_policy_restricted")
     assert client.call("get", id=2119)[0]["original"]
-    project.activate(retained, 5, "rollback", error="rollback would restore revoked permissions")
+    project.activate(retained, 5, "rollback")
+    client.call("get", id=105, _error="source_policy_restricted")
     denied = client.call("table", id=105)[0]
     assert all("original_heading" not in section for section in denied["sections"])
-    print("Policy audit, receipt, buffered revocation and stale cursor checks passed", flush=True)
+    for operation, epoch in (("excerpt", 1), ("internal_search", 2)):
+        command = project.app("sync", "-T", args=("policy", "restrict", "--rfc", "108", "--deny", operation,
+                              "--reason", "rights_revoked", "--review-ref", "synthetic operation restriction",
+                              "--expect-epoch", str(epoch)))
+        assert f"rights epoch {epoch + 1}" in subprocess.check_output(command, env=project.env, text=True, timeout=30)
+        result = client.call("rg", pattern="TLS", ids=[108])[0]
+        if operation == "excerpt":
+            assert result["scan_complete"] and result["matches"]
+            assert all(hit["content_omitted_reason"] == "source_policy_restricted" for hit in result["matches"])
+            assert bytes_from(client.call("get", id=108)[0]["original"]) == RG_ORIGINAL
+        else:
+            assert not result["scan_complete"] and not result["matches"] and result["omitted"][0]["id"] == 108
+    print("Policy diagnostics, exact bytes, buffered revocation and stale cursor checks passed", flush=True)
 
 
 def upgrade(project):
@@ -615,7 +659,7 @@ def upgrade(project):
     project.check("serve", expected="unsupported storage schema version")
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "\n".join(map(str, range(1, 13)))
+    assert project.sql("SELECT version FROM rfc.schema_migrations ORDER BY version") == "\n".join(map(str, range(1, 14)))
     assert project.sql(record) == before
 
 
@@ -657,7 +701,7 @@ def main():
             assert project.admin("/ready").returncode == 0
             assert "rfc_mcp_rg_available 1" in project.admin("/metrics").stdout
             cursor = read_tests(client, project, sources)
-            rg_page = rg_tests(client)
+            rg_page = rg_tests(client, project)
             project.denied_sql("DELETE FROM rfc.document_versions", phase1.SERVE)
             phase1.exercise_isolation(project)
             for service in ("sync", "feed"):

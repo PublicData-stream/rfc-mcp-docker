@@ -8,7 +8,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[index], "-e") != 0)
             continue;
         if (strcmp(argv[index + 1], "rfc-worker-check") == 0) {
-            puts("{\"type\":\"match\",\"data\":{\"absolute_offset\":0,"
+            puts("{\"type\":\"match\",\"data\":{\"absolute_offset\":0,\"line_number\":1,"
                  "\"lines\":{\"text\":\"rfc-worker-check\\n\"},"
                  "\"submatches\":[{\"match\":{\"text\":\"rfc-worker-check\"},"
                  "\"start\":0,\"end\":16}]}}");

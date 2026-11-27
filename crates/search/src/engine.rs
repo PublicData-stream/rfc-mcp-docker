@@ -233,7 +233,7 @@ pub struct Hit {
     pub excerpts: Vec<Excerpt>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct OriginalRange {
     pub start_byte: u64,
     pub end_byte: u64,
@@ -241,7 +241,7 @@ pub struct OriginalRange {
     pub(crate) representation: Representation,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum Representation {
     Text { content: String },
@@ -579,7 +579,7 @@ impl Scan<'_> {
             let mut through = after;
             for row in rows.iter().take(count) {
                 let id: i32 = row.get(0);
-                if !patterns.is_empty() {
+                if !patterns.is_empty() && row.try_get::<_, bool>(2)? {
                     let length = usize::try_from(row.get::<_, i64>(1))
                         .map_err(|_| SearchError::Unavailable)?;
                     if !self.budget.charge(length, patterns.len()) {
@@ -698,6 +698,7 @@ impl Scan<'_> {
             return Ok(());
         }
         if page.notice_groups.len() < 10
+            && source.permits_search()
             && source.permits_excerpt()
             && source.length <= snippets::MAX_SOURCE_BYTES
             && self.budget.charge(source.length, literals.len())

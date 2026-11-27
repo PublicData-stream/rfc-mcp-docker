@@ -38,10 +38,10 @@ async fn main() -> Result<()> {
         [action, index, source, rfc] if action == "policy-check-sample" => {
             rfc_mcp_docker_sync::policy_cli::qualify_sample(index, source, rfc)?;
         }
-        [action] if action == "policy-receipt-digests" => {
+        [action] if action == "source-rights-digests" => {
             for line in std::io::stdin().lock().lines() {
-                let receipt: rfc_storage::policy::Receipt = serde_json::from_str(&line?)?;
-                println!("{}", receipt.digest()?);
+                let rights: rfc_storage::policy::Rights = serde_json::from_str(&line?)?;
+                println!("{}", rights.digest()?);
             }
         }
         [action, id, sequence] if matches!(action.as_str(), "publish" | "rollback") => {

@@ -170,13 +170,13 @@ def qualify(project, source_schema, originals, driver, mixed_sync=None):
             backup_faults(stack, backup, command, files, blobs)
 
         result = subprocess.check_output(command, env=stack.env, text=True, timeout=110)
-        assert f"migration committed from schema {source_schema} to 12" in result, result
+        assert f"migration committed from schema {source_schema} to 13" in result, result
         assert not stack.capture("ps", "-q", SERVE, SYNC, FEED)
-        assert stack.sql("-c", HISTORY).splitlines() == list(map(str, range(1, 13)))
+        assert stack.sql("-c", HISTORY).splitlines() == list(map(str, range(1, 14)))
         for name, sql in INVENTORY.items():
             assert stack.sql("-c", sql) == files[name].strip()
         result = subprocess.check_output(base, env=stack.env, text=True, timeout=90)
-        assert "already at schema 12; no migration applied" in result, result
+        assert "already at schema 13; no migration applied" in result, result
 
         if mixed_sync:
             current = stack.env["RFC_SYNC_IMAGE"]
@@ -198,15 +198,15 @@ def qualify(project, source_schema, originals, driver, mixed_sync=None):
         stack.run("stop", SERVE)
         if source_schema == 11:
             # A successful preflight from an earlier up must be checked again.
-            stack.sql("-c", "UPDATE rfc.schema_migrations SET version = 99 WHERE version = 12")
+            stack.sql("-c", "UPDATE rfc.schema_migrations SET version = 99 WHERE version = 13")
             try:
                 application_gate(stack, "99]", force=False)
             finally:
-                stack.sql("-c", "UPDATE rfc.schema_migrations SET version = 12 WHERE version = 99")
+                stack.sql("-c", "UPDATE rfc.schema_migrations SET version = 13 WHERE version = 99")
         for generation in files["readable"].splitlines():
             document = json.loads(stack.capture("run", "--rm", "--no-deps", "-T", "-v",
                                                 f"{driver}:/fixture-driver:ro", "--entrypoint",
                                                 "/fixture-driver", SERVE, "read", generation))
             assert str(document["generation"]) == generation
             assert bytes(document["body"]) == originals[101]
-        print(f"Production Compose preserved the incumbent and verified schema {source_schema} → 12", flush=True)
+        print(f"Production Compose preserved the incumbent and verified schema {source_schema} → 13", flush=True)

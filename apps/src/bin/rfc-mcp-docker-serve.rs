@@ -25,14 +25,18 @@ fn main() -> ProbeResult {
         {
             return Ok(rfc_search::sandbox_probe(true, mode == "cpu")?);
         }
-        [option, mode, case, pattern]
+        [option, mode, case, lines, pattern]
             if option == "--rg-worker"
                 && matches!(mode.as_str(), "literal" | "regex")
-                && matches!(case.as_str(), "sensitive" | "insensitive") =>
+                && matches!(case.as_str(), "sensitive" | "insensitive")
+                && matches!(lines.as_str(), "line" | "multiline") =>
         {
-            if let Err(error) =
-                rfc_search::sandbox_worker(pattern, mode == "literal", case == "sensitive")
-            {
+            if let Err(error) = rfc_search::sandbox_worker(
+                pattern,
+                mode == "literal",
+                case == "sensitive",
+                lines == "multiline",
+            ) {
                 eprintln!("ripgrep confinement setup failed: {error}");
                 std::process::exit(125);
             }

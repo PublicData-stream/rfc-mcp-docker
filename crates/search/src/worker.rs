@@ -20,6 +20,8 @@ pub(crate) struct Match {
     pub start: usize,
     pub end: usize,
     pub line: Range<usize>,
+    pub line_number: usize,
+    pub end_line_number: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +29,7 @@ pub(crate) struct Pattern<'a> {
     pub text: &'a str,
     pub literal: bool,
     pub sensitive: bool,
+    pub multiline: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +55,7 @@ enum Event {
 #[derive(Deserialize)]
 struct Line {
     absolute_offset: usize,
+    line_number: usize,
     lines: Text,
     submatches: Vec<Submatch>,
 }
@@ -92,11 +96,12 @@ impl Output {
         &mut self,
         stdout: tokio::process::ChildStdout,
         input: &[u8],
+        multiline: bool,
     ) -> Result<bool, WorkerError> {
         let mut reader = BufReader::new(stdout);
         let mut frame = Vec::new();
         let mut summary = false;
-        let mut last_line_end = 0;
+        let mut previous = None;
         while let Ok(bytes) = reader.fill_buf().await {
             if bytes.is_empty() {
                 return if frame.is_empty() {
@@ -128,8 +133,7 @@ impl Output {
                 Event::Begin(_) | Event::End(_) => {}
                 Event::Summary(_) => summary = true,
                 Event::Match(line) => {
-                    let line_end = self.line(line, input, last_line_end)?;
-                    last_line_end = line_end;
+                    previous = Some(self.line(line, input, previous, multiline)?);
                 }
             }
         }
@@ -140,24 +144,48 @@ impl Output {
         &mut self,
         line: Line,
         input: &[u8],
-        previous_end: usize,
-    ) -> Result<usize, WorkerError> {
+        previous: Option<(usize, usize, usize)>,
+        multiline: bool,
+    ) -> Result<(usize, usize, usize), WorkerError> {
         let bytes = line.lines.into_bytes()?;
         let start = line.absolute_offset;
         let end = start
             .checked_add(bytes.len())
             .ok_or(WorkerError::Unavailable)?;
+        let (previous_start, previous_end, previous_line) = previous.unwrap_or((0, 0, 1));
+        let prefix = input
+            .get(previous_start..start)
+            .ok_or(WorkerError::Unavailable)?;
         if start < previous_end
+            || line.line_number != previous_line + memchr::memchr_iter(b'\n', prefix).count()
             || bytes.is_empty()
             || input.get(start..end) != Some(bytes.as_slice())
             || (start > 0 && input[start - 1] != b'\n')
             || (end < input.len() && bytes.last() != Some(&b'\n'))
-            || bytes[..bytes.len() - 1].contains(&b'\n')
-            || line.submatches.is_empty()
+            || (!multiline && bytes[..bytes.len() - 1].contains(&b'\n'))
         {
             return Err(WorkerError::Unavailable);
         }
+        // The pinned JSON printer omits an empty final submatch at EOF.
+        if line.submatches.is_empty() && end == input.len() && bytes.last() != Some(&b'\n') {
+            if self.after.is_none_or(|after| (end, end) > after) {
+                if self.matches.len() == self.wanted {
+                    return Err(WorkerError::Page);
+                }
+                self.matches.push(Match {
+                    start: end,
+                    end,
+                    line: start..end,
+                    line_number: line.line_number,
+                    end_line_number: line.line_number,
+                });
+            }
+            return Ok((start, end, line.line_number));
+        }
         let mut previous = None;
+        let mut newline = memchr::memchr_iter(b'\n', &bytes).peekable();
+        let mut start_line = line.line_number;
+        let mut start_line_byte = start;
         for submatch in line.submatches {
             let pair = (submatch.start, submatch.end);
             if previous.is_some_and(|prior: (usize, usize)| prior >= pair || prior.1 > pair.0)
@@ -167,6 +195,24 @@ impl Output {
             }
             previous = Some(pair);
             let absolute = (start + pair.0, start + pair.1);
+            while let Some(&offset) = newline.peek().filter(|&&offset| offset < pair.0) {
+                start_line += 1;
+                start_line_byte = start + offset + 1;
+                newline.next();
+            }
+            let last = pair.1.saturating_sub(1).max(pair.0);
+            let mut end_line = start_line;
+            let mut end_line_byte = end;
+            let mut last_line_start = start_line_byte;
+            while let Some(&offset) = newline.peek() {
+                if offset >= last {
+                    end_line_byte = start + offset + 1;
+                    break;
+                }
+                newline.next();
+                end_line += 1;
+                last_line_start = start + offset + 1;
+            }
             if self.after.is_none_or(|after| absolute > after) {
                 if self.matches.len() == self.wanted {
                     return Err(WorkerError::Page);
@@ -174,11 +220,15 @@ impl Output {
                 self.matches.push(Match {
                     start: absolute.0,
                     end: absolute.1,
-                    line: start..end,
+                    line: start_line_byte..end_line_byte,
+                    line_number: start_line,
+                    end_line_number: end_line,
                 });
             }
+            start_line = end_line;
+            start_line_byte = last_line_start;
         }
-        Ok(end)
+        Ok((start, end, line.line_number))
     }
 }
 
@@ -245,6 +295,11 @@ pub(crate) async fn scan(
             } else {
                 "insensitive"
             },
+            if pattern.multiline {
+                "multiline"
+            } else {
+                "line"
+            },
             pattern.text,
         ])
         .stdin(Stdio::piped())
@@ -291,7 +346,11 @@ pub(crate) async fn scan(
             }
             Ok(())
         };
-        let (summary, (), ()) = tokio::try_join!(output.read(stdout, input), write, diagnostic)?;
+        let (summary, (), ()) = tokio::try_join!(
+            output.read(stdout, input, pattern.multiline),
+            write,
+            diagnostic
+        )?;
         let status = process.reap().await?;
         use std::os::unix::process::ExitStatusExt;
         if matches!(
@@ -358,6 +417,73 @@ mod tests {
     }
 
     #[test]
+    fn multiline_frame_keeps_submatch_line_numbers_and_original_ranges() {
+        let input = b"skip\r\na\r\nb z\r\n";
+        let line: Line = serde_json::from_value(serde_json::json!({
+            "absolute_offset": 6,
+            "line_number": 2,
+            "lines": {"text": "a\r\nb z\r\n"},
+            "submatches": [
+                {"match": {"text": "a\r\nb"}, "start": 0, "end": 4},
+                {"match": {"text": "z"}, "start": 5, "end": 6}
+            ]
+        }))
+        .unwrap();
+        let mut output = Output {
+            remaining: 1024,
+            matches: Vec::new(),
+            after: None,
+            wanted: 3,
+        };
+        output.line(line, input, None, true).unwrap();
+        assert_eq!(
+            output.matches,
+            [
+                Match {
+                    start: 6,
+                    end: 10,
+                    line: 6..14,
+                    line_number: 2,
+                    end_line_number: 3
+                },
+                Match {
+                    start: 11,
+                    end: 12,
+                    line: 9..14,
+                    line_number: 3,
+                    end_line_number: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_empty_eof_submatch_uses_the_verified_end_offset() {
+        let line: Line = serde_json::from_value(serde_json::json!({
+            "absolute_offset": 0, "line_number": 1,
+            "lines": {"text": "abc"}, "submatches": []
+        }))
+        .unwrap();
+        let mut output = Output {
+            remaining: 1024,
+            matches: Vec::new(),
+            after: None,
+            wanted: 1,
+        };
+        output.line(line, b"abc", None, true).unwrap();
+        assert_eq!(
+            output.matches,
+            [Match {
+                start: 3,
+                end: 3,
+                line: 0..3,
+                line_number: 1,
+                end_line_number: 1,
+            }]
+        );
+    }
+
+    #[test]
     fn worker_cannot_supply_bytes_outside_the_selected_line() {
         let mut output = Output {
             remaining: 100,
@@ -367,6 +493,7 @@ mod tests {
         };
         let false_line = Line {
             absolute_offset: 1,
+            line_number: 1,
             lines: Text::Plain {
                 text: "has match\n".into(),
             },
@@ -379,7 +506,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            output.line(false_line, b"xhas match\n", 0),
+            output.line(false_line, b"xhas match\n", None, false),
             Err(WorkerError::Unavailable)
         );
         assert!(output.matches.is_empty());

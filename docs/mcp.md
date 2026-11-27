@@ -22,15 +22,36 @@ Mcp-Name: get
 | `search` | `query`, `limit`, `cursor`, `include_snippets` | Uses the [RFC search DSL](search.md). Optional snippets carry original match offsets and complete notice bundles. Coverage describes incomplete or budgeted evaluation. |
 | `get` | `id`, `section_id`, `filter_section_text`, `range`, `max_bytes`, `cursor`, `format` | Retrieves whole TXT by default. Supply at most one selector. Heading text matches the parser's heading exactly, including case. Duplicate headings return candidate IDs. Section slices include descendants. |
 | `table` | `id`, `max_depth`, `limit`, `cursor` | Lists indexed sections in original order. Includes section IDs, depth, parent, parser coverage, and original bounds. Exact heading bytes and the parsed heading label appear when the source policy and complete notices permit excerpts. |
-| `rg` | `pattern`, `mode`, `case_sensitive`, `ids`, `context_lines`, `limit`, `cursor` | Finds occurrences in approved original TXT, in RFC and byte order. Each result includes its original range and references its notice bundle. |
+| `rg` | `pattern`, `mode`, `case_sensitive`, `multiline`, `ids`, `context_lines`, `limit`, `cursor` | Searches verified original TXT in RFC and byte order. Returns match coordinates, source attribution, and original bytes where quoting is permitted. |
 
 Arguments are JSON objects. The [exported schemas](../apps/schemas/tools.json) describe input fields and structured success and error output. A tool error uses `isError: true` with a stable code, message, and relevant recovery details. Protocol errors use the JSON-RPC contract for the pinned revision. Successful outputs report the generation and publication sequence as decimal strings. The MCP text block contains serialized JSON matching `structuredContent`.
 
 `list`, `search`, and `table` default to 20 entries and accept 1–100. Send the same normalized arguments when resuming those tools. For `get`, send the same `id` and the returned cursor. Repeated optional arguments must agree with the cursor. Cursors expire within 30 minutes and refer to the original generation. Start a fresh request after `cursor_expired` or `generation_unavailable`.
 
-`rg` defaults to a case-sensitive single-line regex, zero context lines, and 20 matches. Use `mode: "literal"` for a fixed string. Patterns accept up to 2,048 UTF-8 bytes, `context_lines` accepts 0–5, `limit` accepts 1–100, and `ids` accepts up to 100 positive RFC numbers. Continue with the same normalized arguments and the returned cursor. A resumed document is evaluated from byte zero. Each occurrence has a zero-based half-open `match_range`. Context may be shortened to fit the response. An excerpt uses base64 when its bytes cannot be represented as UTF-8.
+`rg` defaults to case-sensitive single-line regex, zero context lines, and
+20 matches. Use `mode: "literal"` for a fixed string and `multiline: true`
+to allow native ripgrep multiline matches. Patterns accept up to 2,048
+UTF-8 bytes, context accepts 0–5 lines, and the limit accepts 1–100
+matches. Omit `ids` to search across the corpus. An explicit list accepts
+up to 100 RFC numbers. Continue with the same normalized arguments and the
+returned cursor. A resumed document is evaluated from byte zero.
 
-`scan_complete` means the selected scope was fully covered through the current page. An empty partial page leaves the global match count unknown. `omitted` reports documents excluded by policy, unavailable source bytes, or per-original size limits. `source_bytes_charged` includes each original handed to the worker, including an interrupted scan. Follow a returned `next_cursor` after a budget stop. Narrow the scope or pattern if no progress is possible. A failed sandbox check yields `sandbox_unavailable`.
+Each occurrence includes the official `filename`, one-based `line_number`
+and `end_line_number`, and a zero-based half-open `match_range`. The end
+line is the last line occupied by the match. A zero-width match uses its
+start line. On a text-bearing result, `start_byte` and `end_byte` bound
+the bytes actually included. Context can be shortened to fit the grant and
+response budget. Non-UTF-8 excerpts use base64. A metadata-only hit carries
+`content_omitted_reason` and the official source URL. A single notice group
+per RFC per page holds source attribution and the applicable conditions for
+the excerpts included. The richer match schema is returned by default,
+including for existing calls. Strict clients should load the current schema.
+
+`scan_complete` means the selected scope was searched through the current
+page. Metadata-only hits count toward coverage. `omitted` reports originals
+that could not be scanned. `source_bytes_charged` includes inputs to the
+worker, including interrupted scans. Follow `next_cursor` after a budget stop.
+A failed worker confinement check yields `sandbox_unavailable`.
 
 ## Original bytes and notices
 
@@ -45,7 +66,11 @@ method. Each record retains its original `source_url`.
 
 Each `get` page contains up to 64 KiB of original bytes. The complete serialized JSON-RPC response has a 256 KiB limit, including both representations and all notices. A page can contain fewer bytes to fit. Continue until `next_cursor` is null. Compare the reassembled bytes with the returned full BLAKE3 digest.
 
-RFC 2119 and RFC 8174 have single-response, whole-file approvals. Approved excerpts include complete original notices outside the body. A separately reviewed `whole_paginated` decision allows only sequential whole-file retrieval and includes the approved notices on every page. Add such decisions to the sync registry with the RFC ID, exact TXT BLAKE3 digest, review reference, and an ordered, non-overlapping list of complete notice spans. Bump the registry version and reconcile and publish a new generation to apply the receipt. A URL is available when a request cannot return the original.
+Whole TXT can be returned in one response or through a sequential cursor
+when the terms permit it. The continuation keeps the same original and
+selection. Range and section reads require a grant for the requested bytes.
+Where the selected operation cannot return the original, use the official
+URL. [Source policy](source-policy.md)
 
 ## Serving in Docker Compose
 
@@ -97,11 +122,10 @@ The [Phase 8 restore probe](../scripts/phase8/integration.py) exercised distinct
 
 Other clients need to support the pinned request metadata and headers, including direct calls without initialization. Legacy initialization, stdio, and standalone HTTP+SSE are unsupported. Hosted clients require their own integration test. [Observed Phase 8 results](implementation-status.md#phase-8)
 
-## Receipt-backed notices
+## Source attribution and notices
 
-A partial original points to a complete notice group in the same response.
-A receipt-backed group can include `license` with its family, version,
-section and URL, and `policy` with its effective decision, method and rule.
-Use the supplied attribution and notices when redistributing an excerpt.
-Notices count toward the 256 KiB wire limit. A rights change expires earlier
-cursors. [Source policy](source-policy.md)
+When a response includes an excerpt, its notice group supplies the
+attribution and applicable original legal ranges. The `policy` object
+retains its existing summary fields for clients. Use private policy
+diagnostics for the precise grant and operation. A rights change expires
+earlier cursors. [Source policy](source-policy.md)

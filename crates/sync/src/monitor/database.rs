@@ -143,14 +143,14 @@ async fn snapshot() -> Result<Snapshot> {
     let policy_documents = tx.query(
         "SELECT effective, count(*) FROM (
             SELECT CASE
-                WHEN cap.ceiling = 'metadata_only' OR d.notice_policy = 'unresolved'
-                    OR (d.notice_policy = 'excerpt_allowed' AND d.policy_receipt IS NULL) THEN 'metadata_only'
-                WHEN cap.ceiling = 'whole_only' AND d.notice_policy IN ('whole_paginated','excerpt_allowed') THEN 'whole_only'
-                WHEN cap.ceiling = 'whole_paginated' AND d.notice_policy = 'excerpt_allowed' THEN 'whole_paginated'
-                ELSE d.notice_policy END AS effective
-            FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity = m.document_version
-            LEFT JOIN LATERAL (SELECT ceiling FROM rfc.policy_restrictions r WHERE r.rfc_id = m.rfc_id
-                ORDER BY epoch DESC LIMIT 1) cap ON true
+                WHEN (coalesce(cap.denied,0) & 4) = 0 AND CASE WHEN jsonb_typeof(sr.evidence->'quotes') = 'array' THEN jsonb_array_length(sr.evidence->'quotes') > 0 ELSE false END THEN 'excerpt_allowed'
+                WHEN (coalesce(cap.denied,0) & 1) = 0 AND jsonb_typeof(sr.evidence->'whole') = 'object'
+                    THEN CASE WHEN (coalesce(cap.denied,0) & 2) = 0 AND sr.evidence->>'pages' = 'true'
+                        THEN 'whole_paginated' ELSE 'whole_only' END
+                ELSE 'metadata_only' END AS effective
+            FROM rfc.generation_documents m
+            LEFT JOIN rfc.source_rights sr ON (sr.generation_id,sr.rfc_id) = (m.generation_id,m.rfc_id)
+            LEFT JOIN rfc.source_restrictions cap ON cap.rfc_id=m.rfc_id
             WHERE m.generation_id = $1
         ) counted GROUP BY effective", &[&active],
     ).await?.into_iter().map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))

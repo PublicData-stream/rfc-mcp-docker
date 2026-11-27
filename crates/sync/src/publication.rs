@@ -82,15 +82,17 @@ pub(crate) async fn promote_locked(
         if !row.try_get::<_, bool>(1)? {
             return Err("candidate audit cycle expired; reconcile again".into());
         }
-        let policy: bool = tx
+        let format: i32 = tx
             .query_one(
-                "SELECT EXISTS (SELECT FROM rfc.generation_policy WHERE generation_id = $1)",
+                "SELECT manifest_format FROM rfc.generations WHERE id = $1",
                 &[&id],
             )
             .await?
             .try_get(0)?;
-        if !policy {
-            return Err("candidate lacks source policy evidence; reconcile again".into());
+        if format != rfc_storage::manifest::SOURCE_FORMAT_VERSION {
+            return Err(
+                "candidate lacks current HTTPS-first source evidence; reconcile again".into(),
+            );
         }
     }
     verify_stored_manifest(&tx, generation).await?;

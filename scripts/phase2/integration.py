@@ -50,10 +50,14 @@ class Project(phase1.Project):
 
 
 def catalog_entry(rfc, title, tags="", file_format="TXT", day=""):
-    return (f"<rfc-entry><doc-id>RFC{rfc}</doc-id><title>{title}</title>"
-            f"<date><month>May</month>{day}<year>2026</year></date>"
+    month, year, stream, authors = {
+        2119: ("March", 1997, "IETF", "<author><name>S. Bradner</name></author>"),
+        8174: ("May", 2017, "IETF", "<author><name>B. Leiba</name></author>"),
+    }.get(rfc, ("May", 2026, "IRTF", ""))
+    return (f"<rfc-entry><doc-id>RFC{rfc}</doc-id><title>{title}</title>{authors}"
+            f"<date><month>{month}</month>{day}<year>{year}</year></date>"
             f"<format><file-format>{file_format}</file-format></format>"
-            f"{tags}<current-status>INFORMATIONAL</current-status><stream>IRTF</stream></rfc-entry>")
+            f"{tags}<current-status>INFORMATIONAL</current-status><stream>{stream}</stream></rfc-entry>")
 
 
 

@@ -5,9 +5,7 @@ use crate::text::TextIndex;
 use crate::{
     Chunk, Document, IndexedText, Section,
     discovery::{INDEX, PARSER},
-    persist_document,
-    policy::{Registry, notice_rows},
-    text, xml,
+    persist_document, text,
 };
 use rfc_core::{BlobDigest, ByteRange, Coverage, RfcNumber};
 use rfc_storage::blob::DurableBlob;
@@ -195,19 +193,10 @@ pub(crate) async fn store_text(
     db: &impl GenericClient,
     rfc: RfcNumber,
     blob: DurableBlob,
-    registry: &Registry,
-    entry: &xml::Entry,
     bytes: &[u8],
     text: OwnedText,
 ) -> Result<BlobDigest> {
     let indexed = text.data.into_view(bytes, &text.headings)?;
-    let receipt = registry.classify(rfc, blob.digest(), entry, bytes, false)?;
-    let notices = notice_rows(&receipt);
-    let notice_state = if notices.is_empty() {
-        Coverage::Unavailable
-    } else {
-        Coverage::Complete
-    };
     let (encoding, index_state) = if indexed.text.is_some() {
         ("utf8", Coverage::Complete)
     } else {
@@ -222,18 +211,17 @@ pub(crate) async fn store_text(
             index_version: INDEX,
             encoding,
             index_state,
-            notice_state,
-            notice_policy: receipt.decision.name(),
+            notice_state: indexed.notice_state,
+            notice_policy: "metadata_only",
             sections: indexed.sections,
             chunks: indexed.chunks,
-            notices,
+            notices: indexed.notices,
         },
         Some(IndexedText {
             section_state: indexed.section_state,
             line_starts: &indexed.line_starts,
             text: indexed.text,
         }),
-        Some(&receipt),
     )
     .await
 }

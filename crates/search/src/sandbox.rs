@@ -91,13 +91,18 @@ pub fn sandbox_probe(extended: bool, burn_cpu: bool) -> io::Result<()> {
             std::hint::spin_loop();
         }
     }
-    exec_rg("phase-zero", true, true)
+    exec_rg("phase-zero", true, true, false)
 }
 
 /// Called before the serve runtime starts, in a dedicated child process.
-pub fn sandbox_worker(pattern: &str, literal: bool, case_sensitive: bool) -> io::Result<()> {
+pub fn sandbox_worker(
+    pattern: &str,
+    literal: bool,
+    case_sensitive: bool,
+    multiline: bool,
+) -> io::Result<()> {
     confine()?;
-    exec_rg(pattern, literal, case_sensitive)
+    exec_rg(pattern, literal, case_sensitive, multiline)
 }
 
 fn confine() -> io::Result<libc::c_long> {
@@ -114,7 +119,7 @@ fn confine() -> io::Result<libc::c_long> {
     Ok(abi)
 }
 
-fn exec_rg(pattern: &str, literal: bool, case_sensitive: bool) -> io::Result<()> {
+fn exec_rg(pattern: &str, literal: bool, case_sensitive: bool, multiline: bool) -> io::Result<()> {
     let mut command = Command::new(RG);
     command.env_clear().args([
         "--json",
@@ -130,6 +135,9 @@ fn exec_rg(pattern: &str, literal: bool, case_sensitive: bool) -> io::Result<()>
         "--engine",
         "default",
     ]);
+    if multiline {
+        command.arg("--multiline");
+    }
     if literal {
         command.arg("--fixed-strings");
     }

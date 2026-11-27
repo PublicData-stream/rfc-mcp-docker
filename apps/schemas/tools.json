@@ -1,13 +1,14 @@
 [
   {
     "name": "rg",
-    "description": "Find regex or literal matches in original RFC TXT, with original byte offsets and notice bundles.",
+    "description": "Find regex or literal matches across verified RFC TXT, with original byte offsets and source attribution.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
       "properties": {
-        "pattern": {"type": "string", "minLength": 1, "maxLength": 2048, "not": {"pattern": "[\\u0000\\n]"}, "description": "Single-line pattern, at most 2,048 UTF-8 bytes."},
+        "pattern": {"type": "string", "minLength": 1, "maxLength": 2048, "not": {"pattern": "[\\u0000]"}, "description": "Pattern of at most 2,048 UTF-8 bytes. A newline requires multiline mode."},
         "mode": {"type": "string", "enum": ["regex", "literal"], "default": "regex"},
+        "multiline": {"type": "boolean", "default": false},
         "case_sensitive": {"type": "boolean", "default": true},
         "ids": {
           "type": "array",
@@ -20,6 +21,8 @@
         "cursor": {"type": "string", "minLength": 1, "maxLength": 512}
       },
       "required": ["pattern"],
+      "if": {"required": ["multiline"], "properties": {"multiline": {"const": true}}},
+      "else": {"properties": {"pattern": {"not": {"pattern": "\\n"}}}},
       "additionalProperties": false
     },
     "outputSchema": {
@@ -63,6 +66,10 @@
           "type": "object",
           "properties": {
             "id": {"$ref": "#/$defs/rfc"},
+            "filename": {"type": "string", "pattern": "^rfc[1-9][0-9]*\\.txt$"},
+            "line_number": {"type": "integer", "minimum": 1},
+            "end_line_number": {"type": "integer", "minimum": 1},
+            "content_omitted_reason": {"enum": ["source_policy_restricted", "resource_limit_exceeded"]},
             "source_url": {"type": "string"},
             "source_verification": {"$ref": "#/$defs/source_verification"},
             "digest": {"$ref": "#/$defs/digest"},
@@ -74,10 +81,11 @@
             "notice_group_id": {"type": "string"},
             "match_range": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/offset"}}
           },
-          "required": ["id", "source_url", "digest", "start_byte", "end_byte", "encoding", "notice_group_id", "match_range"],
+          "required": ["id", "filename", "line_number", "end_line_number", "source_url", "digest", "start_byte", "end_byte", "notice_group_id", "match_range"],
           "oneOf": [
-            {"properties": {"encoding": {"const": "utf8"}, "content_base64": false}, "required": ["content"]},
-            {"properties": {"encoding": {"const": "base64"}, "content": false}, "required": ["content_base64"]}
+            {"properties": {"encoding": {"const": "utf8"}, "content_base64": false, "content_omitted_reason": false}, "required": ["content", "encoding"]},
+            {"properties": {"encoding": {"const": "base64"}, "content": false, "content_omitted_reason": false}, "required": ["content_base64", "encoding"]},
+            {"properties": {"encoding": false, "content": false, "content_base64": false}, "required": ["content_omitted_reason"]}
           ],
           "additionalProperties": false
         },
@@ -101,7 +109,7 @@
             "source_url": {"type": "string"},
             "source_verification": {"$ref": "#/$defs/source_verification"},
             "source_name": {"const": "RFC Editor"},
-            "stream": {"type": "string"},
+            "stream": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "attribution": {"type": "string"},
             "license": {"type": "object", "additionalProperties": false,
               "properties": {"family": {"type": "string"}, "version": {"type": "string"},

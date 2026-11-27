@@ -8,7 +8,6 @@ use crate::{
     egress::ROOT,
     insert_observation,
     parse::{Budget, BudgetExceeded, DOCUMENT_BYTES, OwnedText},
-    policy::Registry,
     register_blob,
     shutdown::Shutdown,
     upstream::{Capture, Download, FetchAttempts, MissingXml, Source, Upstream},
@@ -371,10 +370,8 @@ impl Spool {
     }
 }
 
-pub(crate) struct Selection<'a> {
+pub(crate) struct Selection {
     pub checkpoint: Context,
-    pub catalog: &'a xml::Catalog,
-    pub registry: &'a Registry,
     pub header: serde_json::Value,
     pub expected: Vec<RfcNumber>,
     pub txt: BTreeMap<RfcNumber, Original>,
@@ -385,7 +382,7 @@ pub(crate) struct Selection<'a> {
 impl Spool {
     pub(crate) async fn acquire(
         &self,
-        selection: Selection<'_>,
+        selection: Selection,
         writer: &mut Writer,
         config: &SyncConfig,
         upstream: &Upstream,
@@ -665,7 +662,7 @@ impl Spool {
 async fn apply_repair(
     worker: &Worker,
     writer: &mut Writer,
-    selection: &Selection<'_>,
+    selection: &Selection,
     repair: audit::Resolved,
     join: &mut Join,
     summaries: &mut BTreeMap<(u32, &'static str), BlobDigest>,
@@ -1094,7 +1091,7 @@ impl Receipt {
         Ok(BlobDigest::hash(&semantics))
     }
 
-    async fn persist(&mut self, tx: &impl GenericClient, selection: &Selection<'_>) -> Result<()> {
+    async fn persist(&mut self, tx: &impl GenericClient, selection: &Selection) -> Result<()> {
         let Some(prepared) = self.prepared.take() else {
             if self.kind == "rfcxml"
                 && self.original.is_none()
@@ -1150,18 +1147,9 @@ impl Receipt {
             }
         };
         let version = match prepared.text {
-            Some((bytes, text)) if matches!(kind, Kind::Txt) => Some(
-                crate::parse::store_text(
-                    tx,
-                    id,
-                    prepared.blob,
-                    selection.registry,
-                    &selection.catalog.entries[&id],
-                    &bytes,
-                    text,
-                )
-                .await?,
-            ),
+            Some((bytes, text)) if matches!(kind, Kind::Txt) => {
+                Some(crate::parse::store_text(tx, id, prepared.blob, &bytes, text).await?)
+            }
             None if matches!(kind, Kind::Xml) => None,
             _ => return Err("parsed result has the wrong artifact kind".into()),
         };

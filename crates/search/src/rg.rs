@@ -34,12 +34,12 @@ const DEADLINE: Duration = Duration::from_secs(5);
 const SOURCES: &str = "SELECT m.rfc_id::integer,m.title,m.stream,d.txt_digest::bytea,
     d.byte_length::bigint,d.encoding,d.notice_policy,d.notice_state::text,
     o.source_url,d.identity::bytea,
-    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm, d.policy_receipt::bytea AS policy_identity,
-    receipt.receipt::text AS policy_evidence,
-    (SELECT cap.ceiling FROM rfc.policy_restrictions cap WHERE cap.rfc_id = m.rfc_id
-      ORDER BY cap.epoch DESC LIMIT 1) AS policy_ceiling
+    coalesce(p.method, o.verification_method) AS verification_method, p.algorithm AS verification_algorithm, sr.identity::bytea AS policy_identity,
+    sr.evidence::text AS policy_evidence, m.metadata_identity::bytea AS policy_metadata,
+    coalesce(cap.denied, 0) AS policy_denied
     FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity=m.document_version
-    LEFT JOIN rfc.policy_receipts receipt ON receipt.identity = d.policy_receipt
+    LEFT JOIN rfc.source_rights sr ON (sr.generation_id,sr.rfc_id) = (m.generation_id,m.rfc_id)
+    LEFT JOIN rfc.source_restrictions cap ON cap.rfc_id=m.rfc_id
     JOIN rfc.source_observations o ON o.identity=m.txt_observation
     LEFT JOIN LATERAL (
         SELECT method, algorithm FROM rfc.generation_source_evidence p
@@ -64,6 +64,8 @@ pub struct RgRequest {
     #[serde(default)]
     mode: Mode,
     case_sensitive: Option<bool>,
+    #[serde(default)]
+    multiline: bool,
     ids: Option<Vec<i32>>,
     context_lines: Option<u8>,
     limit: Option<usize>,
@@ -73,7 +75,8 @@ pub struct RgRequest {
 impl RgRequest {
     fn normalize(&mut self) -> Result<String, SearchError> {
         if !(1..=2048).contains(&self.pattern.len())
-            || self.pattern.contains(['\0', '\n'])
+            || self.pattern.contains('\0')
+            || (!self.multiline && self.pattern.contains('\n'))
             || self.ids.as_ref().is_some_and(|ids| {
                 ids.is_empty() || ids.len() > 100 || ids.iter().any(|id| *id <= 0)
             })
@@ -94,6 +97,7 @@ impl RgRequest {
             &self.pattern,
             self.mode,
             self.case_sensitive.unwrap_or(true),
+            self.multiline,
             &self.ids,
             self.context_lines.unwrap_or_default(),
             self.limit.unwrap_or(20),
@@ -107,6 +111,7 @@ impl RgRequest {
             text: &self.pattern,
             literal: matches!(self.mode, Mode::Literal),
             sensitive: self.case_sensitive.unwrap_or(true),
+            multiline: self.multiline,
         }
     }
 }
@@ -150,6 +155,7 @@ impl Rg {
             text: "rfc-worker-check",
             literal: true,
             sensitive: true,
+            multiline: false,
         };
         let available = worker::scan(
             pattern,
@@ -206,7 +212,10 @@ impl Rg {
             .map(|token| search.key.open::<Cursor>(token))
             .transpose()?;
         let selection = if let Some(saved) = &checkpoint {
-            if saved.v != 1 || saved.tool != "rg" || saved.args != args || saved.pos.rfc < 1 {
+            if saved.v == 1 {
+                return Err(SearchError::CursorExpired);
+            }
+            if saved.v != 2 || saved.tool != "rg" || saved.args != args || saved.pos.rfc < 1 {
                 return Err(SearchError::CursorInvalid);
             }
             validate_context(saved.generation, saved.sequence, saved.expiry, now)?;
@@ -350,7 +359,7 @@ impl Scan<'_, '_> {
                 rfc: id,
                 after: None,
             };
-            let mut omission = if !source.permits_excerpt() {
+            let mut omission = if !source.permits_search() {
                 Some("source_policy_restricted")
             } else if source.length > MAX_SOURCE_BYTES {
                 Some("resource_limit_exceeded")
@@ -373,82 +382,122 @@ impl Scan<'_, '_> {
                     result => result??,
                 };
                 if let Some(bytes) = bytes {
-                    let read_notices =
-                        snippets::notices(self.guard.transaction(), &source, &bytes, false);
-                    let notices = match bound(self.cancelled, self.deadline, read_notices).await {
-                        Err(SearchError::Deadline) => {
-                            reason = Some("deadline");
-                            break;
-                        }
-                        result => result??,
-                    };
-                    if let Some(notices) = notices {
-                        let group = json!(source.notice_group(notices, false));
-                        let after = (position.rfc == id).then_some(position.after).flatten();
-                        let (hits, status) = self.scan(&bytes, after, limit - seen).await;
-                        if let Err(
-                            error @ (WorkerError::Sandbox
-                            | WorkerError::InvalidRegex
-                            | WorkerError::Unavailable
-                            | WorkerError::Cancelled),
-                        ) = status
+                    let after = (position.rfc == id).then_some(position.after).flatten();
+                    let (hits, status) = self.scan(&bytes, after, limit - seen).await;
+                    if let Err(
+                        error @ (WorkerError::Sandbox
+                        | WorkerError::InvalidRegex
+                        | WorkerError::Unavailable
+                        | WorkerError::Cancelled),
+                    ) = status
+                    {
+                        return Err(worker_error(error));
+                    }
+                    scanned_bytes += source.length;
+                    if status.is_ok() {
+                        documents += 1;
+                    }
+                    let group_slot = page["notice_groups"].as_array().unwrap().len();
+                    let mut grants: Vec<&rfc_storage::policy::Grant> = Vec::new();
+                    for hit in hits {
+                        let matched = hit.start..hit.end;
+                        let covered = source.cover(&matched);
+                        let mut fitted = false;
+                        let prior_grants = grants.len();
+                        if let Some(covered) = covered
+                            .as_ref()
+                            .filter(|_| matched.len() <= MAX_EXCERPT_BYTES)
                         {
-                            return Err(worker_error(error));
+                            for grant in covered {
+                                if !grants.iter().any(|prior| std::ptr::eq(*prior, *grant)) {
+                                    grants.push(*grant);
+                                }
+                            }
                         }
-                        scanned_bytes += source.length;
-                        if status.is_ok() {
-                            documents += 1;
+                        let notices = covered
+                            .as_ref()
+                            .filter(|_| matched.len() <= MAX_EXCERPT_BYTES)
+                            .and_then(|_| source.notices(&bytes, &grants));
+                        if let Some(notices) = notices {
+                            let group = json!(source.notice_group(notices, &grants, None));
+                            let prior = insert_group(&mut page, group_slot, group);
+                            for context in [self.request.context_lines.unwrap_or_default(), 0] {
+                                let range = excerpt(&bytes, &hit, context);
+                                let range = source.quote(&matched).map_or_else(
+                                    || matched.clone(),
+                                    |grant| range.start.max(grant.start)..range.end.min(grant.end),
+                                );
+                                if push_match(
+                                    &mut page,
+                                    hit_value(&source, &bytes, &hit, Some(range), None),
+                                    self.fits,
+                                ) {
+                                    fitted = true;
+                                    break;
+                                }
+                            }
+                            if !fitted {
+                                fitted = push_match(
+                                    &mut page,
+                                    hit_value(&source, &bytes, &hit, Some(matched.clone()), None),
+                                    self.fits,
+                                );
+                            }
+                            if !fitted {
+                                restore_group(&mut page, group_slot, prior);
+                                grants.truncate(prior_grants);
+                                if seen > 0 {
+                                    reason = Some("response_budget");
+                                    break 'documents;
+                                }
+                            }
                         }
-                        let mut group_added = false;
-                        for hit in hits {
-                            if hit.end - hit.start > MAX_EXCERPT_BYTES {
-                                reason = Some("response_budget");
-                                break 'documents;
+                        if !fitted {
+                            grants.truncate(prior_grants);
+                            let omission = if covered.is_some() {
+                                "resource_limit_exceeded"
+                            } else {
+                                "source_policy_restricted"
+                            };
+                            let existing =
+                                page["notice_groups"].as_array().unwrap().len() > group_slot;
+                            if !existing {
+                                insert_group(
+                                    &mut page,
+                                    group_slot,
+                                    json!(source.notice_group(Vec::new(), &[], None)),
+                                );
                             }
-                            let context = self.request.context_lines.unwrap_or_default();
-                            let range = excerpt(&bytes, &hit, context);
-                            let line = excerpt(&bytes, &hit, 0);
-                            if !group_added {
-                                page["notice_groups"]
-                                    .as_array_mut()
-                                    .unwrap()
-                                    .push(group.clone());
-                            }
-                            let matches = page["matches"].as_array_mut().unwrap();
-                            matches.push(hit_value(&source, &bytes, &hit, range));
-                            if !(self.fits)(&page, RESPONSE_TAIL) {
-                                *page["matches"].as_array_mut().unwrap().last_mut().unwrap() =
-                                    hit_value(&source, &bytes, &hit, line);
-                            }
-                            if !(self.fits)(&page, RESPONSE_TAIL) {
-                                *page["matches"].as_array_mut().unwrap().last_mut().unwrap() =
-                                    hit_value(&source, &bytes, &hit, hit.start..hit.end);
-                            }
-                            if !(self.fits)(&page, RESPONSE_TAIL) {
-                                page["matches"].as_array_mut().unwrap().pop();
-                                if !group_added {
-                                    page["notice_groups"].as_array_mut().unwrap().pop();
+                            if !push_match(
+                                &mut page,
+                                hit_value(&source, &bytes, &hit, None, Some(omission)),
+                                self.fits,
+                            ) {
+                                if !existing {
+                                    restore_group(&mut page, group_slot, None);
                                 }
                                 reason = Some("response_budget");
                                 break 'documents;
                             }
-                            group_added = true;
-                            seen += 1;
-                            position = Position {
-                                rfc: id,
-                                after: Some((hit.start, hit.end)),
-                            };
                         }
-                        if let Err(error) = status {
-                            reason = Some(match error {
-                                WorkerError::Deadline => "deadline",
-                                WorkerError::Page => "match_limit",
-                                _ => "worker_budget",
-                            });
+                        seen += 1;
+                        position = Position {
+                            rfc: id,
+                            after: Some((hit.start, hit.end)),
+                        };
+                    }
+                    if let Err(error) = status {
+                        reason = Some(match error {
+                            WorkerError::Deadline => "deadline",
+                            WorkerError::Page => "match_limit",
+                            _ => "worker_budget",
+                        });
+                        if error == WorkerError::Budget && position == initial {
+                            // An individually unaffordable frame must not strand a corpus cursor.
+                            omission = Some("resource_limit_exceeded");
+                        } else {
                             break;
                         }
-                    } else {
-                        omission = Some("source_policy_restricted");
                     }
                 } else {
                     omission = Some("source_unavailable");
@@ -466,6 +515,9 @@ impl Scan<'_, '_> {
                 coverage_gap = true;
             }
             position = completed;
+            if reason.is_some() {
+                break;
+            }
         }
         page["documents_scanned"] = json!(documents);
         page["source_bytes_charged"] = json!(scanned_bytes);
@@ -480,7 +532,7 @@ impl Scan<'_, '_> {
             }
             page["truncation_reason"] = json!(reason);
             page["next_cursor"] = json!(self.search.key.seal(&Cursor {
-                v: 1,
+                v: 2,
                 tool: "rg".into(),
                 args,
                 generation,
@@ -540,15 +592,60 @@ fn excerpt(bytes: &[u8], hit: &Match, context: u8) -> Range<usize> {
     start..end
 }
 
-fn hit_value(source: &Source, bytes: &[u8], hit: &Match, range: Range<usize>) -> Value {
-    let force_base64 = std::str::from_utf8(&bytes[range.clone()]).is_err();
-    let original = snippets::original(range.clone(), &bytes[range], force_base64);
-    let mut value = json!(original);
+fn insert_group(page: &mut Value, index: usize, value: Value) -> Option<Value> {
+    let groups = page["notice_groups"].as_array_mut().expect("notice groups");
+    if let Some(group) = groups.get_mut(index) {
+        Some(std::mem::replace(group, value))
+    } else {
+        groups.push(value);
+        None
+    }
+}
+
+fn restore_group(page: &mut Value, index: usize, prior: Option<Value>) {
+    let groups = page["notice_groups"].as_array_mut().expect("notice groups");
+    if let Some(prior) = prior {
+        groups[index] = prior;
+    } else {
+        groups.pop();
+    }
+}
+
+fn push_match(page: &mut Value, hit: Value, fits: &dyn Fn(&Value, usize) -> bool) -> bool {
+    page["matches"].as_array_mut().expect("matches").push(hit);
+    if fits(page, RESPONSE_TAIL) {
+        return true;
+    }
+    page["matches"].as_array_mut().expect("matches").pop();
+    false
+}
+
+fn hit_value(
+    source: &Source,
+    bytes: &[u8],
+    hit: &Match,
+    range: Option<Range<usize>>,
+    reason: Option<&str>,
+) -> Value {
+    let mut value = if let Some(range) = range {
+        let force_base64 = std::str::from_utf8(&bytes[range.clone()]).is_err();
+        let mut value = json!(snippets::original(
+            range.clone(),
+            &bytes[range],
+            force_base64
+        ));
+        value["encoding"] = json!(if force_base64 { "base64" } else { "utf8" });
+        value
+    } else {
+        json!({"start_byte": hit.start, "end_byte": hit.end, "content_omitted_reason": reason})
+    };
     value["id"] = json!(source.rfc.get());
+    value["filename"] = json!(format!("rfc{}.txt", source.rfc.get()));
+    value["line_number"] = json!(hit.line_number);
+    value["end_line_number"] = json!(hit.end_line_number);
     value["source_url"] = json!(source.url);
     SourceVerification::add(&mut value, source.verification.as_ref());
     value["digest"] = json!(source.digest.to_string());
-    value["encoding"] = json!(if force_base64 { "base64" } else { "utf8" });
     value["notice_group_id"] = json!(format!("rfc-{}-notices", source.rfc.get()));
     value["match_range"] = json!([hit.start, hit.end]);
     value

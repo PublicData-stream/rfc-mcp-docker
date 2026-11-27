@@ -873,7 +873,7 @@ def publication_contract(project, client, sources, first):
     initial = publication_snapshot(project)
     assert initial == "-1|0|0|0", initial
     generation = int(first["generation_id"])
-    assert project.sql(f"SELECT state,manifest_format FROM rfc.generations WHERE id={generation}") == "ready|4"
+    assert project.sql(f"SELECT state,manifest_format FROM rfc.generations WHERE id={generation}") == "ready|5"
     assert project.sql(f"""
         SELECT count(*), count(DISTINCT receipt), count(DISTINCT algorithm),
                bool_and(e.method='rsync_checksum_match' AND e.checksum_choice='auto'
@@ -968,8 +968,8 @@ def verify_active_get(client, sources, generation, sequence):
 
 def verify_binary_mcp(project, client, sources, sequence):
     # Authorize whole reads of these synthetic bytes in the fixture driver.
-    # The production registry still applies to the normal publication cases.
-    registry = json.loads((phase2.REPO / "crates/sync/src/policy.json").read_text())
+    # These artificial originals need fixture-specific whole-copy grants.
+    registry = {"overrides": []}
     registry["version"] = "https-first-binary-fixtures"
     for rfc in (101, phase2.NUL_RFC):
         registry["overrides"].append({"rfc": rfc, "digest": project.digest(sources[rfc]),
@@ -1334,8 +1334,9 @@ def upgrade_publication(project, old_driver, sources, old_schema, compose_qualif
         compose_qualification(project, old_schema, sources)
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "12"
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "13"
     assert history(project) == before
+    phase1.capture(project.app("sync", "-T", args=("policy", "refresh")), env=project.env, timeout=90)
     client = project.start_mcp()
     phase6.wait(lambda: project.admin("/ready").returncode == 0)
     load_mcp_schemas(client)
@@ -1359,12 +1360,12 @@ def upgrade_publication(project, old_driver, sources, old_schema, compose_qualif
     print(f"Populated schema {old_schema} upgraded twice and retained byte-exact rollback with original proof", flush=True)
 
 
-def upgrade_policy(project, old_driver, sources, compose_qualification):
+def upgrade_policy(project, old_driver, sources, old_schema, compose_qualification):
     current = project.env["PHASE2_DRIVER"]
     project.env["PHASE2_DRIVER"] = str(old_driver)
     old = project.operation("sync", "full")
     first, ready = None, None
-    sequence = 2 if compose_qualification else 1
+    sequence = 2 if compose_qualification or old_schema == 12 else 1
     for attempt in range(sequence + 1):
         report = json.loads(phase1.capture(old, env=project.env, timeout=100))
         generation = int(report["generation_id"])
@@ -1374,15 +1375,59 @@ def upgrade_policy(project, old_driver, sources, compose_qualification):
             project.activate(generation, attempt)
         else:
             ready = generation
-    assert project.sql(f"SELECT manifest_format FROM rfc.generations WHERE id={first}") == "3"
+    historical_format = str(old_schema - 8)
+    assert project.sql(f"SELECT manifest_format FROM rfc.generations WHERE id={first}") == historical_format
+    if old_schema == 12:
+        assert project.sql("BEGIN; SET LOCAL ROLE rfc_sync; SELECT pg_try_advisory_xact_lock(-4::bigint); "
+                           "SELECT rfc.restrict_policy(100,'metadata_only','rights_revoked',"
+                           "'synthetic historical rights',0); COMMIT").splitlines()[-1] == "1"
     before = history(project)
     project.env["PHASE2_DRIVER"] = current
     if compose_qualification:
-        compose_qualification(project, 11, sources)
+        compose_qualification(project, old_schema, sources)
     project.migrate()
     project.migrate()
-    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "12"
+    assert project.sql("SELECT max(version) FROM rfc.schema_migrations") == "13"
     assert history(project) == before
+    refresh = project.app("sync", "-T", args=("policy", "refresh"))
+    if old_schema == 12:
+        assert project.sql("SELECT rights_epoch FROM rfc.policy_state") == "1"
+        assert project.sql("SELECT denied FROM rfc.source_restrictions WHERE rfc_id=100") == "7"
+        # A failed refresh writes no partial rows. Retry after the fence is released.
+        with subprocess.Popen(project.psql(), env=project.env, text=True,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as writer:
+            writer.stdin.write("BEGIN; SET LOCAL ROLE rfc_sync; "
+                               "SELECT pg_try_advisory_xact_lock(-4::bigint);\n")
+            writer.stdin.flush()
+            assert writer.stdout.readline().strip() == "t"
+            denied = subprocess.run(refresh, env=project.env, text=True, capture_output=True, timeout=45)
+            assert denied.returncode and "rights fence" in denied.stderr, denied.stderr
+            assert project.sql("SELECT count(*) FROM rfc.source_rights") == "0"
+            writer.communicate("ROLLBACK;\n", timeout=15)
+    if old_schema == 12:
+        project.sql("""
+            CREATE FUNCTION rfc.fail_fixture_rights_refresh() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.rfc_id = 8174 THEN
+                    RAISE EXCEPTION 'injected rights refresh failure';
+                END IF;
+                RETURN NEW;
+            END
+            $$;
+            REVOKE EXECUTE ON FUNCTION rfc.fail_fixture_rights_refresh() FROM PUBLIC;
+            CREATE TRIGGER fail_fixture_rights_refresh BEFORE INSERT
+                ON rfc.source_rights FOR EACH ROW EXECUTE FUNCTION rfc.fail_fixture_rights_refresh();
+        """)
+        try:
+            failed = subprocess.run(refresh, env=project.env, text=True, capture_output=True, timeout=45)
+            assert failed.returncode and "injected rights refresh failure" in failed.stderr, failed.stderr
+            assert project.sql("SELECT count(*) FROM rfc.source_rights") == "0"
+        finally:
+            project.sql("DROP TRIGGER fail_fixture_rights_refresh ON rfc.source_rights; "
+                        "DROP FUNCTION rfc.fail_fixture_rights_refresh()")
+    phase1.capture(refresh, env=project.env, timeout=90)
+    assert "for 0 generation members" in phase1.capture(refresh, env=project.env, timeout=90)
     client = project.start_mcp()
     phase6.wait(lambda: project.admin("/ready").returncode == 0)
     load_mcp_schemas(client)
@@ -1390,17 +1435,17 @@ def upgrade_policy(project, old_driver, sources, compose_qualification):
         result = client.call("get", id=id)[0]
         assert phase6.phase5.bytes_from(result["original"]) == sources[id]
     publication_command(project, {"generation_id": str(ready), "expected_publication_sequence": sequence},
-                        error="lacks source policy evidence")
+                        error="lacks current HTTPS-first source evidence")
     replacement = manual(project)
     new = int(replacement["generation_id"])
     assert replacement["acquisition"]["txt_reused"] == len(sources)
-    assert project.sql(f"SELECT manifest_format FROM rfc.generations WHERE id={new}") == "4"
+    assert project.sql(f"SELECT manifest_format FROM rfc.generations WHERE id={new}") == "5"
     publication_command(project, replacement)
     publication_command(project, {"generation_id": str(first), "expected_publication_sequence": sequence + 1},
                         rollback=True)
     original = client.call("get", id=2119)[0]["original"]
     assert phase6.phase5.bytes_from(original) == sources[2119]
-    print("Populated schema 11 upgraded twice, preserved the format-3 incumbent, and published format 4", flush=True)
+    print(f"Populated schema {old_schema} upgraded twice, preserved format-{historical_format} history, and published format 5", flush=True)
 
 
 def exercise(project, work, spool, audit, incumbent_only, old_driver=None, scheduler_only=False, audit_only=False,
@@ -1433,8 +1478,8 @@ def exercise(project, work, spool, audit, incumbent_only, old_driver=None, sched
     }}))
     project.ingestion_overlay = overlay
     if old_driver:
-        if old_schema == 11:
-            upgrade_policy(project, old_driver, sources, compose_qualification)
+        if old_schema in (11, 12):
+            upgrade_policy(project, old_driver, sources, old_schema, compose_qualification)
         else:
             upgrade_publication(project, old_driver, sources, old_schema, compose_qualification)
         return
@@ -1646,7 +1691,9 @@ def main():
     modes.add_argument("--upgrade-from-schema10", metavar="SCHEMA10_IMAGE_PREFIX",
                        help="qualify a populated schema 10 upgrade")
     modes.add_argument("--upgrade-from-schema11", metavar="SCHEMA11_IMAGE_PREFIX",
-                       help="qualify a populated schema 11 to 12 upgrade")
+                       help="qualify a populated schema 11 to 13 upgrade")
+    modes.add_argument("--upgrade-from-schema12", metavar="SCHEMA12_IMAGE_PREFIX",
+                       help="qualify a populated schema 12 to 13 upgrade")
     args = parser.parse_args()
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-https-discovery-", dir="/tmp") as directory:
@@ -1654,8 +1701,8 @@ def main():
         driver = work / "publication-driver"
         phase3.fixture_driver(docker, args.image_prefix, driver)
         old_driver = None
-        old_prefix = args.upgrade_from_schema11 or args.upgrade_from_schema10 or args.upgrade_from_schema9
-        old_schema = next((version for version in (9, 10, 11)
+        old_prefix = args.upgrade_from_schema12 or args.upgrade_from_schema11 or args.upgrade_from_schema10 or args.upgrade_from_schema9
+        old_schema = next((version for version in (9, 10, 11, 12)
                            if getattr(args, f"upgrade_from_schema{version}")), None)
         if args.compose_upgrade and old_schema is None:
             parser.error("--compose-upgrade requires a populated historical upgrade mode")

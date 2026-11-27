@@ -198,7 +198,7 @@ exec /usr/local/bin/rfc-mcp-docker-sync --check-config""",
         self.sql("-f", "/migrations/bootstrap.sql")
         if migrate:
             self.sql("-f", "/migrations/migrate.sql")
-            assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "12"
+            assert self.sql("-c", "SELECT max(version) FROM rfc.schema_migrations") == "13"
         assert self.sql("-c", "SELECT current_setting('server_encoding') || ':' || datlocale || ':' "
                         "|| datlocprovider::text FROM pg_database WHERE datname = current_database()") == "UTF8:und:i"
         if migrate:
@@ -378,7 +378,7 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
         assert killed.returncode == 137 and time.monotonic() - started < 8, killed.stderr
         raw = b"\xef\xbb\xbfmatch\r\n\xffmatch\x00\n"
         child = subprocess.run(self.command("exec", "-T", SERVE, binary, "--rg-worker", "literal",
-                                            "sensitive", "match"), env=self.env, input=raw,
+                                            "sensitive", "line", "match"), env=self.env, input=raw,
                                capture_output=True, timeout=10, check=True)
         lines = [event["data"] for line in child.stdout.splitlines()
                  if (event := json.loads(line))["type"] == "match"]
@@ -444,12 +444,12 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
                 assert request.stdout.readline().strip() == "sent"
             try:
                 wait_workers(2)
-                # The last query before starting a worker loads its notices.
+                # The last query before starting a worker selects the original.
                 # Readiness and other pool lanes also use short transactions.
                 pids = phase5.phase3.wait_for_readers(
                     lambda query: self.sql("-c", query),
                     "state='idle in transaction' AND "
-                    "query LIKE '%FROM rfc.notice_ranges WHERE document_version=%'",
+                    "query LIKE 'SELECT d.txt_digest::bytea FROM rfc.generation_documents m%'",
                 )
                 assert len(pids) == 2, pids
                 self.client.call("rg", **arguments, _error="resource_limit_exceeded")

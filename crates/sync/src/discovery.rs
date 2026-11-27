@@ -10,7 +10,7 @@ use crate::{
     egress::Lease,
     inventory,
     metrics::{Record, Stage},
-    policy::Registry,
+    policy::FixtureRules,
     publication, recovery,
     shutdown::Shutdown,
     upstream::{Capture, MAX_CATALOG_ENTRIES, Source, TXT_LIMIT, Upstream, XML_LIMIT},
@@ -150,15 +150,15 @@ pub async fn reconcile_audited_fixture(scope: Scope, reviews: Option<&str>) -> R
     let config = SyncConfig::load()?;
     let upstream = Upstream::discovery_fixture(config.ingestion.https)?
         .with_parsers(config.ingestion.pipeline.parser_workers);
-    let registry = reviews.map(Registry::fixture).transpose()?;
-    reconcile_standalone(scope, config, upstream, registry).await
+    let fixture_rules = reviews.map(FixtureRules::load).transpose()?.map(Arc::new);
+    reconcile_standalone(scope, config, upstream, fixture_rules).await
 }
 
 async fn reconcile_standalone(
     scope: Scope,
     config: SyncConfig,
     upstream: Upstream,
-    registry: Option<Registry>,
+    fixture_rules: Option<Arc<FixtureRules>>,
 ) -> Result<()> {
     let lease = Lease::acquire()?;
     let leader = Writer::connect().await?;
@@ -174,7 +174,7 @@ async fn reconcile_standalone(
         }
     };
     let run = Run::start(scope, None);
-    let work = execute_with_registry(&run, &config, &upstream, &shutdown, registry);
+    let work = execute_with_fixture(&run, &config, &upstream, &shutdown, fixture_rules);
     tokio::pin!(work);
     let outcome = tokio::select! {
         result = &mut work => result?,
@@ -242,15 +242,15 @@ pub(crate) async fn execute(
     upstream: &Upstream,
     shutdown: &Shutdown,
 ) -> Result<Execution> {
-    execute_with_registry(run, config, upstream, shutdown, None).await
+    execute_with_fixture(run, config, upstream, shutdown, None).await
 }
 
-async fn execute_with_registry(
+async fn execute_with_fixture(
     run: &Run,
     config: &SyncConfig,
     upstream: &Upstream,
     shutdown: &Shutdown,
-    registry: Option<Registry>,
+    fixture_rules: Option<Arc<FixtureRules>>,
 ) -> Result<Execution> {
     let started = Instant::now();
     let (scope, job) = (run.scope(), run.job());
@@ -292,7 +292,7 @@ async fn execute_with_registry(
                 &upstream,
                 shutdown,
                 deadline,
-                (scope, registry),
+                (scope, fixture_rules),
                 &mut report,
             )
             .await?
@@ -387,7 +387,7 @@ async fn discover(
     upstream: &Upstream,
     shutdown: &Shutdown,
     deadline: Instant,
-    (scope, registry): (Scope, Option<Registry>),
+    (scope, fixture_rules): (Scope, Option<Arc<FixtureRules>>),
     report: &mut Report,
 ) -> Result<Outcome> {
     let (active, sequence, priors, hints) = {
@@ -530,26 +530,11 @@ async fn discover(
     }
     report.local_https_txt_audit_pending = local_with_https;
     report.local_txt_needs_https = local_without_https;
-    let mut registry = match registry {
-        Some(registry) => registry,
-        None => Registry::load()?,
-    };
-    let classifier = rfc_storage::policy::CLASSIFIER;
-    registry.approved = writer
-        .client
-        .query_one(
-            "SELECT coalesce(registry_digest = $1::bytea AND classifier = $2, false)
-         FROM rfc.policy_state WHERE singleton",
-            &[&registry.digest.as_bytes().as_slice(), &classifier],
-        )
-        .await?
-        .try_get(0)?;
-    let registry_digest = registry.digest.to_string();
     let scope_name = scope.as_str();
     let checkpoint = Context {
         scope: scope_name,
         key: identity(
-            "rfc-https-processing-selection-v1",
+            "rfc-https-processing-selection-v2",
             &(
                 scope_name,
                 catalog_digest.to_string(),
@@ -557,9 +542,6 @@ async fn discover(
                 POLICY,
                 PARSER,
                 INDEX,
-                &registry_digest,
-                classifier,
-                registry.approved,
                 active,
                 sequence,
             ),
@@ -615,8 +597,6 @@ async fn discover(
         let work_stop = Shutdown::new();
         let selection = Selection {
             checkpoint,
-            catalog: &catalog,
-            registry: &registry,
             header: serde_json::json!({
                 "selection_id": selection_id,
                 "catalog_digest": catalog_digest.to_string(),
@@ -627,8 +607,6 @@ async fn discover(
                 "policy_version": POLICY,
                 "parser_version": PARSER,
                 "index_version": INDEX,
-                "registry_digest": registry_digest,
-                "classifier": classifier,
             }),
             expected: expected.into_iter().collect(),
             txt: reuse_txt,
@@ -684,7 +662,7 @@ async fn discover(
                 .ok_or("missing inventory digest")?,
             sequence,
             catalog: &catalog,
-            registry_digest: registry.digest,
+            fixture_rules,
             fixture: upstream.is_fixture(),
             before: &before,
             after: &after,

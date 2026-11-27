@@ -115,8 +115,8 @@ Use the [operating checks](#operate-and-recover) to match the active PostgreSQL 
 
 ### Upgrade existing volumes
 
-The upgrade uses matching schema 12 images. Follow this maintenance
-procedure for a populated schema 9, 10, or 11 deployment.
+The upgrade uses matching schema 13 images. Follow this maintenance
+procedure for a populated schema 9, 10, 11, or 12 deployment.
 
 1. Close public ingress. In the previous checkout, stop Feed, allow the
    running job to settle, stop Sync, and stop Serve. Save the previous
@@ -152,18 +152,20 @@ procedure for a populated schema 9, 10, or 11 deployment.
    Compose project name. The command checks the target images and Sync
    configuration, verifies the independently stored PostgreSQL archive and
    mirror against the quiescent deployment, and applies the migrations in
-   one transaction. Capture the dump with the same PostgreSQL tooling
-   during this maintenance window. A different archive or mirror copy
-   stops the upgrade before SQL runs. The command leaves applications
-   stopped, including when postflight fails. If the command reports schema
-   12 already present, it runs the storage checks without rewriting the
-   database. Resolve any reported postflight failure before starting Serve.
+   one transaction. It then runs `policy refresh` against the verified local
+   active and retained generations. This step can be retried with ingress
+   closed and the application services stopped. Capture the dump with the
+   same PostgreSQL tooling during this maintenance window. A different
+   archive or mirror copy stops the upgrade before SQL runs. The command
+   leaves applications stopped, including when postflight fails. If schema
+   13 is already present, it reruns the rights refresh and storage checks
+   and reuses valid rights records. Resolve any reported postflight failure
+   before starting Serve.
 
-4. Confirm schema 12 and the backed-up sequence. Check `/ready` and an
+4. Confirm schema 13 and the backed-up sequence. Check `/ready` and an
    exact-byte MCP `get` for the incumbent. Confirm the result's generation
-   and sequence against the saved pointer. Use a valid pre-upgrade cursor
-   to check a retained read where available, or verify the retained
-   manifests and originals through the private storage checks in the
+   and sequence against the saved pointer. Pre-upgrade cursors expire.
+   Verify the retained manifests and originals through the private storage checks in the
    [restore rehearsal](release-readiness.md#restore-and-client-results).
    Reopen ingress after verifying the serving path. Run
    `compose up -d rfc-mcp-docker-sync` and verify a full audited
@@ -189,14 +191,13 @@ schema 11 and release `2.6.0` expects schema 12.
      -c 'SELECT generation_id, publication_sequence FROM rfc.active_generation'
    ~~~
 
-2. For a complete schema 9–11 history and a schema 12 target, use the
-   [upgrade procedure](#upgrade-existing-volumes). With the original
-   `2.6.0` images, use their pinned checkout and the manual peer-socket
-   step below. Verify the independent backup and the qualified image set
-   first. If the database is already schema 12, select matching schema 12
-   images and proceed directly to the two storage checks. For absent,
-   gapped, or newer history, identify the matching deployment or backup
-   before proceeding.
+2. For a complete schema 9–12 history and a schema 13 target, use the
+   [upgrade procedure](#upgrade-existing-volumes). For a recovery that
+   stays on `2.6.0`, use its pinned checkout and matching image set. Verify
+   the independent backup and apply its manual peer-socket migration below
+   if the database needs an upgrade. If the database is already schema 12,
+   proceed directly to the two storage checks. For absent, gapped, or newer
+   history, identify the matching deployment or backup before proceeding.
 
    ~~~sh
    compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d rfc -f /migrations/migrate.sql
@@ -216,7 +217,7 @@ schema 11 and release `2.6.0` expects schema 12.
 
 ### Rollback
 
-For rollback within schema 12, stop Feed and Sync, read the active sequence,
+For rollback within schema 13, stop Feed and Sync, read the active sequence,
 and select a retained generation. Serve can continue handling reads.
 
 ~~~sh
@@ -424,9 +425,7 @@ with matching images and configuration when reproducing historical checks.
 
 ## Source policy rollout
 
-Drain the schema 11 deployment, verify an independent backup, and apply
-migration 12 with matching Sync and Serve images. Check readiness and
-retained whole-document delivery. Historical receiptless excerpt decisions
-are withheld until a new version qualifies. Reconcile before promoting a new
-generation. Activate automatic grants only after the [private corpus audit
-and maintainer review](source-policy.md#audit-and-activate-a-policy-bundle).
+The schema 13 upgrade refreshes rights for active and retained generations
+from their verified originals and catalog data. Confirm ordinary whole-file
+reads, an attributed excerpt, and a metadata-only regex hit before reopening
+ingress. See [private rights diagnostics](source-policy.md#diagnose-rights).

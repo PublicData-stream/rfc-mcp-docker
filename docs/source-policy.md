@@ -1,122 +1,94 @@
-# RFC source policy
+# RFC redistribution and search
 
-Sync evaluates redistribution rights against the verified official TXT and
-the RFC Index. It seals the decision with the document version. Serve checks
-that decision and the current rights restriction before releasing original
-text. Metadata and structural ranges remain available when original text is
-restricted.
+RFC MCP gives readers access to authentic Internet standards and the rest of
+the RFC Series. Sync keeps verified official TXT intact, including copyright
+notices, legal legends, authorship, line breaks, and form feeds. Serve checks
+the BLAKE3 digest before using the bytes and reports the publication status
+from the RFC Index. The service returns exact original bytes with attribution.
 
-## Rule review and applicability
+## Rights by operation
 
-The first automatic candidate rule covers the reviewed IETF Stream TLP 5.0
-boilerplate. The IETF Trust archive dates TLP 5.0 to 2015-03-25. Corrected TLP
-5.0 §3.c(iii) covers unmodified portions with attribution and requires the
-original legends, legal notices, and indications of authorship for substantial
-reproduction. RFC MCP includes the verified inventory on every excerpt.
-The 2021 correction explains the historical Simplified BSD wording. The
-classifier recognizes that wording while preserving the exact original
-paragraph. Separate code license claims and third-party terms need their own
-review.
+The policy evaluates internal copying and search, complete reproduction,
+sequential whole-file delivery, and unmodified quotation independently.
+RFC 8721 §§4.1–4.4 gives the dissemination and quotation objectives. The
+actual terms come from the applicable outbound grant. The RFC Editor and IPMC
+publish affirmative guidance supporting complete reproduction. A separate
+grant supports quotation, including quotation of an identified Code Component.
+[BCP 78](https://www.rfc-editor.org/rfc/rfc5378.html) ·
+[RFC 8721 §4](https://www.rfc-editor.org/rfc/rfc8721.html#section-4) ·
+[RFC Editor guidance](https://www.rfc-editor.org/series/rfc-use/) ·
+[IPMC guidance](https://www.ietf-ipm.org/faq/)
 
-The rule requires matching RFC number, publication period and stream, a
-standard copyright and license context, and corroborated authorship from the
-byline, author block and RFC Index. For a month that crosses an effective
-date, Sync withholds automatic permission when the available evidence cannot
-resolve applicability. Unknown templates, pre-5378 material with unresolved
-rights, and conflicting or additional legal terms go to review. The classifier
-implements the reviewed layouts and supported restriction patterns. Rule
-review must evaluate missed legal notices as well as false matches before
-approving the bundle.
+| Evidence | Operations covered |
+| --- | --- |
+| RFC Series guidance and applicable historic distribution notices | Complete unmodified reproduction. Sequential delivery uses the same fixed original, with the required context and attribution on each page where the terms permit it. |
+| Historical grants and notices | Apply the actual terms in the original, including the explanatory and implementation grant under RFC 2026 §10.4 and Code Component terms under RFCs 3667, 3978, and 4748. |
+| IETF Stream TLP 1.0–5.0 | Apply §3.c(i) for complete reproduction and §3.c(iii) for attributed unmodified quotation. Apply the relevant §4 grant to identified Code Components when its conditions are met. |
+| IAB, IRTF, and Independent Streams | Apply the applicable outbound terms, including TLP §§8 and 3.a(i) where in effect, and any document-specific grant. |
+| Editorial Stream | Apply the general whole-copy guidance and any affirmative document-specific quotation grant. Check for final IPMC terms and their effective dates before applying TLP 6.0. |
 
-- TLP 1.0–4.0 have distinct tracked effective periods. Their historical
-  boilerplate, grant scope and exceptions require independent review.
-- IAB, IRTF and Independent submissions have separate outgoing rights. The
-  IETF Stream §3.c(iii) grant does not apply to them under TLP 5.0 §8.
-- Editorial Stream and legacy documents require supporting evidence for
-  their own grants. The checked-in RFC 2119 review permits the complete
-  exact-digest original. RFC 8174 retains its exact-digest whole-document
-  approval when automatic qualification is unavailable.
-- A reviewed exception identifies its RFC, source digest, grant and any
-  verified notice spans. A restriction takes priority across all generations.
-
-[IETF Trust archive](https://trustee.ietf.org/documents/trust-legal-provisions/) ·
+When a publication month crosses a TLP effective date, use permissions common
+to the plausible editions. Identify the applicable licenses in diagnostics.
+[RFC 2026 §10](https://www.rfc-editor.org/rfc/rfc2026.html#section-10) ·
+[RFC 3667](https://www.rfc-editor.org/rfc/rfc3667.html) ·
+[RFC 3978](https://www.rfc-editor.org/rfc/rfc3978.html) ·
+[RFC 4748](https://www.rfc-editor.org/rfc/rfc4748.html) ·
+[TLP archive](https://trustee.ietf.org/documents/trust-legal-provisions/) ·
 [Corrected TLP 5.0](https://trustee.ietf.org/documents/trust-legal-provisions/tlp-5/) ·
-[RFC 5377](https://www.rfc-editor.org/rfc/rfc5377.html) ·
-[RFC 5378](https://www.rfc-editor.org/rfc/rfc5378.html) ·
 [RFC 5743](https://www.rfc-editor.org/rfc/rfc5743.html) ·
 [RFC 5744](https://www.rfc-editor.org/rfc/rfc5744.html) ·
-[RFC 5745](https://www.rfc-editor.org/rfc/rfc5745.html) ·
-[RFC 2026](https://www.rfc-editor.org/rfc/rfc2026.html) ·
-[RFC 9920](https://www.rfc-editor.org/rfc/rfc9920.html)
+[RFC 5745](https://datatracker.ietf.org/doc/html/rfc5745) ·
+[RFC 9920 §6.1](https://www.rfc-editor.org/rfc/rfc9920.html#section-6.1) ·
+[IPMC provisions](https://www.ietf-ipm.org/tlp/)
 
-## Audit and activate a policy bundle
+Interpret no-modification and no-derivatives legends according to their scope.
+A standard Pre-5378 legend identifies potential limits on inherited rights.
+The applicable general quotation grant supports unmodified quotations unless
+specific evidence identifies affected material. Check an independent
+historical, third-party, or code license for those ranges. Descriptions of
+copyright and BSD terms in the body carry no denial by themselves.
 
-Run the Sync CLI in an isolated deployment restored from an independently
-verified corpus backup. Audit validates the selected generation manifest and
-rechecks the original bytes from its mirror. The report records coverage,
-current and proposed decisions, and reason- and template-specific review
-queues. The two approval denominators are the audited TXT corpus and the
-documents in a supported applicable rule family. The source generation stays
-unchanged.
+Serve can search a verified original internally and return the occurrence's
+coordinates and official URL when it lacks a basis to quote the match. It
+returns exact quote bytes when the grant and required notice material support
+them. Response notice groups carry attribution and applicable conditions once
+per RFC per page. [MCP API](mcp.md)
+
+## Diagnose rights
+
+Run the Sync CLI privately. Use the active generation by default or pass
+`--generation ID` to inspect a retained generation.
 
 ~~~sh
-rfc-mcp-docker-sync policy audit --format json > /tmp/policy-audit.json
-rfc-mcp-docker-sync policy audit --status unresolved
 rfc-mcp-docker-sync policy explain --rfc 8174
+rfc-mcp-docker-sync policy audit --status unresolved --format json
 ~~~
 
-Review representative positives and negatives, inspect unresolved evidence,
-and record maintainer approval of each applicable permissive rule and the
-complete audit report. For a schema 11 backup, verify the backup's origin
-against the independent operator inventory. The fixture provenance marker
-is available on format-4 generations. Before disclosing text under the
-new policy, validate the candidate over the normal MCP transport and record
-the rollout decision.
-Install the matching Sync build and pin the reviewed registry in the target
-database using the report. The review reference identifies the maintainer's
-approval of the exact report and bundle. Keep reports and their attestation
-within the private operator boundary.
+These commands report the license evidence, original ranges, unresolved
+operations, and emergency denials. Sync applies the policy on verified
+material during ordinary reconciliation. Publication continues to depend on
+acquisition proof, integrity, and the publication sequence.
+
+## Restrict an operation or recover the ledger
+
+Inspect the current epoch with `policy explain` or `status --json`. Pass
+`--deny full_reproduction`, `--deny pagination`, `--deny excerpt`, or
+`--deny internal_search`. A full-reproduction denial covers both delivery
+forms. An excerpt denial allows metadata-only matches where internal search
+is authorized. Internal-search denial leaves body predicates unknown and
+excludes the original from regex scanning. The existing `--ceiling` values
+retain their effects on public bytes. Restrictions accumulate.
 
 ~~~sh
-rfc-mcp-docker-sync policy approve --registry "$REGISTRY_DIGEST" \
-  --audit-report /tmp/policy-audit.json --review-ref "$REVIEW_REFERENCE"
-rfc-mcp-docker-sync --phase2-reconcile --full
-rfc-mcp-docker-sync --phase3-publish "$GENERATION" --expect-sequence "$SEQUENCE"
+rfc-mcp-docker-sync policy restrict --rfc "$RFC" --deny excerpt \
+  --reason rights_revoked --review-ref "$REFERENCE" --expect-epoch "$EPOCH"
 ~~~
 
-The pin governs forward promotion. The daemon uses the same audited
-candidate and promotion checks during its normal full runs. Requalification
-is required when the bundle changes. Serve can read the current qualified
-generation while a replacement is being built.
-
-## Restrict an RFC
-
-Use `policy explain` or `status --json` to read the current rights epoch.
-Choose a ceiling of `metadata_only`, `whole_only` or `whole_paginated`.
-The ceiling intersects the existing permission, so a restriction cannot
-grant a new operation. Use `rights_revoked`, `legal_obligation_changed` or
-`unresolved_rights` as the reason.
-
-~~~sh
-rfc-mcp-docker-sync policy restrict --rfc "$RFC" --ceiling metadata_only \
-  --reason rights_revoked --review-ref "$REVIEW_REFERENCE" --expect-epoch "$EPOCH"
-~~~
-
-A committed restriction affects every Serve replica and every generation.
-It expires earlier cursors and prevents a buffered response with an older
-rights epoch from passing the final database check. Authorization linearizes
-at that check while Serve holds the shared rights fence. Data already handed
-to HTTP or received by a client cannot be recalled. Serve responses carry
-`Cache-Control: no-store`.
-
-Treat the append-only restriction ledger as recovery state. While operator
-writes are paused, save an independent PostgreSQL data dump containing
-`rfc.policy_restrictions`, `rfc.policy_state`, and `rfc.policy_approvals`.
-Record the rights epoch and the dump digest with the backup inventory.
-After restoring an older corpus backup, keep ingress closed while an
-administrator verifies the ledger in a disposable schema 12 database.
-Replay the verified restriction suffix in epoch order, preserving any
-existing stricter restrictions. Verify the final epoch and reviewed pin
-and check a restricted MCP read before reopening ingress. An earlier
-Serve image must support the current ledger to reopen public ingress.
-[Publication and recovery](publication.md) · [Deployment](deployment.md)
+The commit takes effect across Serve replicas and readable generations.
+It expires earlier cursors and invalidates buffered responses that have
+yet to pass the final rights fence. Keep ingress closed after restoring
+an older backup until the latest verified restriction ledger has been
+replayed in epoch order and the final epoch and effective rights have
+been checked. Back up `rfc.policy_state` and `rfc.policy_restrictions`
+with the paired database and mirror inventory. [Publication and recovery](publication.md) ·
+[Deployment](deployment.md)

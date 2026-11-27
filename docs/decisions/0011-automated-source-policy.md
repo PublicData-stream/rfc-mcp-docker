@@ -1,5 +1,7 @@
 # 0011 — Audited source policy and cross-generation restrictions
 
+Superseded by [0012](0012-license-based-redistribution.md).
+
 Classify redistribution rights in Sync with a versioned registry and
 evidence mapped to the original bytes. Seal the receipt with the document
 version and the registry with the generation manifest. A maintainer-approved

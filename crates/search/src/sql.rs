@@ -15,8 +15,11 @@ const TOKENIZE: &str = "SELECT DISTINCT term.lexeme COLLATE pg_catalog.\"C\" AS 
     WHERE octet_length(token.token) < 2048 AND octet_length(term.lexeme) BETWEEN 1 AND 2047
     ORDER BY lexeme LIMIT 65";
 
-pub(crate) const WINDOW: &str = "SELECT m.rfc_id::integer, d.byte_length::bigint
+pub(crate) const WINDOW: &str = "SELECT m.rfc_id::integer, d.byte_length::bigint,
+    coalesce(sr.evidence->>'search'='true',false) AND (coalesce(cap.denied,0) & 8) = 0
     FROM rfc.generation_documents m JOIN rfc.document_versions d ON d.identity=m.document_version
+    LEFT JOIN rfc.source_rights sr ON (sr.generation_id,sr.rfc_id) = (m.generation_id,m.rfc_id)
+    LEFT JOIN rfc.source_restrictions cap ON cap.rfc_id=m.rfc_id
     WHERE m.generation_id=$1 AND m.rfc_id>$2::integer
     ORDER BY m.rfc_id LIMIT $3";
 
@@ -234,10 +237,9 @@ impl Plan {
             m.document_version::bytea,
             coalesce(p.method, (SELECT o.verification_method FROM rfc.source_observations o
                 WHERE o.identity=m.txt_observation LIMIT 1)) AS verification_method,
-            p.algorithm AS verification_algorithm, d.policy_receipt::bytea AS policy_identity,
-            receipt.receipt::text AS policy_evidence,
-            (SELECT cap.ceiling FROM rfc.policy_restrictions cap WHERE cap.rfc_id = m.rfc_id
-                ORDER BY cap.epoch DESC LIMIT 1) AS policy_ceiling,ARRAY[");
+            p.algorithm AS verification_algorithm, sr.identity::bytea AS policy_identity,
+    sr.evidence::text AS policy_evidence, m.metadata_identity::bytea AS policy_metadata,
+    coalesce(cap.denied, 0) AS policy_denied,ARRAY[");
         let mut params = Vec::new();
         for (slot, leaf) in self.leaves.iter().enumerate() {
             if slot != 0 {
@@ -257,7 +259,7 @@ impl Plan {
                     let exact = self.exact.iter().position(|&index| index == slot).unwrap();
                     write!(
                         sql,
-                        "(CASE get_byte(x.facts,{exact}) WHEN 1 THEN true WHEN 0 THEN false END)"
+                        "(CASE WHEN (coalesce(cap.denied,0) & 8) = 0 AND sr.evidence->>'search'='true' THEN CASE get_byte(x.facts,{exact}) WHEN 1 THEN true WHEN 0 THEN false END END)"
                     )
                     .unwrap();
                 }
@@ -271,7 +273,7 @@ impl Plan {
                 }
                 Predicate::Text(Field::Fulltext, Match::Token, _) => {
                     params.push(Parameter::Terms(leaf.terms.clone()));
-                    write!(sql, "(CASE WHEN d.index_version='rfc-original-bytes-pg19-1'
+                    write!(sql, "(CASE WHEN (coalesce(cap.denied,0) & 8) = 0 AND sr.evidence->>'search'='true' AND d.index_version='rfc-original-bytes-pg19-1'
                         AND d.line_starts IS NOT NULL AND d.encoding='utf8' THEN
                         CASE WHEN NOT EXISTS (SELECT FROM pg_catalog.unnest(${parameter}::text[]) term(lexeme)
                             WHERE NOT EXISTS (SELECT FROM rfc.document_lexemes lexeme
@@ -298,7 +300,8 @@ impl Plan {
         sql.push_str(
             "] AS predicates FROM rfc.generation_documents m
             JOIN rfc.document_versions d ON d.identity=m.document_version
-            LEFT JOIN rfc.policy_receipts receipt ON receipt.identity = d.policy_receipt
+            LEFT JOIN rfc.source_rights sr ON (sr.generation_id,sr.rfc_id) = (m.generation_id,m.rfc_id)
+    LEFT JOIN rfc.source_restrictions cap ON cap.rfc_id=m.rfc_id
             LEFT JOIN LATERAL (
                 SELECT method, algorithm FROM rfc.generation_source_evidence p
                 WHERE (p.generation_id,p.rfc_id) = (m.generation_id,m.rfc_id) LIMIT 1

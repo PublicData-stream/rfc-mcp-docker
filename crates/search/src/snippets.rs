@@ -2,7 +2,10 @@ use std::ops::Range;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rfc_core::{BlobDigest, RfcNumber};
-use rfc_storage::policy::{MAX_NOTICE_BYTES, MAX_NOTICES, Policy, Receipt};
+use rfc_storage::policy::{
+    DENY_EXCERPT, DENY_PAGINATION, DENY_SEARCH, DENY_WHOLE, Grant, MAX_NOTICE_BYTES, Method,
+    Policy, RIGHTS_REVISION, Rights,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_postgres::{Row, Transaction};
@@ -32,9 +35,8 @@ pub(crate) struct Source {
     pub url: String,
     pub version: Vec<u8>,
     pub encoding: String,
-    pub policy: Policy,
-    receipt: Option<Receipt>,
-    pub notice_state: String,
+    rights: Option<Rights>,
+    denied: i32,
     pub verification: Option<SourceVerification>,
 }
 
@@ -82,53 +84,30 @@ impl Source {
                 .try_into()
                 .map_err(|_| SearchError::Unavailable)?,
         );
-        let base = Policy::parse(row.get::<_, &str>(6)).unwrap_or(Policy::MetadataOnly);
-        let receipt = match (
-            row.try_get::<_, Option<&[u8]>>("policy_identity")?,
-            row.try_get::<_, Option<&str>>("policy_evidence")?,
-        ) {
-            (None, None) => None,
-            (Some(identity), Some(evidence)) => {
-                let receipt: Receipt =
-                    serde_json::from_str(evidence).map_err(|_| SearchError::Unavailable)?;
-                if receipt
-                    .digest()
-                    .map_err(|_| SearchError::Unavailable)?
-                    .as_bytes()
-                    .as_slice()
-                    != identity
-                    || receipt.rfc != rfc.get()
-                    || receipt.source_digest != digest.to_string()
-                    || receipt.decision != base
-                {
-                    return Err(SearchError::Unavailable);
-                }
-                Some(receipt)
-            }
-            _ => return Err(SearchError::Unavailable),
-        };
-        let ceiling = row
-            .try_get::<_, Option<&str>>("policy_ceiling")?
-            .map_or(Ok(Policy::ExcerptAllowed), |cap| {
-                Policy::parse(cap).ok_or(SearchError::Unavailable)
-            })?;
-        let policy = if base == Policy::ExcerptAllowed
-            && !receipt.as_ref().is_some_and(Receipt::eligible_for_excerpt)
-        {
-            Policy::MetadataOnly
-        } else {
-            base.min(ceiling)
-        };
+        let length = usize::try_from(row.get::<_, i64>(4)).map_err(|_| SearchError::Unavailable)?;
+        let identity = row.try_get::<_, Option<&[u8]>>("policy_identity")?;
+        let metadata = row.try_get::<_, &[u8]>("policy_metadata")?;
+        let rights = row
+            .try_get::<_, Option<&str>>("policy_evidence")?
+            .and_then(|value| serde_json::from_str::<Rights>(value).ok())
+            .filter(|rights| {
+                rights.valid_for(rfc.get(), digest, metadata, length)
+                    && rights
+                        .digest()
+                        .ok()
+                        .as_ref()
+                        .map(|digest| digest.as_bytes().as_slice())
+                        == identity
+            });
         Ok(Self {
             rfc,
             title: row.get(1),
             stream: row.get(2),
             digest,
-            length: usize::try_from(row.get::<_, i64>(4)).map_err(|_| SearchError::Unavailable)?,
+            length,
             encoding: row.get(5),
-            policy,
-            receipt,
-            notice_state: row.get(7),
+            rights,
+            denied: row.try_get("policy_denied")?,
             url: row.get(8),
             version: row.get(9),
             verification: SourceVerification::read(
@@ -139,17 +118,98 @@ impl Source {
         })
     }
 
+    pub fn permits_search(&self) -> bool {
+        self.denied & DENY_SEARCH == 0 && self.rights.as_ref().is_some_and(|rights| rights.search)
+    }
+
     pub fn permits_excerpt(&self) -> bool {
-        self.policy == Policy::ExcerptAllowed
-            && self.notice_state == "complete"
-            && self.stream.is_some()
+        self.denied & DENY_EXCERPT == 0
+            && self
+                .rights
+                .as_ref()
+                .is_some_and(|rights| !rights.quotes.is_empty())
+    }
+
+    pub fn quote(&self, range: &Range<usize>) -> Option<&Grant> {
+        if self.denied & DENY_EXCERPT != 0 {
+            return None;
+        }
+        self.rights.as_ref()?.quote(range)
+    }
+
+    pub fn cover(&self, range: &Range<usize>) -> Option<Vec<&Grant>> {
+        if self.denied & DENY_EXCERPT != 0 {
+            return None;
+        }
+        self.rights.as_ref()?.cover(range)
+    }
+
+    pub fn whole(&self) -> Option<bool> {
+        let rights = self.rights.as_ref()?;
+        if self.denied & DENY_WHOLE != 0 || rights.whole.is_none() {
+            return None;
+        }
+        Some(self.denied & DENY_PAGINATION == 0 && rights.pages)
+    }
+
+    pub fn notices(&self, bytes: &[u8], grants: &[&Grant]) -> Option<Vec<OriginalRange>> {
+        let mut total = 0;
+        let ranges = self
+            .rights
+            .as_ref()?
+            .notices
+            .iter()
+            .chain(grants.iter().flat_map(|grant| &grant.notices))
+            .map(|notice| (notice.start_byte as usize, notice.end_byte as usize))
+            .collect::<std::collections::BTreeSet<_>>();
+        if ranges.len() > rfc_storage::policy::MAX_NOTICES {
+            return None;
+        }
+        ranges
+            .into_iter()
+            .map(|(start, end)| {
+                let content = bytes.get(start..end)?;
+                total += content.len();
+                (total <= MAX_NOTICE_BYTES).then(|| original(start..end, content, false))
+            })
+            .collect()
     }
 
     pub fn notice_group(
         &self,
         notices: Vec<OriginalRange>,
-        included_in_whole: bool,
+        grants: &[&Grant],
+        whole: Option<bool>,
     ) -> NoticeGroup {
+        let mut attribution = self
+            .rights
+            .as_ref()
+            .map(|rights| rights.attribution.clone())
+            .unwrap_or_else(|| format!("rfc{}.txt, RFC Editor", self.rfc.get()));
+        let mut legends = std::collections::BTreeSet::new();
+        for legend in grants.iter().filter_map(|grant| grant.legend.as_deref()) {
+            if legends.insert(legend) {
+                attribution.push('\n');
+                attribution.push_str(legend);
+            }
+        }
+        let license = if whole.is_some() {
+            self.rights.as_ref().and_then(|rights| rights.whole.clone())
+        } else {
+            grants
+                .first()
+                .filter(|first| grants.iter().all(|grant| grant.license == first.license))
+                .map(|grant| grant.license.clone())
+        };
+        let decision = if !grants.is_empty() {
+            Policy::ExcerptAllowed
+        } else {
+            match whole {
+                Some(true) => Policy::WholeOnly,
+                Some(false) => Policy::WholePaginated,
+                None => Policy::MetadataOnly,
+            }
+        };
         NoticeGroup {
             id: format!("rfc-{}-notices", self.rfc.get()),
             rfc_id: self.rfc.get(),
@@ -157,32 +217,20 @@ impl Source {
             source_verification: self.verification.clone(),
             source_name: "RFC Editor",
             stream: self.stream.clone(),
-            attribution: self
-                .receipt
-                .as_ref()
-                .and_then(|receipt| receipt.attribution.clone())
-                .unwrap_or_else(|| {
-                    if self.stream.as_deref() == Some("IETF") {
-                        "RFC Editor, IETF stream".into()
-                    } else {
-                        "RFC Editor".into()
-                    }
-                }),
-            license: self
-                .receipt
-                .as_ref()
-                .and_then(|receipt| receipt.license.clone()),
-            policy: self
-                .receipt
-                .as_ref()
-                .map(|receipt| crate::engine::NoticePolicy {
-                    decision: self.policy,
-                    approval_method: receipt.approval_method,
-                    rule_id: receipt.rule_id.clone(),
-                }),
+            attribution,
+            license,
+            policy: self.rights.as_ref().map(|_| crate::engine::NoticePolicy {
+                decision,
+                approval_method: if decision == Policy::MetadataOnly {
+                    Method::Fallback
+                } else {
+                    Method::Automatic
+                },
+                rule_id: RIGHTS_REVISION.into(),
+            }),
             digest: self.digest.to_string(),
             notices,
-            included_in_whole,
+            included_in_whole: whole == Some(true),
         }
     }
 }
@@ -199,60 +247,6 @@ pub(crate) fn fulltext_witnesses<'a>(plan: &'a Plan, witnesses: &[usize]) -> Vec
     literals
 }
 
-pub(crate) async fn notices(
-    tx: &Transaction<'_>,
-    source: &Source,
-    bytes: &[u8],
-    require_review: bool,
-) -> Result<Option<Vec<OriginalRange>>, SearchError> {
-    let notices = tx
-        .query(
-            "SELECT start_byte::bigint,end_byte::bigint,extraction_state::text,review_state,category
-         FROM rfc.notice_ranges WHERE document_version=$1::bytea ORDER BY ordinal LIMIT 129",
-            &[&source.version],
-        )
-        .await?;
-    if notices.is_empty() || notices.len() > MAX_NOTICES {
-        return Ok(None);
-    }
-    if source
-        .receipt
-        .as_ref()
-        .is_some_and(|receipt| receipt.notices.len() != notices.len())
-    {
-        return Ok(None);
-    }
-    let mut notice_bytes = 0_usize;
-    let mut notice_ranges = Vec::with_capacity(notices.len());
-    for (ordinal, row) in notices.into_iter().enumerate() {
-        if source.receipt.as_ref().is_some_and(|receipt| {
-            let span = &receipt.notices[ordinal];
-            (span.start_byte, span.end_byte, span.category.as_str())
-                != (row.get(0), row.get(1), row.get(4))
-        }) {
-            return Ok(None);
-        }
-        let start = usize::try_from(row.get::<_, i64>(0)).map_err(|_| SearchError::Unavailable)?;
-        let end = usize::try_from(row.get::<_, i64>(1)).map_err(|_| SearchError::Unavailable)?;
-        let review = row.get::<_, &str>(3);
-        if row.get::<_, &str>(2) != "complete"
-            || review == "restricted"
-            || (require_review && review != "reviewed")
-        {
-            return Ok(None);
-        }
-        let Some(notice) = bytes.get(start..end) else {
-            return Ok(None);
-        };
-        notice_bytes += notice.len();
-        if notice_bytes > MAX_NOTICE_BYTES {
-            return Ok(None);
-        }
-        notice_ranges.push(original(start..end, notice, false));
-    }
-    Ok(Some(notice_ranges))
-}
-
 pub(crate) async fn collect(
     tx: &Transaction<'_>,
     source: &Source,
@@ -262,23 +256,26 @@ pub(crate) async fn collect(
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Ok(None);
     };
-    let Some(notices) = notices(tx, source, bytes, false).await? else {
-        return Ok(None);
-    };
-    let group = source.notice_group(notices, false);
+    let group_id = format!("rfc-{}-notices", source.rfc.get());
     let allow_markers =
         bytes.len() <= MAX_TOKEN_SOURCE_BYTES && !bytes.contains(&START) && !bytes.contains(&STOP);
     let mut ranges = Vec::new();
     for &(mode, literal) in witnesses {
         match mode {
             Match::Exact => {
-                if let Some(start) = memchr::memmem::find(bytes, literal.as_bytes()) {
+                if let Some(start) = memchr::memmem::find_iter(bytes, literal.as_bytes())
+                    .find(|&start| source.cover(&(start..start + literal.len())).is_some())
+                {
                     ranges.push(start..start + literal.len());
                 }
             }
             Match::Token if allow_markers => {
                 let row = tx.query_one(HEADLINE, &[&text, &literal]).await?;
-                if let Some(mut marked) = marked_ranges(bytes, row.get::<_, &str>(0).as_bytes()) {
+                if let Some(mut marked) =
+                    marked_ranges(bytes, row.get::<_, &str>(0).as_bytes(), |range| {
+                        source.cover(range).is_some()
+                    })
+                {
                     ranges.append(&mut marked);
                 }
             }
@@ -287,21 +284,29 @@ pub(crate) async fn collect(
     }
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
     ranges.dedup();
+    let mut grants = Vec::new();
     let excerpts: Vec<_> = ranges
         .into_iter()
-        .take(MAX_EXCERPTS)
         .filter_map(|range| {
+            let covered = source.cover(&range)?;
             let content = text.get(range.clone())?;
             let match_range = [range.start as u64, range.end as u64];
+            grants.extend(covered);
             Some(Excerpt {
                 original: original(range, content.as_bytes(), false),
                 encoding: "utf8",
-                notice_group_id: group.id.clone(),
+                notice_group_id: group_id.clone(),
                 match_range,
             })
         })
+        .take(MAX_EXCERPTS)
         .collect();
-    Ok((!excerpts.is_empty()).then_some((excerpts, group)))
+    if excerpts.is_empty() {
+        return Ok(None);
+    }
+    Ok(source
+        .notices(bytes, &grants)
+        .map(|notices| (excerpts, source.notice_group(notices, &grants, None))))
 }
 
 pub(crate) fn original(range: Range<usize>, bytes: &[u8], base64: bool) -> OriginalRange {
@@ -320,7 +325,11 @@ pub(crate) fn original(range: Range<usize>, bytes: &[u8], base64: bool) -> Origi
     }
 }
 
-fn marked_ranges(original: &[u8], marked: &[u8]) -> Option<Vec<Range<usize>>> {
+fn marked_ranges(
+    original: &[u8],
+    marked: &[u8],
+    permits: impl Fn(&Range<usize>) -> bool,
+) -> Option<Vec<Range<usize>>> {
     let mut offset = 0;
     let mut start = None;
     let mut ranges = Vec::new();
@@ -332,7 +341,7 @@ fn marked_ranges(original: &[u8], marked: &[u8]) -> Option<Vec<Range<usize>>> {
                 if begin == offset {
                     return None;
                 }
-                if ranges.len() < MAX_EXCERPTS {
+                if ranges.len() < MAX_EXCERPTS && permits(&(begin..offset)) {
                     ranges.push(begin..offset);
                 }
             }
@@ -353,12 +362,13 @@ mod tests {
         assert_eq!(
             marked_ranges(
                 "é TLS\r\nTLS".as_bytes(),
-                "é \x01TLS\x02\r\n\x01TLS\x02".as_bytes()
+                "é \x01TLS\x02\r\n\x01TLS\x02".as_bytes(),
+                |_| true,
             ),
             Some(vec![3..6, 8..11])
         );
-        assert_eq!(marked_ranges(b"<tag>TLS", b"\x01TLS\x02"), None);
-        assert_eq!(marked_ranges(b"TLS", b"\x01\x01TLS\x02"), None);
-        assert_eq!(marked_ranges(b"TLS", b"\x01TLS"), None);
+        assert_eq!(marked_ranges(b"<tag>TLS", b"\x01TLS\x02", |_| true), None);
+        assert_eq!(marked_ranges(b"TLS", b"\x01\x01TLS\x02", |_| true), None);
+        assert_eq!(marked_ranges(b"TLS", b"\x01TLS", |_| true), None);
     }
 }

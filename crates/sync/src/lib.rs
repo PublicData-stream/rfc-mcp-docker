@@ -4,7 +4,6 @@ use rfc_core::{BlobDigest, ByteRange, Coverage, GenerationId, Relation, RfcNumbe
 use rfc_storage::{
     blob::{BlobWriter, DurableBlob},
     manifest::identity,
-    policy::Receipt,
     postgres::{Result, RuntimeRole, connect, load_manifest, mirror_root},
 };
 use std::os::fd::OwnedFd;
@@ -291,11 +290,13 @@ impl Candidate<'_> {
         document: Document<'_>,
         indexed: Option<IndexedText<'_>>,
     ) -> Result<BlobDigest> {
-        persist_document(&self.tx, document, indexed, None).await
+        persist_document(&self.tx, document, indexed).await
     }
 
     pub async fn member(&self, member: &Membership<'_>) -> Result<()> {
-        self.member_with_sources(member, None, None, false).await
+        self.member_with_sources(member, None, None, false)
+            .await
+            .map(|_| ())
     }
 
     async fn member_with_sources(
@@ -304,7 +305,7 @@ impl Candidate<'_> {
         month: Option<&str>,
         rfcxml: Option<BlobDigest>,
         ingestion: bool,
-    ) -> Result<()> {
+    ) -> Result<BlobDigest> {
         let mut metadata = identity(
             "rfc-catalog-metadata-v1",
             &(
@@ -336,7 +337,7 @@ impl Candidate<'_> {
               &member.catalog.as_bytes().as_slice(), &member.txt.as_bytes().as_slice(), &member.title, &member.stream,
               &member.publication_date, &member.status, &month, &rfcxml],
         ).await?;
-        Ok(())
+        Ok(metadata)
     }
 
     pub async fn evidence(&self, evidence: &Evidence<'_>) -> Result<BlobDigest> {
@@ -494,7 +495,6 @@ async fn persist_document(
     db: &impl GenericClient,
     mut document: Document<'_>,
     indexed: Option<IndexedText<'_>>,
-    receipt: Option<&Receipt>,
 ) -> Result<BlobDigest> {
     let rfc = document.rfc.get() as i32;
     let length = document.txt.byte_length();
@@ -533,55 +533,18 @@ async fn persist_document(
             index_identity.to_string(),
         ),
     )?;
-    let receipt_id = if let Some(receipt) = receipt {
-        if receipt.rfc != document.rfc.get()
-            || receipt.source_digest != digest.to_string()
-            || receipt.decision.name() != document.notice_policy
-        {
-            return Err("source policy receipt binding mismatch".into());
-        }
-        let identity = receipt.digest()?;
-        let canonical = serde_json::to_string(receipt)?;
-        let registry =
-            BlobDigest::from_hex(&receipt.registry_digest).ok_or("invalid registry digest")?;
-        db.execute(
-            "INSERT INTO rfc.policy_receipts (identity,rfc_id,source_digest,registry_digest,decision,receipt)
-             VALUES ($1::bytea,$2::integer,$3::bytea,$4::bytea,$5,$6::text::jsonb)
-             ON CONFLICT DO NOTHING",
-            &[&identity.as_bytes().as_slice(), &rfc, &digest.as_bytes().as_slice(),
-              &registry.as_bytes().as_slice(), &document.notice_policy, &canonical],
-        ).await?;
-        let matches: bool = db.query_one(
-            "SELECT receipt = $2::text::jsonb FROM rfc.policy_receipts WHERE identity = $1::bytea",
-            &[&identity.as_bytes().as_slice(), &canonical],
-        ).await?.try_get(0)?;
-        if !matches {
-            return Err("stored source policy receipt differs from its identity".into());
-        }
-        Some(identity)
-    } else {
-        None
-    };
-    let id = match receipt_id {
-        Some(receipt) => identity(
-            "rfc-document-version-v2",
-            &(id.to_string(), receipt.to_string()),
-        )?,
-        None => id,
-    };
     let key = id.as_bytes().as_slice();
     ensure_rfc_identity(db, rfc).await?;
     let inserted = db.execute(
             "INSERT INTO rfc.document_versions (identity, rfc_id, txt_digest, byte_length, parser_version, index_version,
-                encoding, indexing_state, notice_state, notice_policy, index_identity, section_state, line_starts, policy_receipt)
-             VALUES ($1::bytea, $2::integer, $3::bytea, $4::bigint, $5, $6, $7, $8::text, $9::text, $10, $11::bytea, $12::text, $13::bigint[], $14::bytea)
+                encoding, indexing_state, notice_state, notice_policy, index_identity, section_state, line_starts)
+             VALUES ($1::bytea, $2::integer, $3::bytea, $4::bigint, $5, $6, $7, $8::text, $9::text, $10, $11::bytea, $12::text, $13::bigint[])
              ON CONFLICT DO NOTHING",
             &[&key, &rfc, &digest.as_bytes().as_slice(), &length, &document.parser_version, &document.index_version,
               &document.encoding, &document.index_state.as_str(), &document.notice_state.as_str(),
               &document.notice_policy, &index_identity.as_bytes().as_slice(),
               &indexed.as_ref().map(|index| index.section_state.as_str()),
-              &indexed.as_ref().map(|index| index.line_starts),
-              &receipt_id.as_ref().map(|digest| digest.as_bytes().as_slice())],
+              &indexed.as_ref().map(|index| index.line_starts)],
         ).await?;
     if inserted == 0 {
         let sealed: bool = db

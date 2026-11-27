@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::engine::SearchError;
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const TOOL: &str = "search";
 const MAX_CURSOR_BYTES: usize = 512;
 const TAG_BYTES: usize = 48;
@@ -72,6 +72,9 @@ impl CursorKey {
 
     pub fn decode(&self, encoded: &str, query: &str, now: u64) -> Result<Cursor, SearchError> {
         let cursor: Cursor = self.open(encoded)?;
+        if cursor.version == 1 {
+            return Err(SearchError::CursorExpired);
+        }
         if cursor.version != VERSION
             || cursor.tool != TOOL
             || cursor.sort != "id_asc"

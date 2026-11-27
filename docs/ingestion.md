@@ -2,7 +2,7 @@
 
 Sync runs the same HTTPS-first discovery and durable processing for
 manual requests and daemon jobs. It installs original HTTPS TXT and RFCXML
-in BLAKE3 CAS, seals TXT indexes in PostgreSQL schema 12, and joins both
+in BLAKE3 CAS, seals TXT indexes in PostgreSQL schema 13, and joins both
 outcomes in the Sync coordinator. Each required TXT receives a current rsync
 audit or a fresh dual-source byte comparison. Manual reconciliation prepares
 a ready candidate. The daemon promotes its own full candidates.
@@ -248,10 +248,10 @@ for the retired acquisition profiles and their benchmark commands. The
 [HTTPS-first timing decision](decisions/0010-https-first-rfc-synchronization.md#cold-start-timing)
 describes the current production pacing constraint.
 
-## Source policy decisions
+## Source rights
 
-Sync binds the exact TXT digest, rights-relevant index metadata, template and
-verified notice ranges into a receipt. The registry and classifier identities
-are part of checkpoint selection. Policy changes reclassify verified bytes
-through normal reconciliation, with original reuse under the existing source
-evidence rules. [Audit and approval](source-policy.md#audit-and-activate-a-policy-bundle)
+Sync derives operation and range rights from verified originals and RFC Index
+metadata during candidate assembly. The evidence is bound to the TXT digest,
+generation metadata identity, and the policy revision. Reclassification
+reuses local verified bytes. Source verification and the HTTPS-first audit
+govern publication. [Source policy](source-policy.md)

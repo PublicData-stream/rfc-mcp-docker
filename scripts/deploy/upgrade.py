@@ -85,10 +85,10 @@ class Deployment:
     def exec(self, *args):
         return [*self.compose, "exec", "-T", "postgres", *args]
 
-    def probe(self, service, option):
+    def probe(self, service, *options, timeout=90):
         self.verify_images()
         subprocess.run([*self.compose, "run", "--rm", "--no-deps", "-T", "--pull=never",
-                        service, option], check=True, timeout=90)
+                        service, *options], check=True, timeout=timeout)
         self.verify_images()
 
 
@@ -187,7 +187,7 @@ def upgrade(args):
             state = f"database was already at schema {target}; no migration applied"
         else:
             source = len(history)
-            if source not in (9, 10, 11) or history != versions[:source]:
+            if source not in (9, 10, 11, 12) or history != versions[:source]:
                 raise ValueError(f"unsupported source migration history {history}")
             if args.backup_dir is None:
                 raise ValueError("--backup-dir is required before applying migrations")
@@ -207,6 +207,8 @@ def upgrade(args):
     print(state, flush=True)
     try:
         stack.require_stopped()
+        if target >= 13:
+            stack.probe(SYNC, "policy", "refresh", timeout=900)
         for service in (SERVE, SYNC):
             stack.probe(service, "--phase1-check-storage")
     except (ValueError, OSError, subprocess.SubprocessError) as error:

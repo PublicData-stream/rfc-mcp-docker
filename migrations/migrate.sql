@@ -91,6 +91,12 @@ SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 12) AS appl
 \ir 0012-source-policy.sql
 INSERT INTO rfc.schema_migrations (version) VALUES (12);
 \endif
+SELECT NOT EXISTS (SELECT FROM rfc.schema_migrations WHERE version = 13) AS apply_v13
+\gset
+\if :apply_v13
+\ir 0013-redistribution.sql
+INSERT INTO rfc.schema_migrations (version) VALUES (13);
+\endif
 \if :{?upgrade_from}
 SELECT ARRAY(SELECT version FROM rfc.schema_migrations ORDER BY version) =
        ARRAY(SELECT generate_series(1, :upgrade_to))

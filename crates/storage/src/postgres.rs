@@ -22,7 +22,7 @@ pub use pool::{PoolClass, PoolConfig, PoolError, ReadOutcome, ServePool};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const SCHEMA_VERSIONS: [i32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const SCHEMA_VERSIONS: [i32; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 /// The latest migration required by this build.
 pub const STORAGE_SCHEMA_VERSION: i32 = SCHEMA_VERSIONS[SCHEMA_VERSIONS.len() - 1];
 const READ_DEADLINE: Duration = Duration::from_secs(15);
@@ -48,6 +48,8 @@ const PUBLIC_READS: &[&str] = &[
     "generation_source_evidence",
     "generation_policy",
     "policy_receipts",
+    "source_rights",
+    "source_restrictions",
 ];
 
 /// Expected role for the executable opening a storage repository.
@@ -79,6 +81,7 @@ impl RuntimeRole {
                     "policy_restrictions.rfc_id:SELECT",
                     "policy_restrictions.ceiling:SELECT",
                     "policy_restrictions.epoch:SELECT",
+                    "policy_restrictions.denied:SELECT",
                 ]
                 .map(str::to_owned),
             ),
@@ -109,8 +112,7 @@ impl RuntimeRole {
                     "generation_ingestion",
                     "generation_audit",
                     "generation_source_evidence",
-                    "generation_policy",
-                    "policy_receipts",
+                    "source_rights",
                 ] {
                     grants.push(format!("{name}:INSERT"));
                 }
@@ -119,9 +121,10 @@ impl RuntimeRole {
                     (
                         "document_versions",
                         "INSERT",
-                        "identity rfc_id txt_digest byte_length parser_version index_version encoding indexing_state notice_state notice_policy index_identity section_state line_starts policy_receipt",
+                        "identity rfc_id txt_digest byte_length parser_version index_version encoding indexing_state notice_state notice_policy index_identity section_state line_starts",
                     ),
                     ("document_versions", "UPDATE", "sealed"),
+                    ("source_rights", "UPDATE", "identity evidence"),
                     (
                         "text_chunks",
                         "INSERT",
@@ -172,7 +175,7 @@ impl RuntimeRole {
                         "store_source_checkpoint(text,bytea,integer,text,bytea,text,bytea):EXECUTE",
                         "queue_orphan_blobs(bytea[]):EXECUTE",
                         "finish_blob_deletion(bytea):EXECUTE",
-                        "approve_policy(bytea,text,bytea,bytea,text):EXECUTE",
+                        "deny_source_rights(integer,integer,text,text,bigint):EXECUTE",
                         "restrict_policy(integer,text,text,text,bigint):EXECUTE",
                     ]
                     .map(str::to_owned),
@@ -860,7 +863,7 @@ pub async fn load_manifest(db: &impl GenericClient, generation: GenerationId) ->
     let audit = if let Some(header) = db
         .query_opt(
             "SELECT jsonb_build_array(encode(selection, 'hex'), encode(inventory, 'hex'), policy,
-            expected_rfc_ids, expected_sequence, started_us, expires_us)::text
+            expected_rfc_ids, expected_sequence, started_us, expires_us)::text, fixture
          FROM rfc.generation_audit WHERE generation_id = $1",
             &[&id],
         )
@@ -876,10 +879,15 @@ pub async fn load_manifest(db: &impl GenericClient, generation: GenerationId) ->
         ).await? {
             proofs.push(serde_json::from_str(row.try_get::<_, &str>(0)?)?);
         }
-        Some(Audit(
-            serde_json::from_str(header.try_get::<_, &str>(0)?)?,
-            proofs,
-        ))
+        let mut header_fields: Vec<serde_json::Value> =
+            serde_json::from_str(header.try_get::<_, &str>(0)?)?;
+        if ingestion
+            .as_ref()
+            .is_some_and(|ingestion| ingestion.3.is_none())
+        {
+            header_fields.push(serde_json::json!(header.try_get::<_, bool>(1)?));
+        }
+        Some(Audit(serde_json::Value::Array(header_fields), proofs))
     } else {
         None
     };
