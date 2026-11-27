@@ -14,6 +14,17 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  docs:
+    name: Documentation links
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 -B scripts/ci/check-doc-links.py
+
   rust:
     name: Rust checks (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -75,15 +86,17 @@ jobs:
     name: CI summary
     runs-on: ubuntu-26.04
     timeout-minutes: 5
-    needs: [rust, docker-e2e, rustsec]
+    needs: [docs, rust, docker-e2e, rustsec]
     if: ${{ always() }}
     steps:
-      - name: Require the Rust and Docker matrices and RustSec audit
+      - name: Require documentation, Rust, Docker, and RustSec checks
         env:
+          DOCS_RESULT: ${{ needs.docs.result }}
           RUST_RESULT: ${{ needs.rust.result }}
           DOCKER_RESULT: ${{ needs.docker-e2e.result }}
           RUSTSEC_RESULT: ${{ needs.rustsec.result }}
         run: |
-          printf 'Rust matrix: %s\nDocker E2E matrix: %s\nRustSec audit: %s\n' \
-            "$RUST_RESULT" "$DOCKER_RESULT" "$RUSTSEC_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
-          [[ "$RUST_RESULT" == success && "$DOCKER_RESULT" == success && "$RUSTSEC_RESULT" == success ]]
+          printf 'Documentation links: %s\nRust matrix: %s\nDocker E2E matrix: %s\nRustSec audit: %s\n' \
+            "$DOCS_RESULT" "$RUST_RESULT" "$DOCKER_RESULT" "$RUSTSEC_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$DOCS_RESULT" == success && "$RUST_RESULT" == success \
+            && "$DOCKER_RESULT" == success && "$RUSTSEC_RESULT" == success ]]

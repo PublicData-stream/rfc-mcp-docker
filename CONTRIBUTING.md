@@ -58,6 +58,8 @@ cargo test --workspace --all-features --frozen
 ```
 
 Run `python3 -B scripts/phase8/http-smoke.py` for public HTTP boundary changes.
+Run `python3 -B scripts/ci/check-doc-links.py` when editing Markdown links or
+headings. It checks repository-relative targets and Markdown anchors offline.
 Run `actionlint` when editing GitHub Actions workflows.
 
 ## Release and Upgrade Guidance
