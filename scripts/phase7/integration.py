@@ -501,14 +501,13 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
         key_id = self.env["RFC_SYNC_SERVE_KEY_ID"]
         key = self.notify_key
         fixture = HERE.parent / "phase6" / "probe.py"
+        peer = f"{self.name}-pool-notify"
 
         def notify(path, epoch="bootstrap", body=b"{}"):
             wire, expected = control.request(self, path, epoch, body, to_serve=True,
                                              credentials=(key_id, key))
-            command = [*self.docker, "run", "--rm", "-i", "--network", f"{self.name}_sync_notify",
-                       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-                       "-v", f"{fixture}:/probe.py:ro", "--entrypoint", "python3",
-                       f"{self.prefix}-fixtures", "-B", "/probe.py", self.env["RFC_NOTIFY_SERVE_IP"], "8782"]
+            command = [*self.docker, "exec", "-i", peer, "python3", "-B", "/probe.py",
+                       self.env["RFC_NOTIFY_SERVE_IP"], "8782"]
             result = subprocess.run(command, input=wire, capture_output=True, timeout=12, check=True)
             head, reply = result.stdout.split(b"\r\n\r\n", 1)
             assert head.startswith(b"HTTP/1.1 200 "), head
@@ -524,6 +523,14 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
         self.env["RFC_MCP_DB_POOL_MAX_CONNECTIONS"] = "3"
         try:
             self.run("up", "-d", "--no-deps", "--wait", SERVE, timeout=60)
+            # Keep container startup outside the timed control exchanges.
+            subprocess.run([*self.docker, "run", *phase0.local_image_args(), "--rm", "-d", "--name", peer,
+                            "--network", f"{self.name}_sync_notify", "--read-only", "--cap-drop", "ALL",
+                            "--security-opt", "no-new-privileges:true", "-v", f"{fixture}:/probe.py:ro",
+                            "--entrypoint", "/bin/sleep", f"{self.prefix}-fixtures", "180"],
+                           check=True, stdout=subprocess.DEVNULL, timeout=45)
+            # Recreating Serve rotates the authenticated receiver epoch.
+            epoch = notify("/internal/v1/identify")["epoch"]
             sql = lambda query: self.sql("-c", query)
             with subprocess.Popen(
                 self.command("exec", "-T", "postgres", *phase1.SQL_OPTIONS, "-U", "postgres", "-d", "rfc"),
@@ -533,8 +540,6 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
                 holder.stdin.flush()
                 try:
                     assert select.select([holder.stdout], [], [], 5)[0] and holder.stdout.readline().strip() == "locked"
-                    # Recreating Serve also rotates the authenticated receiver epoch.
-                    epoch = notify("/internal/v1/identify")["epoch"]
                     callbacks = self.command("exec", "-T", "test-proxy", "python3", "-B",
                                              "/phase7/disconnect.py", "192.0.2.10", "get")
                     with subprocess.Popen(callbacks, env=self.env, text=True, stdin=subprocess.PIPE,
@@ -553,6 +558,8 @@ for addr, port in ((sys.argv[1], 8781), (sys.argv[1], 8782),
                     holder.communicate("ROLLBACK;\n", timeout=8)
             phase5.phase3.assert_readers_idle(sql, gone=blocked, max_connections=3)
         finally:
+            subprocess.run([*self.docker, "rm", "-f", peer], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=30)
             if previous is None:
                 self.env.pop("RFC_MCP_DB_POOL_MAX_CONNECTIONS", None)
             else:
