@@ -1,6 +1,10 @@
 # Phase 8 release qualification
 
-Qualify the exact service images on a Linux rootless Docker Compose host using the pinned PostgreSQL image, cgroup v2, and the effective sandbox. Synthetic corpus and fault fixtures use disposable projects, with a localhost HTTPS proxy. The official-source sample is a separate operation. [Current evidence and decision](implementation-status.md#phase-8)
+Qualify the exact Serve, Sync, Feed, and Maintenance images together with
+the pinned PostgreSQL image on a Linux rootless Docker Compose host.
+Verify cgroup v2 and the effective sandbox. Synthetic corpus and fault
+fixtures use disposable projects and a localhost HTTPS proxy.
+[Schema 13 startup verification](implementation-status.md#automatic-database-migration-at-startup)
 
 ## Repeat the checks
 
@@ -12,28 +16,39 @@ export RFC_PHASE8_IMAGE_PREFIX=rfc-phase8-qualified
 cargo fetch --locked
 bash scripts/phase8/verify.sh
 bash scripts/phase8/audit.sh /tmp/rfc-phase8-audit
-python3 -B scripts/phase0/upstream.py
 ```
 
-For an explicitly authorized live ingestion sample, use the [standard Compose sample command](ingestion.md#run-acquisition) with the daemon stopped and a bounded official-source window.
+To check live endpoint assumptions, run `python3 -B scripts/phase0/upstream.py`
+separately. For an explicitly authorized live ingestion sample, use the
+[standard Compose sample command](ingestion.md#run-acquisition) with the
+daemon stopped and a bounded official-source window.
 
-Use a new audit output directory for every run. The audit verifies the scanner archive against its pinned SHA-256 and retrieves the advisory database. It records the candidate image IDs, per-image CycloneDX SBOMs, resolved Rust dependency and license inventories, and advisory, license, and redacted secret results. Use `RFC_PHASE8_CONTEXT` to select the Docker context and `RFC_PHASE8_TRIVY_ARCHIVE` to reuse a downloaded scanner archive. The manual [GitHub Actions audit job](../.github/workflows/release-audit.yml) exports the same redacted evidence. Scanner completion means the reports were generated. Review findings before assigning a release status.
+Use a new audit output directory for every run. The audit verifies the scanner archive against its pinned SHA-256 and retrieves the advisory database. It records the four candidate image IDs and the separate Compose PostgreSQL image ID, per-image CycloneDX SBOMs, resolved Rust dependency and license inventories, and advisory, license, and redacted secret results. Use `RFC_PHASE8_CONTEXT` to select the Docker context and `RFC_PHASE8_TRIVY_ARCHIVE` to reuse a downloaded scanner archive. The manual [GitHub Actions audit job](../.github/workflows/release-audit.yml) builds the four candidate images and exports the same redacted evidence. Scanner completion means the reports were generated. Review findings before assigning a release status.
 
-The compatible-client, restore, and capacity results use the images built by the Phase 0 probe. The offline runner prints its report directory under `/tmp`. Package archives, database dumps, mirror copies, synthetic credentials, and captures stay under `/tmp`.
+The offline runner builds Maintenance alongside the Phase 0 service
+images and uses that image set for migration, restore, client, and capacity
+probes. It prints its report directory under `/tmp`. Package archives,
+database dumps, mirror copies, synthetic credentials, and captures stay
+under `/tmp`.
 
 ## Restore and client results
 
 The Phase 8 rehearsal backs up a stack with an active, a retained, and a ready generation. It destroys the disposable source stack and its backing directories before provisioning the distinct restore stack. The destination validates the independent archive, reconstructs the generation manifests and fences, checks persisted byte coordinates, and then replays all five public tool reads over HTTPS. The same drill checks missing and same-length damaged backup files before starting the proxy. [Operator backup and restore](publication.md#backup-and-restore)
 
-The fresh destination restored active generation 2 at publication sequence 2, retained generation 1, and ready generation 3. It verified 16 registered blobs by full BLAKE3 and length and checked 794 persisted ranges and line starts. The three reconstructed manifests and the decoded reads matched the baseline. Missing and same-length damaged inputs both stopped archive verification. The machine-readable result is `restore.json` in the Phase 8 evidence directory.
+In the 2026-11-23 rehearsal, the fresh destination restored active generation 2 at publication sequence 2, retained generation 1, and ready generation 3. It verified 16 registered blobs by full BLAKE3 and length and checked 794 persisted ranges and line starts. The three reconstructed manifests and the decoded reads matched the baseline. Missing and same-length damaged inputs both stopped archive verification. The machine-readable result is `restore.json` in the Phase 8 evidence directory. [Later schema 13 rehearsal](implementation-status.md#automatic-database-migration-at-startup)
 
 The compatibility checks use Python and curl with a verified HTTPS certificate and per-request MCP metadata. The table in the [MCP API guide](mcp.md#client-compatibility) identifies the tested clients, revision, and rejection behavior.
 
 ## Capacity methodology
 
-The harness uses two synthetic corpus sizes, with three warmup seconds and a 15-second measurement window at each concurrency. The mixed workload runs list, exact body search, original retrieval, section listing, and ripgrep through the TLS proxy. Separate test clients use distinct container addresses. The shared-source burst uses the host loopback proxy. The distinct-source admission burst holds a private PostgreSQL relation lock to keep admitted reads in flight long enough to test the cap.
+The 2026-11-23 benchmark used two synthetic corpus sizes, with three warmup seconds and a 15-second measurement window at each concurrency. The mixed workload ran list, exact body search, original retrieval, section listing, and ripgrep through the TLS proxy. Separate test clients used distinct container addresses. The shared-source burst used the host loopback proxy. The distinct-source admission burst held a private PostgreSQL relation lock to keep admitted reads in flight long enough to test the cap.
 
-Bulk fixture entries share an original and use metadata-only policy. The ripgrep case scans three reviewed synthetic originals. Charged bytes per second describe those scans through MCP. The fixture SQL plans use the same pinned PostgreSQL version and corpus rows used to seed the serving stacks. The measurements apply to this host, corpus, and workload.
+Bulk fixture entries shared an original and used the metadata-only policy
+in effect at the time. The ripgrep case scanned three reviewed synthetic
+originals. Charged bytes per second describe those scans through MCP.
+The fixture SQL plans used the same pinned PostgreSQL version and corpus
+rows used to seed the serving stacks. The measurements apply to that image
+set, host, corpus, and workload.
 
 | Synthetic RFCs | Clients | Successful calls/s | HTTP 429 | Typed tool rejections | Search p95, ms | Peak sampled serve MiB | Serve FDs | DB readers |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -52,7 +67,7 @@ At each corpus size, the 32-call shared-source burst returned 10 successes and 2
 
 ## Bounded official-source verification
 
-The Phase 0 HTTPS probe captured seven endpoints between 04:21:00 and 04:21:09 UTC on 2026-11-23. Atom and RSS each yielded 15 entries. The capped catalog prefix contained 261 complete entries. The Phase 2 sample on the qualified images reconciled a ready candidate while the active pointer stayed unset. It recorded two unavailable RFCXML bodies, one incomplete reference classification, and one partial section index.
+The Phase 0 HTTPS probe captured seven endpoints between 04:21:00 and 04:21:09 UTC on 2026-11-23. Atom and RSS each yielded 15 entries. The capped catalog prefix contained 261 complete entries. The Phase 2 sample on those images reconciled a ready candidate while the active pointer stayed unset. It recorded the legacy policy labels below, two unavailable RFCXML bodies, one incomplete reference classification, and one partial section index. [Later license-based sample](implementation-status.md#license-based-redistribution-and-whole-corpus-regex)
 
 | Official TXT | Capture time, UTC | Bytes | BLAKE3 | Recorded policy and section coverage |
 | --- | --- | ---: | --- | --- |
@@ -62,15 +77,20 @@ The Phase 0 HTTPS probe captured seven endpoints between 04:21:00 and 04:21:09 U
 
 ## Supply-chain review
 
-Trivy 0.76.2 used vulnerability database schema 2, published at 2026-11-23 01:05 UTC. Both Cargo locks had zero matched advisories. The checked-out source and each candidate image had zero secret matches. The four CycloneDX reports contained 17 components for serve, 25 for sync, 17 for feed, and 59 for PostgreSQL. The separate locked Rust dependency and license inventories cover statically linked components. The application and ripgrep lock SHA-256 values are `131194af5397c781fd833dc04e35b673924502690aae503c7bccb241aa429213` and `7a7d39cda8a03930e578f1dbb724e055771901842eca239e03b01e19da946a64`. [Trivy release](https://github.com/aquasecurity/trivy/releases/tag/v0.76.2)
+The 2026-11-23 audit predates the Maintenance image. Trivy 0.76.2 used vulnerability database schema 2, published at 2026-11-23 01:05 UTC. Both Cargo locks had zero matched advisories. The checked-out source and each candidate image had zero secret matches. The four CycloneDX reports contained 17 components for serve, 25 for sync, 17 for feed, and 59 for PostgreSQL. The separate locked Rust dependency and license inventories covered statically linked components. The recorded application and ripgrep lock SHA-256 values were `131194af5397c781fd833dc04e35b673924502690aae503c7bccb241aa429213` and `7a7d39cda8a03930e578f1dbb724e055771901842eca239e03b01e19da946a64`. [Trivy release](https://github.com/aquasecurity/trivy/releases/tag/v0.76.2)
 
 - Each service image reported seven medium and four low package findings in Alpine libraries. Use the image reports to track installed and fixed package versions.
-- The PostgreSQL image reported one critical, 26 high, 31 medium, three low, and one unknown finding. The installed `libxml2` is `2.13.9-r2`, and Alpine records a fix for CVE-2026-86144 in `2.13.9-r3`. The current official `postgres:19.0-alpine3.24` tag still resolved to the qualified index digest. An image refresh needs package verification, rescanning, and Compose requalification. [Alpine security database](https://secdb.alpinelinux.org/v3.24/main.json) · [Official PostgreSQL image](https://hub.docker.com/_/postgres)
+- The PostgreSQL image reported one critical, 26 high, 31 medium, three low, and one unknown finding. It contained `libxml2` `2.13.9-r2`, and the audit recorded Alpine's fix for CVE-2026-86144 in `2.13.9-r3`. At the time, the official `postgres:19.0-alpine3.24` tag resolved to the qualified index digest. An image refresh needs package verification, rescanning, and Compose requalification. [Alpine security database](https://secdb.alpinelinux.org/v3.24/main.json) · [Official PostgreSQL image](https://hub.docker.com/_/postgres)
 - The remaining PostgreSQL-image matches came from the bundled `gosu` Go binary, including Go TLS advisory GO-2026-4337. Compose starts PostgreSQL as UID 70, and the pinned image's entrypoint calls `gosu` for root startup. That narrows the normal startup path. Binary-level applicability remains open for release review. [Go advisory](https://pkg.go.dev/vuln/GO-2026-4337) · [Pinned PostgreSQL entrypoint](https://github.com/docker-library/postgres/blob/8672300fdf4f4ce8a8eac7511031fd08b6d2c886/docker-entrypoint.sh)
 
 ## Release review
 
-Rows A01–A39 passed for the local rootless profile. A40 is open for public release. Each `phaseN` reference is the corresponding log from `scripts/phase8/verify.sh`. Test rows for parser, storage, and crash injection include the isolated fixture builds. [Recorded commands and environment](implementation-status.md#phase-8)
+Rows A01–A39 passed in the 2026-11-23 local rootless run. A40 remained
+open. Reapply the matrix to the exact candidate image set and include
+fresh startup and migration results for the current schema. Each
+`phaseN` reference is the corresponding log from `scripts/phase8/verify.sh`.
+Test rows for parser, storage, and crash injection include the isolated
+fixture builds. [Recorded commands and environment](implementation-status.md#phase-8)
 
 | ID | Check | Observation and evidence |
 | --- | --- | --- |

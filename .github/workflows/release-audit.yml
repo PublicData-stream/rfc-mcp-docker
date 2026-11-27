@@ -19,7 +19,7 @@ jobs:
           RFC_PHASE8_CONTEXT: default
           RFC_PHASE8_IMAGE_PREFIX: rfc-mcp-audit
         run: |
-          for role in serve sync feed; do
+          for role in serve sync feed maintenance; do
             docker --context default build --target "$role" -t "$RFC_PHASE8_IMAGE_PREFIX-$role" .
           done
           bash scripts/phase8/audit.sh /tmp/rfc-mcp-release-audit
