@@ -9,7 +9,6 @@ import hashlib
 import hmac
 import importlib.util
 import json
-import hashlib
 from pathlib import Path
 import random
 import secrets
@@ -30,9 +29,10 @@ NOTICE = b"Original synthetic copyright and authorship notice.\r\n"
 CONTENT = NOTICE + "Élan TLS DTLS TLS-alpha\r\nuncut %_\\ path\x0c\n".encode()
 
 
-def search_driver(docker, prefix, target, skip_build):
-    image = f"{prefix}-search-fixture"
-    phase1.phase0.prepare_fixture_image(docker, phase2.REPO, "phase4-fixture", image, skip_build=skip_build)
+def search_driver(docker, prefix, target, skip_build, *, image=None):
+    if image is None:
+        image = f"{prefix}-search-fixture"
+        phase1.phase0.prepare_fixture_image(docker, phase2.REPO, "phase4-fixture", image, skip_build=skip_build)
     container = phase1.capture([*docker, "create", *phase1.phase0.local_image_args(), image,
                                 "/rfc-phase4-fixture"])
     try:
@@ -45,8 +45,8 @@ def search_driver(docker, prefix, target, skip_build):
 
 
 class Project(phase3.Project):
-    def search_command(self, service, *args):
-        options = ("-T", "-v", f"{self.search_driver}:/phase4/fixture-driver:ro",
+    def search_command(self, service, *args, driver=None):
+        options = ("-T", "-v", f"{driver or self.search_driver}:/phase4/fixture-driver:ro",
                    "--entrypoint", "/phase4/fixture-driver")
         if service == "serve":
             options += ("-v", f"{self.key_file}:/phase4/cursor-key:ro")
@@ -75,8 +75,8 @@ class Project(phase3.Project):
 
 
 @contextmanager
-def search_session(project):
-    with subprocess.Popen(project.search_command("serve"), env=project.env, text=True,
+def search_session(project, driver=None):
+    with subprocess.Popen(project.search_command("serve", driver=driver), env=project.env, text=True,
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
         def request(argument):
             proc.stdin.write(json.dumps(argument) + "\n")
@@ -161,6 +161,7 @@ def check_text_and_snippets(request):
         ('in::fulltext:"DTLS TLS-alpha\\r\\nuncut"', [102]),
         ('in::fulltext:"boundarytoken lastterm"', [100]),
         ("in::fulltext:'lastterm firstterm'", [100]),
+        ("in::fulltext:'lastterm firstterm FIRSTTERM'", [100]),
         ('in::fulltext:"firstterm lastterm"', []),
         ('in::fulltext:"Historical RFC bytes"', [101]),
         ('in::title:"%_\'; -- (SELECT)"', []),
@@ -170,6 +171,8 @@ def check_text_and_snippets(request):
     assert hit_ids(report) == [] and report["coverage"]["unknown"] == 1
     assert report["coverage"]["catalog_only"] == 1
     assert set(report["coverage"]["warnings"]) == {"incomplete_index", "incomplete_catalog"}
+    masked = page(request, 'in::title:"never matches any fixture" AND in::fulltext:\'absent\'')
+    assert masked["coverage"]["unknown"] == 0 and masked["coverage"]["unknown_text"] > 0
     expect_error(request, "in::title:'%_'", "invalid_query_syntax")
     expect_error(request, "in::title:'" + " ".join(f"word{n}" for n in range(65)) + "'", "query_too_complex")
     reply = expect_error(request, "in::title:'é\\q'", "invalid_query_syntax")
@@ -221,6 +224,8 @@ def check_corrupt_original(project, request, generation):
     try:
         result = page(request, query)
         assert result["hits"] == [] and result["coverage"]["unknown"] == 1
+        native = request({"query": "in::fulltext:'TLS'"})
+        assert 102 in hit_ids(native["result"]) and native["original_bytes"] == 0
     finally:
         project.run("run", "--rm", "--no-deps", "volume-admin", flip, "--", path, "O")
     assert hit_ids(page(request, query)) == [102]
@@ -325,7 +330,8 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
     template = 105 if bulk else 102
     rights = graph_rights(project, base, template, start, end)
     seed_edges = (
-        f"SELECT {generation}, n, 'obsoletes', 10000+mod(n,12) FROM generate_series({start},{end}) n"
+        f"SELECT {generation}, n, 'obsoletes', 10000+mod(n,12) FROM generate_series({start},{end}) n "
+        f"UNION ALL SELECT {generation}, {start}, 'obsoletes', 102"
         if bulk else "VALUES " + ",".join(f"({generation},{a},'{kind}',{b})" for a, kind, b in edges)
     )
     assignments = ("" if bulk else "VALUES " + ",".join(
@@ -333,6 +339,10 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
     covered = ("CASE WHEN family='obsoletes' THEN 'complete' ELSE 'unavailable' END" if bulk
                else "coalesce(s.state, 'unavailable')")
     coverage_join = ("" if bulk else f"LEFT JOIN ({assignments}) s(rfc_id, kind, state) ON (s.rfc_id,s.kind)=(n,family)")
+    titles = ("CASE WHEN n BETWEEN 19001 AND 19003 THEN 'Oversized node '||n "
+              "ELSE 'Graph node '||n END" if bulk else "'Graph node '||n")
+    streams = ("CASE WHEN n BETWEEN 19001 AND 19003 THEN repeat('~',92000) ELSE stream END"
+               if bulk else "stream")
     script = f"""
         BEGIN;
         SELECT pg_advisory_xact_lock(-1::bigint);
@@ -360,6 +370,7 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
           FROM generate_series({start},{end}) n CROSS JOIN rfc.generation_documents m
           JOIN rfc.document_lexemes l ON l.document_version=m.document_version
           WHERE m.generation_id={base} AND m.rfc_id={template};
+        {f"INSERT INTO rfc.document_lexemes VALUES (sha256(convert_to('phase4-doc-{end}','UTF8')), 'tailfixture');" if bulk else ""}
         UPDATE rfc.document_versions SET sealed=true WHERE rfc_id BETWEEN {start} AND {end};
         INSERT INTO rfc.generation_ingestion
           SELECT {generation},scope,catalog_before,catalog_after,policy_registry,catalog_only
@@ -392,7 +403,7 @@ def seed(project, base, sequence, start, end, edges, coverage, bulk=False):
         INSERT INTO rfc.generation_documents (generation_id,{copy_fields})
           SELECT {generation},n,sha256(convert_to('phase4-doc-'||n,'UTF8')),
                  sha256(convert_to('phase4-metadata-'||n,'UTF8')),catalog_observation,
-                 sha256(convert_to('phase4-txt-'||n,'UTF8')),'Graph node '||n,stream,
+                 sha256(convert_to('phase4-txt-'||n,'UTF8')),{titles},{streams},
                  publication_date,current_status,publication_month,NULL
           FROM generate_series({start},{end}) n CROSS JOIN rfc.generation_documents
           WHERE generation_id={base} AND rfc_id={template};
@@ -512,13 +523,27 @@ def seeded_graph_and_benchmark(project, request, base):
     large = seed(project, graph, 5, 10012, 19992, (), {}, bulk=True)
     assert int(project.sql(f"SELECT count(*) FROM rfc.generation_documents WHERE generation_id={large}")) == 10_000
     project.sql("ANALYZE rfc.generation_documents; ANALYZE rfc.rfc_relations; ANALYZE rfc.document_lexemes")
-    row_bound = "relation::references:1"
+    absent = "relation::references:1"
+    tail = "in::fulltext:'tailfixture'"
     byte_bound = 'in::fulltext:"never found in the fixture"'
-    first = page(request, row_bound)
-    assert first["scan_truncated"] and first["hits"] == [] and first["coverage"]["evaluated"] == 512
-    second = page(request, row_bound, cursor=first["next_cursor"])
-    assert second["scan_truncated"] and second["hits"] == [] and second["coverage"]["evaluated"] == 512
-    assert first["next_cursor"] != second["next_cursor"]
+    first = page(request, absent)
+    assert not first["scan_truncated"] and first["hits"] == [] and first["coverage"]["evaluated"] == 10_000
+    assert first["next_cursor"] is None
+    late = page(request, tail, limit=1)
+    assert hit_ids(late) == [19992] and late["next_cursor"] is None and not late["scan_truncated"]
+    assert late["coverage"]["evaluated"] == 10_000
+    native_page = page(request, "in::fulltext:'tailfixture' OR in::title:\"Graph node 18000\"", limit=1)
+    assert hit_ids(native_page) == [18000] and native_page["next_cursor"]
+    next_page = page(request, "in::fulltext:'tailfixture' OR in::title:\"Graph node 18000\"",
+                     limit=1, cursor=native_page["next_cursor"])
+    assert hit_ids(next_page) == [19992] and next_page["next_cursor"] is None
+    assert native_page["coverage"]["evaluated"] + next_page["coverage"]["evaluated"] == 10_000
+    oversized = 'in::title:"Oversized node "'
+    first = page(request, oversized)
+    assert first["response_truncated"] and hit_ids(first) == [19001, 19002]
+    second = page(request, oversized, cursor=first["next_cursor"])
+    assert hit_ids(second) == [19003] and second["next_cursor"] is None
+    assert first["coverage"]["evaluated"] + second["coverage"]["evaluated"] == 10_000
     first = page(request, byte_bound)
     assert first["scan_truncated"] and first["hits"] == [] and 0 < first["coverage"]["evaluated"] < 512
     expensive = " OR ".join(f'in::fulltext:"missing {number}"' for number in range(64))
@@ -528,7 +553,10 @@ def seeded_graph_and_benchmark(project, request, base):
     for label, query in [
         ("title_token", "in::title:'graph node'"),
         ("inbound_obsolescence", "is::obsoleted:true"),
-        ("row_budget", row_bound),
+        ("row_budget", absent),
+        ("late_token", tail),
+        ("common_token", "in::fulltext:'large'"),
+        ("maximum_terms", "in::fulltext:'" + " ".join(f"word{n}" for n in range(64)) + "'"),
         ("original_byte_budget", byte_bound),
         ("comparison_budget", expensive),
     ]:
@@ -540,18 +568,58 @@ def seeded_graph_and_benchmark(project, request, base):
         timings = sorted(timings[1:])
         print(f"{label}: median={statistics.median(timings):.2f} ms max={timings[-1]:.2f} ms "
               f"evaluated={result['result']['coverage']['evaluated']}", flush=True)
-        if label in ("title_token", "inbound_obsolescence", "row_budget"):
+        if label in ("title_token", "inbound_obsolescence", "row_budget", "late_token", "common_token"):
             plan = request({"explain": query})
             assert "result" in plan, plan
             sample = "\n".join(plan["result"])
-            assert "generation_documents_pkey" in sample and "source_observations_pkey" in sample, sample
-            assert "Seq Scan on relation_coverage" not in sample, sample
-            assert "generation_source_evidence_pkey" in sample, sample
-            assert "Seq Scan on generation_source_evidence" not in sample, sample
-            assert "Bitmap Heap Scan on generation_source_evidence" not in sample, sample
-            if label == "inbound_obsolescence":
-                assert "relations_inbound_obsolescence" in sample, sample
+            assert "generation_documents" in sample and "source_observations" not in sample, sample
+            assert "generation_source_evidence" not in sample, sample
+            if label == "late_token":
+                assert "document_lexemes_lookup" in sample, sample
             print(label + " EXPLAIN (ANALYZE, BUFFERS)\n" + sample, flush=True)
+    if project.baseline_driver:
+        with search_session(project, project.baseline_driver) as baseline:
+            for query in (absent, tail, "in::title:'graph node 18000'", "relation::obsoletes:10000",
+                          "!(relation::normative_reference:10001 OR in::fulltext:'TLS')"):
+                report = [complete_sequence(engine, query) for engine in (baseline, request)]
+                assert report[0]["semantic"] == report[1]["semantic"], (query, report)
+                print(json.dumps({"query": query, "baseline": report[0]["metrics"],
+                                  "native": report[1]["metrics"]}), flush=True)
+    project.sql("ALTER ROLE rfc_serve IN DATABASE rfc SET temp_file_limit='0'")
+    try:
+        with search_session(project) as constrained:
+            result = constrained({"query": absent, "force_spill": True})
+            assert result.get("error") == "resource_limit_exceeded", result
+            assert page(constrained, absent)["coverage"]["evaluated"] == 10_000
+        phase3.assert_readers_idle(project.sql)
+    finally:
+        project.sql("ALTER ROLE rfc_serve IN DATABASE rfc SET temp_file_limit='32MB'")
+
+
+def complete_sequence(request, query):
+    matches, warnings = [], set()
+    totals = dict.fromkeys(("evaluated", "unknown", "unknown_text", "unknown_relationships"), 0)
+    times = []
+    first_nonempty = None
+    cursor = None
+    while True:
+        reply = request({"query": query, "limit": 100, "cursor": cursor})
+        assert "result" in reply, (query, reply)
+        times.append(reply["elapsed_us"])
+        result = reply["result"]
+        matches.extend(result["hits"])
+        if matches and first_nonempty is None:
+            first_nonempty = sum(times)
+        warnings.update(result["coverage"]["warnings"])
+        for name in totals:
+            totals[name] += result["coverage"][name]
+        cursor = result["next_cursor"]
+        if not cursor:
+            break
+        assert len(times) <= 200, query
+    return {"semantic": (matches, totals, warnings, result["coverage"]["catalog_only"]),
+            "metrics": {"calls": len(times), "first_nonempty_us": first_nonempty,
+                        "total_us": sum(times), "max_us": max(times)}}
 
 
 def main():
@@ -559,6 +627,7 @@ def main():
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", default="rfc-phase4-final")
     parser.add_argument("--skip-fixture-build", action="store_true")
+    parser.add_argument("--baseline-search-image", help="pinned legacy Phase 4 image for cursor-chain comparison")
     args = parser.parse_args()
     if not __debug__:
         raise RuntimeError("Phase 4 requires assertions")
@@ -570,6 +639,11 @@ def main():
         search_driver(docker, args.image_prefix, driver, args.skip_fixture_build)
         project = Project(work / work.name, publication_driver, args.image_prefix, docker)
         project.search_driver = driver
+        project.baseline_driver = None
+        if args.baseline_search_image:
+            project.baseline_driver = work / "baseline-search-driver"
+            search_driver(docker, args.image_prefix, project.baseline_driver, True,
+                          image=args.baseline_search_image)
         project.key_file = work / "cursor-key"
         project.key_file.write_bytes(secrets.token_bytes(48))
         project.key_file.chmod(0o444)

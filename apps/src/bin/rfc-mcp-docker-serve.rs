@@ -57,6 +57,10 @@ async fn run(args: &[String]) -> ProbeResult {
             println!("{STORAGE_SCHEMA_VERSION}");
             Ok(())
         }
+        [option] if option == "--online-search-rollout" => {
+            println!("1");
+            Ok(())
+        }
         [option] if option == "--check-storage-schema" => {
             check_storage_schema(RuntimeRole::Serve).await
         }

@@ -384,6 +384,18 @@ async fn verify(client: &impl GenericClient, role: RuntimeRole) -> Result<()> {
         )
         .into());
     }
+    if role == RuntimeRole::Serve
+        && !client
+            .query_one(
+                "SELECT setting::integer BETWEEN 0 AND 32768
+                 FROM pg_catalog.pg_settings WHERE name='temp_file_limit'",
+                &[],
+            )
+            .await?
+            .try_get::<_, bool>(0)?
+    {
+        return Err("Serve requires a PostgreSQL temporary file limit of at most 32 MiB".into());
+    }
     let differences = client.query(PRIVILEGE_CHECK, &[&role.privileges()]).await?;
     if !differences.is_empty() {
         let differences: Vec<&str> = differences.iter().map(|row| row.get(0)).collect();

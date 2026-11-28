@@ -108,12 +108,16 @@ elif sys.argv[1] == "trusted":
         for sock in sockets:
             sock.close()
     print("Trusted peer identity and 16-request admission cap verified")
-elif sys.argv[1] == "cancel":
+elif sys.argv[1] in {"cancel", "cancel-search"}:
     body = json.loads(discovery())
     body["method"] = "tools/call"
-    body["params"].update(name="get", arguments={"id": 2119})
+    tool, arguments = (("get", {"id": 2119}) if sys.argv[1] == "cancel" else
+                       ("search", {"query": "in::fulltext:'TLS'"}))
+    body["params"].update(name=tool, arguments=arguments)
     encoded = json.dumps(body).encode()
-    with start(headers("tools/call", sys.argv[2] if len(sys.argv) > 2 else "203.0.113.1"), encoded, len(encoded)) as sock:
+    fields = headers("tools/call", sys.argv[2] if len(sys.argv) > 2 else "203.0.113.1")
+    fields["Mcp-Name"] = tool
+    with start(fields, encoded, len(encoded)) as sock:
         print("sent", flush=True)
         assert sys.stdin.readline().strip() == "disconnect"
         sock.shutdown(socket.SHUT_RDWR)

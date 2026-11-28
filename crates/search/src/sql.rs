@@ -8,12 +8,17 @@ use crate::{
     query::{Direction, Expr, Family, Field, Match, Predicate, QueryError},
 };
 
+mod native;
+pub(crate) use native::{HYDRATE, configure_native};
+
 const MAX_TERMS: usize = 64;
-const TOKENIZE: &str = "SELECT DISTINCT term.lexeme COLLATE pg_catalog.\"C\" AS lexeme
-    FROM pg_catalog.ts_debug('pg_catalog.simple'::regconfig, $1::text) AS token
+const TOKENIZE: &str = "SELECT literal, ARRAY(
+    SELECT DISTINCT term.lexeme COLLATE pg_catalog.\"C\" AS lexeme
+    FROM pg_catalog.ts_debug('pg_catalog.simple'::regconfig, literal) AS token
     CROSS JOIN LATERAL pg_catalog.unnest(token.lexemes) AS term(lexeme)
     WHERE octet_length(token.token) < 2048 AND octet_length(term.lexeme) BETWEEN 1 AND 2047
-    ORDER BY lexeme LIMIT 65";
+    ORDER BY lexeme LIMIT 65)
+    FROM pg_catalog.unnest($1::text[]) input(literal)";
 
 pub(crate) const WINDOW: &str = "SELECT m.rfc_id::integer, d.byte_length::bigint,
     coalesce(sr.evidence->>'search'='true',false) AND (coalesce(cap.denied,0) & 8) = 0
@@ -139,6 +144,11 @@ pub(crate) struct Plan {
     expression: String,
 }
 
+pub(crate) enum Strategy {
+    Native,
+    Hybrid,
+}
+
 impl Plan {
     pub fn new(expr: Expr) -> Self {
         let mut leaves = Vec::new();
@@ -189,21 +199,29 @@ impl Plan {
     }
 
     pub async fn normalize(&mut self, tx: &Transaction<'_>) -> Result<(), SearchError> {
+        let literals: Vec<_> = self
+            .leaves
+            .iter()
+            .filter_map(|leaf| match &leaf.predicate {
+                Predicate::Text(_, Match::Token, literal) => Some(literal.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if literals.is_empty() {
+            return Ok(());
+        }
+        let normalized: std::collections::BTreeMap<String, Vec<String>> = tx
+            .query(TOKENIZE, &[&literals])
+            .await?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
         let mut total = 0;
-        let mut normalized = std::collections::BTreeMap::<String, Vec<String>>::new();
         for leaf in &mut self.leaves {
             if let Predicate::Text(_, Match::Token, literal) = &leaf.predicate {
-                if let Some(terms) = normalized.get(literal) {
-                    leaf.terms.clone_from(terms);
-                } else {
-                    leaf.terms = tx
-                        .query(TOKENIZE, &[literal])
-                        .await?
-                        .iter()
-                        .map(|row| row.get::<_, String>(0))
-                        .collect();
-                    normalized.insert(literal.clone(), leaf.terms.clone());
-                }
+                leaf.terms.clone_from(&normalized[literal]);
                 if leaf.terms.is_empty() {
                     return Err(QueryError::new(
                         "invalid_query_syntax",
@@ -224,6 +242,14 @@ impl Plan {
             }
         }
         Ok(())
+    }
+
+    pub fn strategy(&self) -> Strategy {
+        if self.exact.is_empty() {
+            Strategy::Native
+        } else {
+            Strategy::Hybrid
+        }
     }
 
     pub fn compile(&self) -> Evaluation {
@@ -355,6 +381,7 @@ enum Parameter {
     Literal(String),
     Terms(Vec<String>),
     Rfc(i32),
+    Numbers(Vec<i32>),
 }
 
 pub(crate) struct Evaluation {
@@ -363,13 +390,17 @@ pub(crate) struct Evaluation {
 }
 
 impl Evaluation {
-    pub fn bind<'a>(&'a self, scope: [&'a (dyn ToSql + Sync); 5]) -> Vec<&'a (dyn ToSql + Sync)> {
+    pub fn bind<'a, const N: usize>(
+        &'a self,
+        scope: [&'a (dyn ToSql + Sync); N],
+    ) -> Vec<&'a (dyn ToSql + Sync)> {
         scope
             .into_iter()
             .chain(self.params.iter().map(|parameter| match parameter {
                 Parameter::Literal(value) => value as &(dyn ToSql + Sync),
                 Parameter::Terms(value) => value,
                 Parameter::Rfc(value) => value,
+                Parameter::Numbers(value) => value,
             }))
             .collect()
     }
@@ -391,6 +422,15 @@ mod tests {
             matches!(&evaluation.params[0], Parameter::Literal(value) if value == "%_'; -- (SELECT) É")
         );
         assert!(matches!(&evaluation.params[1], Parameter::Rfc(12345)));
+        let native = plan.compile_native();
+        assert!(!native.sql.contains("12345"));
+        assert!(!native.sql.contains("%_'; -- (SELECT) É"));
+        assert!(
+            native
+                .params
+                .iter()
+                .any(|param| matches!(param, Parameter::Numbers(ids) if ids == &[12345]))
+        );
     }
 
     #[test]

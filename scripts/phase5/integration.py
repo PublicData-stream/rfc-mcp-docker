@@ -478,20 +478,23 @@ def block_corpus(project):
 def cancellation(project, client):
     blocked = "wait_event_type='Lock'"
     with block_corpus(project):
-        with subprocess.Popen(project.command("exec", "-T", "proxy", "python3", "-B", "/phase5/direct.py", "cancel"),
-                              env=project.env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE) as request:
-            try:
-                assert select.select([request.stdout], [], [], 6)[0] and request.stdout.readline().strip() == "sent"
-                pids = phase3.wait_for_readers(project.sql, blocked)
-                assert len(pids) == 1, pids
-            finally:
-                started = time.monotonic()
-                _, errors = request.communicate("disconnect\n", timeout=5)
-            assert request.returncode == 0, errors
-            phase3.assert_readers_idle(project.sql, gone=pids)
-            print(f"Disconnected database session was gone after {(time.monotonic() - started) * 1000:.0f} ms",
-                  flush=True)
+        for mode in ("cancel", "cancel-search"):
+            with subprocess.Popen(
+                project.command("exec", "-T", "proxy", "python3", "-B", "/phase5/direct.py", mode),
+                env=project.env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ) as request:
+                try:
+                    assert select.select([request.stdout], [], [], 6)[0] and request.stdout.readline().strip() == "sent"
+                    pids = phase3.wait_for_readers(project.sql, blocked)
+                    assert len(pids) == 1, pids
+                finally:
+                    started = time.monotonic()
+                    _, errors = request.communicate("disconnect\n", timeout=5)
+                assert request.returncode == 0, errors
+                phase3.assert_readers_idle(project.sql, gone=pids)
+                print(f"{mode} database session was gone after {(time.monotonic() - started) * 1000:.0f} ms",
+                      flush=True)
         with ThreadPoolExecutor(max_workers=1) as work:
             call = work.submit(client.call, "get", id=2119, _error="deadline_exceeded")
             pids = phase3.wait_for_readers(project.sql, blocked)
@@ -586,29 +589,38 @@ def policy_revocation(project, client, retained):
     cursor = first["next_cursor"]
     assert cursor
     assert first["notice_groups"][0]["policy"]["decision"] == "whole_paginated"
+    search_query = "in::fulltext:'TLS'"
+    search_cursor = client.call("search", query=search_query, limit=1)[0]["next_cursor"]
+    assert search_cursor
 
     # Hold the writer fence until the HTTP response is waiting at its final
     # authorization check. The reader has already selected the original.
     with subprocess.Popen(project.psql(), env=project.env, text=True, bufsize=1,
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as sql:
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             try:
                 sql.stdin.write("BEGIN; SET LOCAL ROLE rfc_sync; SELECT pg_try_advisory_xact_lock(-4::bigint);\n")
                 sql.stdin.flush()
                 assert sql.stdout.readline().strip() == "t"
                 pending = executor.submit(client.call, "get", id=105, max_bytes=16,
                                           _error="source_policy_restricted")
-                query = ("SELECT EXISTS (SELECT FROM pg_locks WHERE locktype='advisory' "
-                         "AND objid=4294967292::oid AND mode='ShareLock' AND NOT granted)")
+                second_client = Client(client.port, project.directory / "certs/ca.crt")
+                second = executor.submit(second_client.rpc, "tools/call", name="search", arguments={
+                    "query": search_query, "limit": 1, "cursor": search_cursor,
+                })
+                query = ("SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                         "AND objid=4294967292::oid AND mode='ShareLock' AND NOT granted")
                 deadline = time.monotonic() + 8
-                while project.sql(query) != "t":
-                    assert not pending.done() and time.monotonic() < deadline
+                while project.sql(query) != "2":
+                    assert not pending.done() and not second.done() and time.monotonic() < deadline
                     time.sleep(0.05)
                 sql.stdin.write("SELECT rfc.restrict_policy(105,'metadata_only','rights_revoked',"
                                 "'isolated synthetic qualification',0); COMMIT;\n")
                 sql.stdin.flush()
                 assert sql.stdout.readline().strip() == "1"
                 pending.result(timeout=12)
+                result, _ = second.result(timeout=12)
+                assert result["isError"] and result["structuredContent"]["code"] == "cursor_expired", result
             finally:
                 sql.stdin.close()
                 sql.stdin = None
@@ -627,11 +639,14 @@ def policy_revocation(project, client, retained):
                               "--expect-epoch", str(epoch)))
         assert f"rights epoch {epoch + 1}" in subprocess.check_output(command, env=project.env, text=True, timeout=30)
         result = client.call("rg", pattern="TLS", ids=[108])[0]
+        native = client.call("search", query="in::fulltext:'TLS'", include_snippets=True)[0]
         if operation == "excerpt":
             assert result["scan_complete"] and result["matches"]
             assert all(hit["content_omitted_reason"] == "source_policy_restricted" for hit in result["matches"])
+            assert any(hit["id"] == 108 and not hit.get("excerpts") for hit in native["hits"])
             assert bytes_from(client.call("get", id=108)[0]["original"]) == RG_ORIGINAL
         else:
+            assert 108 not in [hit["id"] for hit in native["hits"]]
             assert not result["scan_complete"] and not result["matches"] and result["omitted"][0]["id"] == 108
     print("Policy diagnostics, exact bytes, buffered revocation and stale cursor checks passed", flush=True)
 

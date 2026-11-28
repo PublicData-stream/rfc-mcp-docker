@@ -130,7 +130,8 @@ private spool and audit filesystems, and the independent backup storage.
 Preserve the leases and cooldown recorded in the old spool. Remove legacy
 bulk and HTTPS shadow overrides from the target command.
 
-- For a running deployment, close the external ingress route and run the host deploy command. It stops Feed, gracefully stops Sync and Serve, stops PostgreSQL when required, runs the maintenance checks, and verifies Serve through MCP before it starts Sync and Feed.
+- For an online search rollout on an existing PostgreSQL 19, schema 13 deployment, change only the qualified `RFC_SERVE_IMAGE` pin and run the host deploy command. Keep the installed Sync, Feed, Maintenance, and PostgreSQL pins and the existing cursor key. The command automatically chooses the online path after checking the running deployment. It keeps PostgreSQL, Sync, and Feed online and briefly interrupts MCP while replacing the single Serve container.
+- For a full-stack upgrade, close the external ingress route and run the same host deploy command. It stops Feed, gracefully stops Sync and Serve, stops PostgreSQL when required, runs maintenance, and verifies Serve before it starts Sync and Feed.
 - For a stopped deployment, use `compose up -d --wait` with the same project and backing volumes. To apply maintenance and check storage while keeping applications stopped, use the second command below.
 
 ~~~sh
@@ -153,6 +154,17 @@ readiness and checks the MCP listing against the stored generation and
 publication sequence. If it finds an eligible whole-file read, it also
 reassembles the returned bytes and verifies their length and BLAKE3 digest.
 Verify the external HTTPS proxy path separately before reopening ingress.
+
+The online path sets a PostgreSQL temporary-file cap of at most 32 MiB per
+Serve backend. It uses the existing PostgreSQL peer connection and applies
+the setting to fresh Serve connections. It then checks readiness, MCP
+discovery, and a native search. The application schema, corpus, and generation
+history require no migration or re-ingestion. Maintenance provisions the cap
+for stopped and fresh deployments. If replacement or verification fails,
+the deploy command restores the previous image and role setting. Rerun
+`deploy` to recover an interrupted attempt. Keep the previous Serve image
+available locally during rollout. To roll back after a successful rollout,
+restore the previous Serve pin and run `deploy` again.
 
 The runner supports complete application schema histories 9 through 13. It
 also imports a dedicated RFC PostgreSQL 18 cluster from `18/docker` or

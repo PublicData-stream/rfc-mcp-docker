@@ -439,6 +439,7 @@ def prepare(source, major, target):
             history = get_history(live)
             expect_history(history, target)
             if major == 19 and len(history) == target:
+                sql(live, args=("-f", str(MIGRATIONS / "serve-resource-limits.sql")))
                 print(f"PostgreSQL 19 already uses application schema {target}")
                 return
             dedicated(live)
@@ -446,7 +447,9 @@ def prepare(source, major, target):
             init(staged)
             with cluster(staged, 19, sockets / "restore") as restored:
                 token = backup(live, restored, major, source_id, history, files)
-                migrate(restored if major == 18 else live, history, target, files)
+                destination = restored if major == 18 else live
+                migrate(destination, history, target, files)
+                sql(destination, args=("-f", str(MIGRATIONS / "serve-resource-limits.sql")))
         if major == 18:
             publish_json(staged / RECEIPT, {"source": source_id, "target": control(staged, 19)[0], "backup": token})
             install(staged)

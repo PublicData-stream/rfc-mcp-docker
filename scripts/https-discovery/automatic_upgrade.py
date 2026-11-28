@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 
 from compose_upgrade import (HISTORY, INVENTORY, SERVE, SYNC, FEED, PSQL, ROOT, dump,
                              hold_coordinator, phase7, rejected)
@@ -242,6 +243,87 @@ pg_restore --exit-on-error --single-transaction -d rfc /tmp/source.dump
     print(f"Automatic PostgreSQL 18 upgrade passed for {relative}", flush=True)
 
 
+@contextmanager
+def derived_serve(stack, image, *, broken=False):
+    # Use the locally loaded image for CI, including runners with no prior release.
+    name = f"{stack.name}-{'broken' if broken else 'previous'}"
+    container = phase7.phase1.capture([*stack.docker, "create", image])
+    try:
+        change = "LABEL rfc.test.online-upgrade=previous"
+        if broken:
+            command = 'test "$#" -gt 0; exec /usr/local/bin/rfc-mcp-docker-serve "$@"'
+            change = "ENTRYPOINT " + json.dumps(["/bin/sh", "-ec", command, "serve"])
+        subprocess.run([*stack.docker, "commit", "--change", change, container, name], check=True,
+                       stdout=subprocess.DEVNULL, timeout=30)
+        yield name
+    finally:
+        subprocess.run([*stack.docker, "rm", "-f", container], check=True, stdout=subprocess.DEVNULL, timeout=20)
+        subprocess.run([*stack.docker, "image", "rm", name], check=False, stdout=subprocess.DEVNULL, timeout=20)
+
+
+def automatic_online(stack, archive, baseline):
+    candidate = stack.env["RFC_SERVE_IMAGE"]
+    with derived_serve(stack, candidate) as previous, derived_serve(stack, candidate, broken=True) as broken:
+        previous = baseline or previous
+        stack.env["RFC_SERVE_IMAGE"] = previous
+        stack.provision()
+        stack.restore(archive)
+        if baseline:
+            stack.sql("-c", "ALTER ROLE rfc_serve IN DATABASE rfc RESET temp_file_limit")
+        stack.run("up", "-d", "--wait", SERVE, SYNC, FEED, "test-proxy", timeout=180)
+        port = int(stack.capture("port", "test-proxy", "8443").rsplit(":", 1)[1])
+        stack.client = phase7.phase5.Client(port, stack.ca)
+
+        def current():
+            return {service: (row["Id"], row["State"]["StartedAt"])
+                    for service in ("postgres", SYNC, FEED) if (row := stack.inspect(service))}
+
+        def search(cursor=None):
+            arguments = {"query": "is::obsoleted:true OR is::obsoleted:false", "limit": 1}
+            if cursor is not None:
+                arguments["cursor"] = cursor
+            result, _ = stack.client.rpc("tools/call", name="search", arguments=arguments)
+            assert not result["isError"], result
+            return result["structuredContent"]
+
+        stamp, database = current(), tables(stack)
+        old = stack.inspect(SERVE)
+        first = search()
+        assert first["next_cursor"] and first["hits"]
+
+        # The candidate passes schema and storage checks and fails only at runtime.
+        stack.env["RFC_SERVE_IMAGE"] = broken
+        rejected([*host_command(stack), "deploy"], stack.env, "Restored the previous Serve image")
+        assert stack.inspect(SERVE)["Image"] == old["Image"] and current() == stamp
+        if baseline:
+            assert stack.sql("-c", "SELECT count(*) FROM pg_db_role_setting, unnest(setconfig) s "
+                             "WHERE s LIKE 'temp_file_limit=%'") == "0"
+        assert search(first["next_cursor"])["hits"]
+
+        stack.env["RFC_SERVE_IMAGE"] = candidate
+        command = [*host_command(stack), "deploy"]
+        report = subprocess.check_output(command, env=stack.env, text=True, timeout=150)
+        assert "Replaced Serve with PostgreSQL, Sync, and Feed online" in report, report
+        second = search(first["next_cursor"])
+        assert not second["scan_truncated"] and second["hits"][0]["id"] > first["hits"][0]["id"]
+        assert current() == stamp and tables(stack) == database
+        assert stack.sql("-c", "SELECT has_parameter_privilege('rfc_serve','temp_file_limit','SET')") == "f"
+        active = stack.inspect(SERVE)["Id"]
+        report = subprocess.check_output(command, env=stack.env, text=True, timeout=100)
+        assert "already running the requested image" in report
+        assert stack.inspect(SERVE)["Id"] == active
+
+        stack.env["RFC_SERVE_IMAGE"] = previous
+        report = subprocess.check_output(command, env=stack.env, text=True, timeout=150)
+        assert "Replaced Serve with PostgreSQL, Sync, and Feed online" in report
+        third = search(second["next_cursor"])
+        assert third["hits"][0]["id"] > second["hits"][0]["id"] and current() == stamp
+        if not baseline:
+            stack.run("rm", "--force", "--stop", SERVE)
+            stack.env["RFC_SERVE_IMAGE"] = candidate
+    print("Automatic online Serve replacement, failure recovery, repeated deploy and cursor rollback passed", flush=True)
+
+
 def prepare_seed(work, prefix, docker):
     driver = work / "publication-driver"
     phase7.phase5.phase3.fixture_driver(docker, prefix, driver)
@@ -260,10 +342,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--context", default="rootless")
     parser.add_argument("--image-prefix", required=True)
+    parser.add_argument("--baseline-serve-image", help="pinned pre-search-change Serve image for online rehearsal")
     parser.add_argument("--case", action="append",
-                        choices=("fresh", "9", "10", "11", "12", "pg18-docker", "pg18-custom"))
+                        choices=("fresh", "9", "10", "11", "12", "pg18-docker", "pg18-custom", "online"))
     args = parser.parse_args()
-    selected = set(args.case or ("fresh", "9", "10", "11", "12", "pg18-docker", "pg18-custom"))
+    selected = set(args.case or ("fresh", "9", "10", "11", "12", "pg18-docker", "pg18-custom", "online"))
     docker = ["docker", "--context", args.context]
     with tempfile.TemporaryDirectory(prefix="rfc-auto-upgrade-", dir="/tmp") as directory:
         work = Path(directory)
@@ -295,6 +378,13 @@ def main():
                 case.mkdir()
                 with phase7.deployment(case, seed, args.image_prefix, label_prefix="fresh-") as stack:
                     fresh(stack)
+            if "online" in selected:
+                case = work / f"{work.name}-online"
+                case.mkdir()
+                (case / "tls").mkdir()
+                phase7.phase0.make_leaf(seed.directory / "certs", "localhost", case / "tls")
+                with phase7.deployment(case, seed, args.image_prefix, label_prefix="on-") as stack:
+                    automatic_online(stack, archive, args.baseline_serve_image)
             for version in (9, 10, 11, 12):
                 if str(version) not in selected:
                     continue

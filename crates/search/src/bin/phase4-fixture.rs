@@ -39,17 +39,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = io::stdout().lock();
     while let Some(line) = input.recv().await {
         let line = line?;
-        let value: Value = serde_json::from_str(&line)?;
+        let mut value: Value = serde_json::from_str(&line)?;
         let start = Instant::now();
-        let result = if let Some(query) = value.get("explain").and_then(Value::as_str) {
-            Search::explain_fixture(query).await.map(|plan| json!(plan))
-        } else {
-            let request: SearchRequest = serde_json::from_str(&line)?;
-            search.run(request).await.map(|page| json!(page))
-        };
+        let (result, original_bytes) =
+            if let Some(query) = value.get("explain").and_then(Value::as_str) {
+                (
+                    Search::explain_fixture(query).await.map(|plan| json!(plan)),
+                    0,
+                )
+            } else {
+                let force_spill = value
+                    .as_object_mut()
+                    .and_then(|request| request.remove("force_spill"))
+                    .is_some_and(|value| value.as_bool() == Some(true));
+                let request: SearchRequest = serde_json::from_value(value)?;
+                let (page, original_bytes) = search.measure_fixture(request, force_spill).await;
+                (page.map(|page| json!(page)), original_bytes)
+            };
         let elapsed_us = start.elapsed().as_micros();
         let response = match result {
-            Ok(result) => json!({"result": result, "elapsed_us": elapsed_us}),
+            Ok(result) => {
+                json!({"result": result, "elapsed_us": elapsed_us, "original_bytes": original_bytes})
+            }
             Err(error) => {
                 let span = match &error {
                     SearchError::Query(error) => json!([error.span.start, error.span.end]),

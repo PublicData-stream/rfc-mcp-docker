@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify a quiescent deployment and migrate its PostgreSQL catalog."""
+"""Deploy RFC MCP with automatic PostgreSQL maintenance when required."""
 
 import argparse
 import base64
@@ -13,6 +13,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +25,17 @@ set -o pipefail
 pg_dump -Fc --schema=rfc --lock-wait-timeout=5000 -U postgres -d rfc | "$@"
 """
 HISTORY = "SELECT version FROM rfc.schema_migrations ORDER BY version"
+SERVE_TEMP_LIMIT = "serve-resource-limits.sql"
+SERVE_TEMP_OVERRIDE = """
+SELECT coalesce(to_json((
+    SELECT substring(item FROM position('=' IN item) + 1)
+    FROM pg_catalog.pg_db_role_setting
+    CROSS JOIN LATERAL pg_catalog.unnest(setconfig) AS config(item)
+    WHERE setdatabase=(SELECT oid FROM pg_catalog.pg_database WHERE datname='rfc')
+      AND setrole=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname='rfc_serve')
+      AND item LIKE 'temp_file_limit=%'
+))::text,'null')
+"""
 INVENTORY = {
     "pointer": "SELECT generation_id,publication_sequence FROM rfc.active_generation",
     "readable": "SELECT id FROM rfc.generations WHERE state IN ('published','retained') ORDER BY id",
@@ -46,6 +58,8 @@ class Deployment:
         config = json.loads(capture([*self.compose, "config", "--format", "json"]))
         services = config["services"]
         self.services = services
+        self.secrets = config.get("secrets", {})
+        self.volumes = config["volumes"]
         self.live_paths = []
         for volume in ("mirror", "pgdata"):
             driver_options = config["volumes"][volume].get("driver_opts") or {}
@@ -88,13 +102,36 @@ class Deployment:
         if capture([*self.compose, "ps", "-q", "postgres"]).strip() != self.postgres:
             raise ValueError("PostgreSQL was replaced during the upgrade")
 
-    def schema_required(self, service):
-        return capture([*self.docker, "run", "--rm", "--pull=never", "--network=none",
-                        "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-                        self.ids[service], "--storage-schema-version"]).strip()
+    def schema_required(self, service, image=None):
+        return capture(self.image_command(image or self.ids[service], "--storage-schema-version")).strip()
+
+    def image_command(self, image, option):
+        return [*self.docker, "run", "--rm", "--pull=never", "--network=none",
+                "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", image, option]
+
+    def native_search(self, image):
+        probe = subprocess.run(self.image_command(image, "--online-search-rollout"),
+                               capture_output=True, text=True, timeout=60)
+        return probe.returncode == 0 and probe.stdout.strip() == "1"
 
     def exec(self, *args):
         return [*self.compose, "exec", "-T", "postgres", *args]
+
+    def service_container(self, service):
+        ids = capture([*self.compose, "ps", "--all", "--quiet", service]).splitlines()
+        if not ids:
+            return None
+        if len(ids) != 1:
+            raise ValueError(f"expected a single {service} container")
+        container = json.loads(capture([*self.docker, "inspect", ids[0]]))[0]
+        return {
+            "id": container["Id"],
+            "image": container["Image"],
+            "reference": container["Config"]["Image"],
+            "hash": container["Config"]["Labels"].get("com.docker.compose.config-hash"),
+            "running": container["State"]["Running"],
+            "started": container["State"]["StartedAt"],
+        }
 
     def probe(self, service, *options, timeout=90):
         self.verify_images()
@@ -214,6 +251,8 @@ def upgrade(args):
                   f"\\set upgrade_pointer '{pointer}'\n\\set upgrade_readable '{readable}'\n"
                   "\\i /migrations/migrate.sql")
             state = f"migration committed from schema {source} to {target}"
+        if stack.native_search(stack.ids[SERVE]):
+            query("\\i /migrations/serve-resource-limits.sql")
 
     print(state, flush=True)
     try:
@@ -271,7 +310,7 @@ def deployment_lock(stack):
     fd = os.open(root / key, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        yield root / f"{key}.online-serve.json"
     finally:
         os.close(fd)
 
@@ -381,16 +420,218 @@ ORDER BY b.byte_length, d.rfc_id LIMIT 1
     print(f"Serve MCP verified generation {generation} at sequence {sequence}", flush=True)
 
 
+@contextmanager
+def serve_override(stack, image):
+    with tempfile.TemporaryDirectory(prefix="rfc-serve-image-", dir="/tmp") as directory:
+        override = Path(directory, "compose.json")
+        override.write_text(json.dumps({"services": {SERVE: {"image": image}}}))
+        yield [*stack.compose, "-f", str(override)]
+
+
+def config_hashes(compose):
+    return dict(line.split() for line in capture([*compose, "config", "--hash", "*"]).splitlines())
+
+
+def set_serve_temp_limit(stack):
+    subprocess.run(stack.exec(*PSQL, "-f", "-"), input=(MIGRATIONS / SERVE_TEMP_LIMIT).read_text(),
+                   check=True, text=True, timeout=20)
+
+
+def restore_serve_temp_limit(stack, previous):
+    current = json.loads(capture(stack.exec(*PSQL, "-c", SERVE_TEMP_OVERRIDE)))
+    if current == previous:
+        return
+    if current != "32MB":
+        raise ValueError("Serve resource settings changed independently during deployment")
+    if previous is None:
+        capture(stack.exec(*PSQL, "-c", "ALTER ROLE rfc_serve IN DATABASE rfc RESET temp_file_limit"))
+    else:
+        statement = r"""SELECT format(
+            'ALTER ROLE rfc_serve IN DATABASE rfc SET temp_file_limit = %L', :'previous')
+\gexec
+"""
+        subprocess.run(stack.exec(*PSQL, "-v", f"previous={previous}", "-f", "-"),
+                       input=statement, text=True, check=True, timeout=20)
+
+
+def online_state(stack):
+    companions = ("postgres", SYNC, FEED, "db-maintenance")
+    deployed = {service: stack.service_container(service) for service in (*companions, SERVE)}
+    prior = deployed[SERVE]
+    if prior is None or not prior["running"]:
+        return None
+    if not all(deployed[service] and deployed[service]["running"] for service in companions[:3]):
+        return None
+    hashes = config_hashes(stack.compose)
+    if any(not deployed[service] or deployed[service]["hash"] != hashes.get(service)
+           or deployed[service]["image"] != stack.ids[service] for service in companions):
+        return None
+    for name in ("pgdata", "mirror", "db_backups"):
+        volume = stack.volumes[name]
+        actual, = json.loads(capture([*stack.docker, "volume", "inspect", volume["name"]]))
+        if actual["Driver"] != volume.get("driver", "local") or actual["Options"] != volume.get("driver_opts"):
+            return None
+    if prior["image"] == stack.ids[SERVE] and prior["hash"] != hashes.get(SERVE):
+        return None
+    with serve_override(stack, prior["reference"]) as compose:
+        if prior["hash"] != config_hashes(compose).get(SERVE):
+            return None
+    version = stack.services["db-maintenance"]["environment"]["RFC_STORAGE_SCHEMA_TARGET"]
+    if version != "13":
+        return None
+    actual = live_database(stack)
+    if actual is None:
+        raise ValueError("could not validate the live database for online Serve deployment")
+    if actual != (19, list(range(1, 14))):
+        return None
+    return {"prior": prior, "companions": {service: deployed[service] for service in companions}}
+
+
+def verify_online_serve(stack, *, native=False):
+    deadline = time.monotonic() + 55
+    query = "is::obsoleted:true OR is::obsoleted:false"
+    context_query = """SELECT a.generation_id,a.publication_sequence,p.rights_epoch
+        FROM rfc.active_generation a CROSS JOIN rfc.policy_state p WHERE a.singleton AND p.singleton"""
+
+    def context():
+        return capture(stack.exec(*PSQL, "-c", context_query)).strip()
+
+    while True:
+        before = context()
+        generation, sequence, _ = before.split("|")
+        probe = subprocess.run([*stack.compose, "exec", "-T", SERVE, "wget", "-S", "-O", "/dev/null",
+                                "-T", "3", "http://127.0.0.1:8781/ready"], capture_output=True, timeout=7)
+        ready = (generation and probe.returncode == 0) or (not generation and b" 503 " in probe.stderr)
+        if ready:
+            try:
+                serve_rpc(stack, "server/discover")
+                if generation:
+                    listing = serve_rpc(stack, "tools/call", "list", {"limit": 1})["structuredContent"]
+                    search = serve_rpc(stack, "tools/call", "search", {"query": query, "limit": 1})["structuredContent"]
+                    for result in (listing, search):
+                        if (result["generation_id"], result["publication_sequence"]) != (generation, sequence):
+                            raise ValueError("Serve did not read the active generation during online deployment")
+                    if native and search["scan_truncated"]:
+                        raise ValueError("online Serve did not complete the native search smoke check")
+            except (KeyError, ValueError, subprocess.SubprocessError):
+                if context() == before:
+                    raise
+            else:
+                if context() == before:
+                    return
+        if time.monotonic() >= deadline:
+            raise ValueError("Serve readiness or active generation did not stabilize during online deployment")
+        time.sleep(0.5)
+
+
+def verify_companions(stack, companions):
+    for service, container in companions.items():
+        if stack.service_container(service) != container:
+            raise ValueError(f"{service} changed during online Serve deployment")
+
+
+def recover_online_serve(stack, journal, state):
+    verify_companions(stack, state["companions"])
+    prior = state["prior"]
+    if stack.image_id(prior["image"]) != prior["image"]:
+        raise ValueError("previous Serve image is unavailable for rollback")
+    with serve_override(stack, prior["reference"]) as compose:
+        if config_hashes(compose).get(SERVE) != prior["hash"]:
+            raise ValueError("Serve configuration changed since the interrupted deployment")
+    restore_serve_temp_limit(stack, state["temp_override"])
+    current = stack.service_container(SERVE)
+    if current is None or not current["running"] or current["image"] != prior["image"]:
+        image = prior["image"]
+        try:
+            if stack.image_id(prior["reference"]) == image:
+                image = prior["reference"]
+        except subprocess.CalledProcessError:
+            pass
+        with serve_override(stack, image) as compose:
+            subprocess.run([*compose, "up", "-d", "--no-deps", "--force-recreate",
+                            "--pull", "never", SERVE], check=True, timeout=70)
+    verify_online_serve(stack)
+    verify_companions(stack, state["companions"])
+    journal.unlink()
+    print("Restored the previous Serve image", flush=True)
+
+
+def online_deploy(stack, journal, state, native):
+    prior = state["prior"]
+    if not native and not stack.native_search(prior["image"]):
+        return False
+    if any(stack.schema_required(service) != "13" for service in (SERVE, SYNC)):
+        raise ValueError("online Serve deployment requires schema 13 images")
+    if stack.schema_required(SERVE, prior["image"]) != "13":
+        raise ValueError("previous Serve image requires a different storage schema")
+    if prior["image"] == stack.ids[SERVE]:
+        if native:
+            set_serve_temp_limit(stack)
+            stack.probe("serve-db-preflight", "--phase1-check-storage")
+        verify_online_serve(stack, native=native)
+        print("Serve is already running the requested image", flush=True)
+        return True
+
+    secret = next(item for item in stack.services[SERVE]["secrets"] if item.get("target") == "cursor_key")
+    path = Path(stack.secrets[secret["source"]]["file"])
+    installed = capture([*stack.docker, "exec", prior["id"], "sha256sum", "/run/secrets/cursor_key"])
+    candidate = capture([*stack.docker, "run", "--rm", "--pull=never", "--network=none",
+                         "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                         "--user", stack.services[SERVE]["user"], "--entrypoint", "/bin/sh",
+                         "--mount", f"type=bind,src={path},dst=/run/cursor-key,readonly",
+                         stack.ids[SERVE], "-ec", 'test "$(wc -c </run/cursor-key)" -eq 48; '
+                         'sha256sum /run/cursor-key'])
+    if candidate.split()[0] != installed.split()[0]:
+        raise ValueError("online Serve deployment requires the installed cursor key")
+    state["temp_override"] = json.loads(capture(stack.exec(*PSQL, "-c", SERVE_TEMP_OVERRIDE)))
+    with tempfile.NamedTemporaryFile(mode="w", dir=journal.parent, delete=False) as pending:
+        try:
+            json.dump(state, pending)
+            pending.flush()
+            os.fsync(pending.fileno())
+            os.replace(pending.name, journal)
+        finally:
+            Path(pending.name).unlink(missing_ok=True)
+
+    try:
+        if native:
+            set_serve_temp_limit(stack)
+        stack.probe("serve-db-preflight", "--phase1-check-storage")
+        verify_companions(stack, state["companions"])
+        run_compose(stack, "up", "-d", "--no-deps", "--force-recreate",
+                    "--pull", "never", "--wait", "--wait-timeout", "30", SERVE, timeout=70)
+        if stack.service_container(SERVE)["image"] != stack.ids[SERVE]:
+            raise ValueError("online Serve deployment started an unexpected image")
+        verify_online_serve(stack, native=native)
+        verify_companions(stack, state["companions"])
+    except (KeyError, ValueError, OSError, subprocess.SubprocessError):
+        recover_online_serve(stack, journal, state)
+        raise
+    journal.unlink()
+    print("Replaced Serve with PostgreSQL, Sync, and Feed online", flush=True)
+    return True
+
+
 def automatic(args):
     stack = Deployment(args, manual=False)
     if args.command == "preflight" and not args.apply:
         validate_target(stack)
         return
-    with deployment_lock(stack):
+    with deployment_lock(stack) as journal:
+        if journal.exists():
+            recover_online_serve(stack, journal, json.loads(journal.read_text()))
+        native = stack.native_search(stack.ids[SERVE])
+        if args.command == "deploy":
+            state = online_state(stack)
+            if state and online_deploy(stack, journal, state, native):
+                return
         report = validate_target(stack)
         if args.command == "preflight":
             if stack.postgres and report["history"] != list(range(1, report["target_schema"] + 1)):
                 raise ValueError("stop the running PostgreSQL service before applying maintenance")
+            if native and stack.postgres:
+                stack.require_stopped()
+                set_serve_temp_limit(stack)
             apply_preflight(stack)
             return
         for service in (FEED, SYNC, SERVE):
@@ -400,6 +641,8 @@ def automatic(args):
             raise ValueError("application containers are still running, including one-shot commands")
         if stack.postgres and report["history"] != list(range(1, report["target_schema"] + 1)):
             run_compose(stack, "stop", "-t", "60", "postgres", timeout=85)
+        elif native and stack.postgres:
+            set_serve_temp_limit(stack)
         apply_preflight(stack)
         pointer = capture(stack.exec(*PSQL, "-c", INVENTORY["pointer"])).strip()
         run_compose(stack, "up", "-d", "--wait", "--wait-timeout", "60", "--pull", "never", SERVE)

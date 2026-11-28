@@ -19,7 +19,7 @@ Mcp-Name: get
 | Tool | Arguments | Behavior |
 | --- | --- | --- |
 | `list` | `limit`, `cursor`, `sort` | Lists published members with original TXT. Default order is `id_asc`. Use `id_desc` for descending order. Coverage reports the catalog-only count when known. |
-| `search` | `query`, `limit`, `cursor`, `include_snippets` | Uses the [RFC search DSL](search.md). Optional snippets carry original match offsets and complete notice bundles. Coverage describes incomplete or budgeted evaluation. |
+| `search` | `query`, `limit`, `cursor`, `include_snippets` | Uses the [RFC search DSL](search.md). PostgreSQL-native queries page by matching RFCs. Exact full-text predicates use bounded scans and may return empty pages with a cursor. Snippets carry original match offsets and notice bundles. |
 | `get` | `id`, `section_id`, `filter_section_text`, `range`, `max_bytes`, `cursor`, `format` | Retrieves whole TXT by default. Supply at most one selector. Heading text matches the parser's heading exactly, including case. Duplicate headings return candidate IDs. Section slices include descendants. |
 | `table` | `id`, `max_depth`, `limit`, `cursor` | Lists indexed sections in original order. Includes section IDs, depth, parent, parser coverage, and original bounds. Exact heading bytes and the parsed heading label appear when the source policy and complete notices permit excerpts. |
 | `rg` | `pattern`, `mode`, `case_sensitive`, `multiline`, `ids`, `context_lines`, `limit`, `cursor` | Searches verified original TXT in RFC and byte order. Returns match coordinates, source attribution, and original bytes where quoting is permitted. |
