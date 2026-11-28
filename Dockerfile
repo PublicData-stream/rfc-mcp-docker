@@ -133,11 +133,26 @@ FROM runtime AS phase6-fixture
 COPY --from=phase6-build /out/rfc-phase6-sync /out/rfc-phase6-feed /
 
 FROM docker.io/library/postgres:18.7-alpine3.24@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71 AS postgres18
+# Maintenance runs PostgreSQL tools directly as the postgres user.
+RUN rm -f /usr/local/bin/gosu
 
 FROM docker.io/library/postgres:19.0-alpine3.24@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188 AS maintenance
+ARG TARGETARCH
 ARG RFC_MAINTENANCE_VERSION=0.0.0
 ENV RFC_MAINTENANCE_VERSION=$RFC_MAINTENANCE_VERSION
-RUN apk add --no-cache python3=3.14.10-r2 b3sum=1.8.5-r0
+RUN set -eu; \
+    case "$TARGETARCH" in \
+        amd64) arch=x86_64; digest=b7d56295eab909875e724992b53ccc242fa792b40d682f303595f958a97b0224 ;; \
+        arm64) arch=aarch64; digest=1b955e97abfb07f24a1d6d4b7699be8f4f55fc180fd1f8191408335c36bf603c ;; \
+        *) exit 1 ;; \
+    esac; \
+    package=/tmp/libxml2-2.13.9-r5.apk; \
+    wget -q -O "$package" "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$arch/${package##*/}"; \
+    printf '%s  %s\n' "$digest" "$package" | sha256sum -c -; \
+    apk --no-logfile add --no-cache python3=3.14.10-r2 b3sum=1.8.5-r0; \
+    apk --no-logfile add --no-network --no-cache "$package"; \
+    rm "$package"; \
+    rm -f /usr/local/bin/gosu
 COPY --from=postgres18 /usr/local/ /opt/postgresql18/
 RUN /opt/postgresql18/bin/postgres --version
 COPY migrations /migrations

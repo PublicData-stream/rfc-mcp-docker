@@ -2283,3 +2283,47 @@ and rights checks, and release workflows.
 - The Feed scheduler probe passed backpressure, daemon attachment, hint
   coalescing, and catalog and inventory convergence. Its paced fixture
   recorded a minimum HTTPS start spacing of 1,000,521 µs.
+
+## Maintenance release image audit
+
+The two native builds for `2.8.0-build.f956a403` passed Phase 0 and the
+automatic migration probe. Trivy blocked publication because both
+`/usr/local/bin/gosu` and `/opt/postgresql18/bin/gosu` contained Go 1.24.6
+and matched critical advisory `CVE-2025-68121`. Each report also found
+seven fixable high-severity advisories in Alpine `libxml2` `2.13.9-r2`.
+[ARM64 audit](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/46095599242/artifacts/15244115013) ·
+[AMD64v3 audit](https://github.com/PublicData-stream/rfc-mcp-docker/actions/runs/46095599242/artifacts/15244025192)
+
+Maintenance invokes the PostgreSQL tools directly as UID/GID `70:70`.
+Its build removes both `gosu` paths from the runtime filesystem and
+installs the signed Alpine `libxml2` `2.13.9-r5` package after verifying
+the architecture-specific checksum.
+
+On 2026-11-28, the frozen Rust gate passed. The native AMD64v3 release
+runner built a disposable source snapshot at `1ff8364` with the same
+Dockerfile as this change. Phase 0 passed. The automatic Compose probe
+passed fresh startup, upgrades from schemas 9–12 to 13, and PostgreSQL
+18 to 19 cutover for both `18/docker` and `legacy/main`.
+
+Trivy `0.76.2` used database schema 2, updated at 01:04:49 UTC on
+2026-11-28. The four image reports and two Cargo reports passed the build
+and stable release policies. The maintenance report found zero
+advisories. A read-only container check confirmed both `gosu` paths were
+absent, `libxml2` was at `2.13.9-r5`, and PostgreSQL 19.0 and 18.7 both
+ran as UID/GID `70:70`.
+
+| Role | Audited AMD64v3 image ID |
+| --- | --- |
+| Serve | `sha256:8eb6fe88494f378c2aaf9eb3680822ab2799bf5a907090cc0240c97392fbb5e7` |
+| Sync | `sha256:a90975b9a8765e44915b7fbe2c4dd433afbfbee0a43915ed01798338b919c39d` |
+| Feed | `sha256:ea4c8e35ccad417600aacf33b85a2d541da5e305211520d326aa3f27226292be` |
+| Maintenance | `sha256:2644d52b7c1308db0117d7db681ce69fdd1c768122b95f337b0f9ccebb45dd54` |
+
+Rootless Minikube v1.39.0 on Kubernetes v1.37.0 used the same AMD64v3
+maintenance image. It migrated schema 12 to 13, verified the backup by
+restoring it, and preserved the catalog and single backup on repeat
+startup. The probe removed its namespace and profile.
+
+An emulated ARM64 build verified the aarch64 APK and ran both PostgreSQL
+binaries as `70:70` with `libxml2` `2.13.9-r5` and both `gosu` paths
+absent. Native ARM64 release qualification remains pending.
