@@ -18,6 +18,19 @@ MIX = (
     ("table", {"id": 102}),
     ("rg", {"pattern": "missing capacity token", "mode": "literal", "ids": [102, 108, 109]}),
 )
+SEARCH = (
+    ("common_token", {"query": "in::fulltext:'synthetic'"}),
+    ("rare_token", {"query": "in::fulltext:'tailfixture'"}),
+    ("absent_token", {"query": "in::fulltext:'absentfixturelexeme'"}),
+    ("maximum_terms", {"query": "in::fulltext:'" + " ".join(f"word{i}" for i in range(64)) + "'"}),
+    ("title_token", {"query": "in::title:'graph node'"}),
+    ("title_exact", {"query": 'in::title:"Graph node"'}),
+    ("forward", {"query": "relation::obsoletes:10000"}),
+    ("inverse", {"query": "relation::obsoleted_by:20001"}),
+    ("compound", {"query": "(is::obsoleted:false AND !in::fulltext:'tailfixture') OR relation::updates:100"}),
+    ("snippets", {"query": "in::fulltext:'tls'", "include_snippets": True}),
+    ("hybrid", MIX[1][1]),
+)
 
 
 class Connection(http.client.HTTPSConnection):
@@ -76,7 +89,7 @@ def main():
         assert time.monotonic() < deadline, "load client start deadline"
         time.sleep(0.025)
     mode = gate.read_text().strip()
-    assert mode in {"mixed", "admission", "comparison"}
+    assert mode in {"mixed", "admission", "comparison", "search"}
     if mode == "admission":
         records = [exchange("test-proxy", 8443, context, *MIX[1])]
     else:
@@ -85,7 +98,12 @@ def main():
         warmup = 0 if mode == "comparison" else 3
         while time.monotonic() < started + duration + warmup:
             tick = time.monotonic()
-            record = exchange("test-proxy", 8443, context, *MIX[index % len(MIX)])
+            if mode == "search":
+                label, arguments = SEARCH[index % len(SEARCH)]
+                record = exchange("test-proxy", 8443, context, "search", {**arguments, "limit": 20})
+                record[0] = label
+            else:
+                record = exchange("test-proxy", 8443, context, *MIX[index % len(MIX)])
             if tick >= started + warmup:
                 records.append(record)
             index += 1

@@ -65,6 +65,27 @@ Ripgrep charged 48,604–340,227 original bytes/s across the tiers. PostgreSQL p
 
 At each corpus size, the 32-call shared-source burst returned 10 successes and 22 HTTP 429s. With distinct sources and the held relation lock, 16 calls received HTTP 429 and the 16 admitted searches returned typed deadlines. Both profiles peaked at the 16-request admission cap. After load, the five-tool listing succeeded, with zero in-flight requests, ripgrep workers, and serving DB readers. The Phase 7 deliberately blocked worker additionally proved both-slot saturation, cancellation, reaping, and lock release. [Capacity evidence](implementation-status.md#phase-8)
 
+### SQL-native search
+
+Run `scripts/phase8/capacity.py --native-search-only --search-baseline-image IMAGE`
+with the candidate image prefix and an evidence directory under `/tmp`. The
+report compares each image at 1 and 16 clients on the same populated fixtures.
+It includes a first query after restarting PostgreSQL, warm per-query
+latencies and outcome counts, CPU, memory, pool waits, temporary disk, cleanup,
+and SQL plans and statement counts. The restart clears shared buffers. The
+host filesystem cache remains warm.
+
+Use the Phase 4 differential probe with `--baseline-search-image IMAGE` to
+compare complete cursor chains and measure time to the first nonempty result.
+Use the automatic upgrade probe with `--case online` and
+`--baseline-serve-image IMAGE` to check the live schema 13 cutover, failed
+replacement recovery, and continuation across a rollback. [Search verification](implementation-status.md#postgresql-native-search)
+
+The 10,000-RFC local fixture met the single-client 100 ms p95 goal for
+the warm query mix. Five native query shapes exceeded 500 ms p95 at
+16 clients. The separate sparse-title cursor-chain case also exceeded
+100 ms for its first result. These measurements cover local fixture runs.
+
 ## Bounded official-source verification
 
 The Phase 0 HTTPS probe captured seven endpoints between 04:21:00 and 04:21:09 UTC on 2026-11-23. Atom and RSS each yielded 15 entries. The capped catalog prefix contained 261 complete entries. The Phase 2 sample on those images reconciled a ready candidate while the active pointer stayed unset. It recorded the legacy policy labels below, two unavailable RFCXML bodies, one incomplete reference classification, and one partial section index. [Later license-based sample](implementation-status.md#license-based-redistribution-and-whole-corpus-regex)

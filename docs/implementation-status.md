@@ -2327,3 +2327,73 @@ startup. The probe removed its namespace and profile.
 An emulated ARM64 build verified the aarch64 APK and ran both PostgreSQL
 binaries as `70:70` with `libxml2` `2.13.9-r5` and both `gosu` paths
 absent. Native ARM64 release qualification remains pending.
+
+## PostgreSQL-native search
+
+The schema 13 search executor uses the existing document lexeme and
+relationship indexes. PostgreSQL selects matching RFCs and counts coverage
+over the same generation and policy snapshot. The hybrid executor still
+charges its document, read, and comparison budgets for exact full-text
+predicates. Both paths use the existing generation fences and signed
+cursors. [Search DSL](search.md#coverage-pages-and-excerpts)
+
+The pre-change Phase 4 benchmark used revision `90af77b4030b` and a
+10,000-RFC private fixture. Its absent relationship query stopped at 512
+evaluated documents per page. The paired run drove the previous and
+candidate executors against the same fixture and compared complete result
+chains with different page boundaries.
+
+| Query on the 10,000-RFC fixture | Previous calls | Native calls | Previous time | Native time |
+| --- | ---: | ---: | ---: | ---: |
+| Absent relationship, through completion | 20 | 1 | 637 ms | 24 ms |
+| Full-text token near the end, to first hit | 20 | 1 | 601 ms | 27 ms |
+| Title token near the end, to first hit | 20 | 1 | 1,266 ms | 732 ms |
+| Forward obsolescence, through completion | 20 | 9 | 604 ms | 212 ms |
+
+The common title-token query had a 12 ms median after adding title-only
+lookahead. A sparse title query still tokenizes the titles it must examine
+and can exceed the 100 ms single-client goal. The 124-query independent
+graph evaluator, five complete differential cursor chains, response-size
+continuation, original-read measurement, and injected PostgreSQL spill
+limit passed. The spill check verified recovery on a subsequent search.
+The plans used the inverted lexeme index for both the rare single posting
+and the common 9,982-posting term. The title-only common query visited 28
+members in RFC ID order before stopping at lookahead. PostgreSQL also used
+the inverse relationship and inbound obsolescence indexes.
+
+The frozen Rust and all-feature checks, HTTP mutation smoke, and Phase 0,
+Phase 5, and Phase 8 backup/restore probes passed. Phase 5 verified
+native-search cancellation and an in-flight cursor rejection at the
+rights-release fence. Timings and equivalence evidence came from private
+fixtures.
+
+The paired HTTPS capacity probe completed the 1,000- and 10,000-RFC
+profiles at 1 and 16 clients with no request rejections. On 10,000 RFCs,
+native p95 ranged from 27 to 64 ms with one client and 431 to 752 ms with
+16 clients. Five of ten native query shapes exceeded the 500 ms goal
+under concurrency. Hybrid p95 moved from 212 to 218 ms at one client
+and from 1,039 to 1,024 ms at 16 clients.
+The candidate used 49.2 MiB of aggregate temporary writes in the
+16-client run, and PostgreSQL peaked at 128 MiB of sampled memory.
+The late-token first call after PostgreSQL restart returned zero hits
+with a continuation on the previous image and one terminal hit on the
+candidate. Its warm SQL statement count fell from 54 to 26. The extended
+report records the other statement counts, buffer plans, CPU, pool waits,
+and cleanup. Official-corpus and production qualification remain pending.
+
+A populated schema 13 Compose rehearsal replaced the previous Serve
+image with the candidate and then rolled back using the same cursor key.
+PostgreSQL, Sync, and Feed kept their container IDs and start times.
+An injected Serve startup failure restored the prior image and the
+previous PostgreSQL role setting. A repeated deploy kept the active
+Serve instance. Fresh Compose provisioning and the schema 12 to 13
+upgrade and repeat startup also passed. The first startup-suite attempt
+timed out launching a fixture digest helper before migration. The replay
+completed all three cases. [Deployment procedure](deployment.md#upgrade-existing-volumes)
+
+The Minikube rehearsal resumed the same search cursor through replacement
+and rollback while PostgreSQL, Sync, and Feed kept their pod identities
+and restart counts. It also verified rights restrictions across two
+Serve replicas and retained authenticated Feed publications. The replay
+used separate capped ext4 fixtures and waited for the Service endpoint
+to accept connections after each replacement.

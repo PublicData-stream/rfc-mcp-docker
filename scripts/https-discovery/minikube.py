@@ -250,7 +250,7 @@ print(response.read().decode())
         """, "sh", self.node_work])
         return sources, writer, reader
 
-    def run(self, *, automatic, serve_pool=False):
+    def run(self, *, automatic, serve_pool=False, baseline_serve=None):
         self.apply_resource({"apiVersion": "v1", "kind": "Namespace",
                              "metadata": {"name": self.namespace}})
         self.execute([*self.docker, "exec", "--user", "0", self.node,
@@ -261,7 +261,7 @@ print(response.read().decode())
         self.execute([*self.docker, "tag", POSTGRES, self.pg_image])
         try:
             self.load([f"{self.prefix}-{name}" for name in ("sync", "serve", "feed", "fixtures")]
-                      + [self.pg_image])
+                      + [self.pg_image] + ([baseline_serve] if baseline_serve else []))
         finally:
             self.execute([*self.docker, "image", "rm", self.pg_image])
         sources, writer, reader = self.prepare()
@@ -347,6 +347,8 @@ print(response.read().decode())
         self.database(input=f"ALTER ROLE rfc_sync PASSWORD '{writer}';\n"
                             f"ALTER ROLE rfc_serve PASSWORD '{reader}';\n")
         self.database("-f", "/migrations/bootstrap.sql", "-f", "/migrations/migrate.sql")
+        if baseline_serve:
+            self.database("-c", "ALTER ROLE rfc_serve IN DATABASE rfc RESET temp_file_limit")
 
         self.service("serve", [8780, 8782])
         self.service("sync", [8783])
@@ -358,7 +360,8 @@ print(response.read().decode())
         feed = {"RFC_FEED_SYNC_KEY_ID": "fixture-feed",
                 "RFC_FEED_SYNC_KEY_FILE": "/run/secrets/feed"}
         def serve(name):
-            self.pod(name, f"{self.prefix}-serve", 10001, ["/usr/local/bin/rfc-mcp-docker-serve"], env={
+            image = baseline_serve if baseline_serve and name == "serve" else f"{self.prefix}-serve"
+            self.pod(name, image, 10001, ["/usr/local/bin/rfc-mcp-docker-serve"], env={
                 **database, **notify, "RFC_MCP_BIND": "$(POD_IP):8780",
                 "RFC_SERVE_NOTIFY_BIND": "$(POD_IP):8782", "RFC_MCP_HOSTS": "rfc.test",
                 "RFC_MCP_CURSOR_KEY_FILE": "/run/secrets/cursor",
@@ -417,6 +420,8 @@ print(response.read().decode())
             self.delivered(2)
             self.verify_served(2, sources[2119])
             assert self.database("-c", "SELECT count(*) FROM rfc.control_events WHERE status='completed'") == "1"
+            if baseline_serve:
+                self.verify_search_rollout(baseline_serve)
             self.verify_policy_replicas(serve, sources[2119])
             print("Minikube status, watch, and diagnose passed through kubectl exec as Sync", flush=True)
             print("Minikube fresh daemon and brokered Feed publications passed with authenticated outbox and MCP reads",
@@ -478,6 +483,54 @@ print(response.read().decode())
               f"{cold['metrics']['https_requests']} cold and {warm['metrics']['https_requests']} warm.",
               flush=True)
 
+    def verify_search_rollout(self, baseline):
+        query = "is::obsoleted:true OR is::obsoleted:false"
+
+        def search(cursor=None):
+            arguments = {"query": query, "limit": 1}
+            if cursor is not None:
+                arguments["cursor"] = cursor
+            result = self.mcp("serve", "search", **arguments)
+            assert not result["isError"], result
+            return result["structuredContent"]
+
+        def companion_stamp():
+            pods = json.loads(self.kubectl("get", "pod", "postgres", "sync", "feed", "-o", "json"))
+            return {item["metadata"]["uid"]: item["status"]["containerStatuses"][0]["restartCount"]
+                    for item in pods["items"]}
+
+        def replace(image):
+            self.kubectl("set", "image", "pod/serve", f"main={image}")
+
+            def current():
+                state = json.loads(self.kubectl("get", "pod", "serve", "-o", "json"))
+                statuses = state["status"].get("containerStatuses", [])
+                if not statuses:
+                    return False
+                status = statuses[0]
+                name = status["image"].removeprefix("docker.io/library/")
+                return status["ready"] and name.removesuffix(":latest") == image.removesuffix(":latest")
+
+            phase6.wait(current, seconds=60)
+            connect = [*self.kube, "exec", "fixtures", "--", "python3", "-B", "-c",
+                       "import socket; socket.create_connection(('serve', 8780), 2).close()"]
+            phase6.wait(lambda: subprocess.run(connect, stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL, timeout=10).returncode == 0)
+
+        companions = companion_stamp()
+        first = search()
+        assert first["hits"] and first["next_cursor"], first
+        self.database("-f", "/migrations/serve-resource-limits.sql")
+        replace(f"{self.prefix}-serve")
+        second = search(first["next_cursor"])
+        assert not second["scan_truncated"] and second["hits"][0]["id"] > first["hits"][0]["id"]
+        replace(baseline)
+        third = search(second["next_cursor"])
+        assert third["hits"][0]["id"] > second["hits"][0]["id"]
+        assert companion_stamp() == companions
+        replace(f"{self.prefix}-serve")
+        print("Minikube same-schema Serve replacement and rollback preserved the search cursor", flush=True)
+
     def verify_serve_pool(self, sequence, original):
         readers = ("SELECT pid FROM pg_stat_activity WHERE usename='rfc_serve' "
                    "AND backend_type='client backend' ORDER BY pid")
@@ -537,6 +590,7 @@ def main():
     parser.add_argument("--image-prefix", required=True)
     parser.add_argument("--serve-pool", action="store_true",
                         help="qualify Serve pool lifecycle after the manual publication probe")
+    parser.add_argument("--baseline-serve-image", help="rehearse online Serve replacement using this previous image")
     for stage in ("spool", "audit"):
         parser.add_argument(f"--{stage}-node-dir", required=True,
                             help="private disk-backed mount beneath the Minikube node's /tmp")
@@ -547,12 +601,14 @@ def main():
         if Path("/tmp") not in Path(path).parents or ".." in Path(path).parts:
             parser.error("staging mount paths must be beneath the node's /tmp")
     os.environ["RFC_E2E_PRELOADED"] = "1"
-    for automatic in (False, True):
+    modes = (True,) if args.baseline_serve_image else (False, True)
+    for automatic in modes:
         with tempfile.TemporaryDirectory(prefix="rfc-minikube-sync-", dir="/tmp") as work:
             probe = Probe(args.profile, args.context, args.image_prefix, Path(work),
                           args.spool_node_dir, args.audit_node_dir)
             try:
-                probe.run(automatic=automatic, serve_pool=args.serve_pool)
+                probe.run(automatic=automatic, serve_pool=args.serve_pool,
+                          baseline_serve=args.baseline_serve_image)
             except Exception:
                 subprocess.run([*probe.kube, "get", "pods"], check=False, timeout=15)
                 for name in ("stock-sync", "serve", "sync", "feed"):

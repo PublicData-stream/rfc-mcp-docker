@@ -15,7 +15,7 @@ import tempfile
 import time
 
 from integration import arguments, dump, phase3, phase5, phase7, project, SERVE
-from load_client import exchange, MIX
+from load_client import exchange, MIX, SEARCH
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("phase4", HERE.parent / "phase4/integration.py")
@@ -29,9 +29,9 @@ class Corpus(phase5.Project):
     search_command = phase4.Project.search_command
 
 
-def statistics(records, duration):
+def statistics(records, duration, workload=MIX):
     by_tool = {}
-    for name, _ in MIX:
+    for name, _ in workload:
         requests = [record for record in records if record[0] == name]
         timings = sorted(row[2] * 1000 for row in requests if row[1] == "ok")
         counts = dict(Counter(row[1] for row in requests))
@@ -98,7 +98,7 @@ def clients(stack, work, count, mode):
             deadline = time.monotonic() + SECONDS + 23
             while any(client.poll() is None for client in clients.values()):
                 assert time.monotonic() < deadline, "load worker completion timeout"
-                measurements.append(sample(stack, include_companions=mode != "comparison"))
+                measurements.append(sample(stack, include_companions=mode not in {"comparison", "search"}))
                 time.sleep(0.35)
             records = []
             for client in clients.values():
@@ -146,10 +146,10 @@ def admission_burst(stack, work):
             "after": recovery(stack)}
 
 
-def recovery(stack):
+def recovery(stack, *, include_companions=True):
     time.sleep(2.1)
     assert stack.client.rpc("tools/list")[0]["tools"]
-    current = sample(stack)
+    current = sample(stack, include_companions=include_companions)
     assert current["rg_workers"] == current["in_flight"] == 0, current
     phase3.assert_readers_idle(lambda query: stack.sql("-c", query))
     return current
@@ -248,6 +248,72 @@ def compare(stack, work, args):
     return {"sample_seconds": SECONDS, "profiles": trials}
 
 
+def search_capacity(stack, work, args):
+    candidate = stack.env["RFC_SERVE_IMAGE"]
+    stack.run("stop", phase7.SYNC, timeout=50)
+
+    def start_serve():
+        stack.run("up", "-d", "--no-deps", "--force-recreate", "--wait", SERVE, timeout=80)
+        assert stack.admin("/ready") == ""
+
+    def spill():
+        values = stack.sql("-c", "SELECT temp_files,temp_bytes FROM pg_stat_database WHERE datname='rfc'")
+        return dict(zip(("temp_files", "temp_bytes"), map(int, values.split("|")), strict=True))
+
+    def search(arguments):
+        started = time.monotonic()
+        result, _ = stack.client.rpc("tools/call", name="search", arguments=arguments)
+        assert not result["isError"], result
+        return {"latency_ms": (time.monotonic() - started) * 1000, "hits": len(result["structuredContent"]["hits"]),
+                "more": bool(result["structuredContent"]["next_cursor"])}
+
+    profiles = {}
+    for label, image in (("previous", args.search_baseline_image), ("candidate", candidate)):
+        if not image:
+            continue
+        stack.env["RFC_SERVE_IMAGE"] = image
+        stack.run("stop", SERVE, timeout=35)
+        stack.run("restart", "postgres", timeout=70)
+        stack.run("up", "-d", "--no-deps", "--wait", "postgres", timeout=70)
+        start_serve()
+        row = {"image": stack.inspect(SERVE)["Image"]}
+        row["cold_first_request"] = search(SEARCH[1][1])
+        row["warm"] = {}
+        for count in (1, 16):
+            old_cpu, old_pool, old_spill = cpu_sample(stack), pool_metrics(stack), spill()
+            records, samples = clients(stack, work, count, "search")
+            new_cpu, new_pool, new_spill = cpu_sample(stack), pool_metrics(stack), spill()
+            assert any(record[1] == "ok" for record in records)
+            row["warm"][count] = {"queries": statistics(records, SECONDS, SEARCH),
+                                  "cpu_us": {name: new_cpu[name] - old_cpu[name] for name in old_cpu},
+                                  "spill": {name: new_spill[name] - old_spill[name] for name in old_spill},
+                                  "pool_wait": {name: value - old_pool.get(name, 0)
+                                                for name, value in new_pool.items() if "wait_seconds_" in name},
+                                  "peak_memory_bytes": {key: max(sample[key] for sample in samples) for key in
+                                                        ("serve_cgroup_bytes", "postgres_cgroup_bytes")},
+                                  "after": recovery(stack, include_companions=False)}
+        stack.sql("-c", "ALTER ROLE rfc_serve IN DATABASE rfc SET log_statement='all'")
+        stack.sql("-c", "ALTER ROLE rfc_serve IN DATABASE rfc SET log_parameter_max_length=0")
+        try:
+            start_serve()
+            row["warm_statement_counts"] = {}
+            search(SEARCH[1][1])
+            for name, arguments in SEARCH:
+                start = len(postgres_logs(stack))
+                search(arguments)
+                row["warm_statement_counts"][name] = sum(
+                    "statement:" in line or "execute " in line
+                    for line in postgres_logs(stack)[start:]
+                )
+        finally:
+            stack.sql("-c", "ALTER ROLE rfc_serve IN DATABASE rfc RESET log_statement")
+            stack.sql("-c", "ALTER ROLE rfc_serve IN DATABASE rfc RESET log_parameter_max_length")
+        profiles[label] = row
+        print(json.dumps({label: row}), flush=True)
+    stack.env["RFC_SERVE_IMAGE"] = candidate
+    return profiles
+
+
 def run_profile(root, args, publication_driver, search_driver, size):
     work = root / f"{root.name}-{size}"
     with project(work, args, publication_driver, fixture_type=Corpus) as seed:
@@ -279,6 +345,8 @@ def run_profile(root, args, publication_driver, search_driver, size):
         with phase7.deployment(work, seed, args.image_prefix) as stack:
             stack.start()
             stack.sql("-c", "ANALYZE")
+            if args.native_search_only:
+                return {"rfc_count": size, "search": search_capacity(stack, work, args), "query_plans": plans}
             if args.baseline_serve_image:
                 return {"rfc_count": size, **compare(stack, work, args)}
             baseline = sample(stack)
@@ -307,7 +375,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-serve-image", help="compare an existing dedicated-session Serve image")
     parser.add_argument("--pool-trials", type=int, default=3)
+    parser.add_argument("--native-search-only", action="store_true", help="measure native and hybrid search")
+    parser.add_argument("--search-baseline-image", help="pinned pre-change Serve image for the search comparison")
     args = arguments(parser)
+    if args.search_baseline_image and not args.native_search_only:
+        parser.error("--search-baseline-image requires --native-search-only")
+    if args.native_search_only and args.baseline_serve_image:
+        parser.error("--native-search-only and --baseline-serve-image select different benchmarks")
     if not 1 <= args.pool_trials <= 10:
         parser.error("--pool-trials must be within 1–10")
     with tempfile.TemporaryDirectory(prefix="rfc-phase8-capacity-", dir="/tmp") as directory:
@@ -318,7 +392,8 @@ def main():
         phase4.search_driver(docker, args.image_prefix, search, False)
         sizes = (1000,) if args.baseline_serve_image else (1000, 10000)
         reports = [run_profile(root, args, publication, search, size) for size in sizes]
-    filename = "pool-comparison.json" if args.baseline_serve_image else "capacity.json"
+    filename = ("search-capacity.json" if args.native_search_only
+                else "pool-comparison.json" if args.baseline_serve_image else "capacity.json")
     (args.evidence / filename).write_text(json.dumps({
         "warmup_seconds": 0 if args.baseline_serve_image else 3, "sample_seconds": SECONDS, "reports": reports,
     }, indent=2) + "\n")
